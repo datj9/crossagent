@@ -422,34 +422,47 @@ def reconcile_stale(job: Job, job_dir: Path) -> Job:
     if a transition occurs.
 
     TOCTOU guard: the worker always writes its terminal state to disk *before*
-    exiting.  After confirming the PID is gone we therefore re-read state.json
-    from disk — if the fresh copy is already terminal (worker wrote it), we
-    return that authoritative state without writing ABANDONED on top.  Only
-    when the freshly-loaded state is still nonterminal do we persist ABANDONED.
+    exiting.  After the snapshot fails the liveness checks we therefore re-read
+    state.json and re-run the *full* liveness evaluation on the fresh copy —
+    the worker may have written a terminal state, booted (RUNNING with a live
+    PID), or recorded fresh activity in the meantime.  Only when the fresh copy
+    still fails every check do we persist ABANDONED, and we transition from the
+    fresh copy, never the snapshot.
+    """
+    if not _worker_presumed_dead(job):
+        return job
+    # Re-load from disk to close the TOCTOU window between the caller's
+    # snapshot and this decision.
+    try:
+        fresh_job = load_state(job_dir)
+    except (FileNotFoundError, JobError):
+        # state.json is unreadable — fall back to the in-memory copy.
+        fresh_job = job
+    else:
+        if not _worker_presumed_dead(fresh_job):
+            # Worker persisted its outcome, booted, or is provably alive;
+            # honour the fresh state.
+            return fresh_job
+    return transition_to(
+        fresh_job,
+        JobState.ABANDONED,
+        job_dir=job_dir,
+        error="Worker process no longer exists",
+    )
+
+
+def _worker_presumed_dead(job: Job) -> bool:
+    """Return True when a nonterminal *job*'s worker appears to be gone.
+
+    Terminal jobs, pending jobs still inside the startup grace window, and
+    jobs whose recorded worker PID is alive are all presumed healthy.
     """
     if is_terminal(job.status):
-        return job
+        return False
     if (job.status == JobState.PENDING and job.worker_pid is None
             and _pending_startup_grace_active(job)):
-        return job
-    if job.worker_pid is None or not _pid_exists(job.worker_pid):
-        # Re-load from disk to close the TOCTOU window: the worker may have
-        # written a terminal state between our last read and now.
-        try:
-            fresh_job = load_state(job_dir)
-        except (FileNotFoundError, JobError):
-            # state.json is unreadable — fall back to the in-memory copy.
-            fresh_job = job
-        if is_terminal(fresh_job.status):
-            # Worker already persisted its outcome; honour it.
-            return fresh_job
-        return transition_to(
-            fresh_job,
-            JobState.ABANDONED,
-            job_dir=job_dir,
-            error="Worker process no longer exists",
-        )
-    return job
+        return False
+    return job.worker_pid is None or not _pid_exists(job.worker_pid)
 
 
 def _pending_startup_grace_active(job: Job) -> bool:

@@ -551,26 +551,28 @@ def test_reconcile_stale_does_not_overwrite_terminal_write_after_load(tmp_path):
     )
     worker_pid = worker_proc.pid
 
-    # Step 1: persist RUNNING with the live worker PID.
-    running_job = Job(
-        job_id="job_toctou",
-        status=JobState.RUNNING,
-        worker_pid=worker_pid,
-        started_at=datetime.now(timezone.utc).isoformat(),
-    )
-    save_state(job_dir, running_job)
+    try:
+        # Step 1: persist RUNNING with the live worker PID.
+        running_job = Job(
+            job_id="job_toctou",
+            status=JobState.RUNNING,
+            worker_pid=worker_pid,
+            started_at=datetime.now(timezone.utc).isoformat(),
+        )
+        save_state(job_dir, running_job)
 
-    # Step 2: dashboard loads the state (simulates the stale in-memory copy).
-    stale_dashboard_copy = load_state(job_dir)
-    assert stale_dashboard_copy.status == JobState.RUNNING
+        # Step 2: dashboard loads the state (simulates the stale in-memory copy).
+        stale_dashboard_copy = load_state(job_dir)
+        assert stale_dashboard_copy.status == JobState.RUNNING
 
-    # Step 3: worker finishes — write SUCCEEDED to disk, then kill and wait.
-    succeeded_job = transition_to(stale_dashboard_copy, JobState.SUCCEEDED, job_dir=job_dir)
-    assert succeeded_job.status == JobState.SUCCEEDED
-
-    # Terminate the subprocess and wait so the PID is truly gone.
-    worker_proc.kill()
-    worker_proc.wait()
+        # Step 3: worker finishes — write SUCCEEDED to disk, then kill and wait.
+        succeeded_job = transition_to(stale_dashboard_copy, JobState.SUCCEEDED, job_dir=job_dir)
+        assert succeeded_job.status == JobState.SUCCEEDED
+    finally:
+        # Terminate the subprocess and wait so the PID is truly gone (and no
+        # 60-second sleeper leaks if an assertion above fails).
+        worker_proc.kill()
+        worker_proc.wait()
 
     # Step 4: reconcile_stale is called with the stale RUNNING copy (not the fresh one).
     # The PID is now gone, but state.json on disk already says SUCCEEDED.
@@ -585,6 +587,60 @@ def test_reconcile_stale_does_not_overwrite_terminal_write_after_load(tmp_path):
     assert on_disk.status == JobState.SUCCEEDED, (
         f"On-disk status is {on_disk.status!r} — reconcile_stale persisted ABANDONED "
         "on top of the worker-written SUCCEEDED"
+    )
+
+
+def test_reconcile_stale_does_not_abandon_job_that_booted_after_snapshot(tmp_path):
+    """A worker that boots between the dashboard snapshot and the reconcile
+    write must survive reconciliation.
+
+    Sequence under test:
+      1. Dashboard loads a PENDING job whose startup grace has expired
+         (no worker_pid) → stale snapshot says "abandon me".
+      2. The late worker boots and persists RUNNING with its live PID.
+      3. reconcile_stale is called with the stale PENDING snapshot.
+
+    Fixed behaviour: the fresh re-read is re-evaluated with the full liveness
+    guards — RUNNING with a live PID is honoured, nothing is persisted.
+    Old behaviour: the fresh copy was only checked for terminality, so the
+    live RUNNING job was overwritten with ABANDONED.
+    """
+    job_dir = create_job_dir(tmp_path, "job_lateboot")
+
+    stale_ts = (datetime.now(timezone.utc) - timedelta(seconds=15)).isoformat()
+    pending_job = Job(
+        job_id="job_lateboot",
+        status=JobState.PENDING,
+        started_at=stale_ts,
+        updated_at=stale_ts,
+        last_activity_at=stale_ts,
+    )
+    save_state(job_dir, pending_job)
+
+    # Step 1: dashboard snapshots the expired PENDING state.
+    stale_dashboard_copy = load_state(job_dir)
+    assert stale_dashboard_copy.status == JobState.PENDING
+
+    # Step 2: the late worker boots — persists RUNNING with a live PID
+    # (this test process stands in for the worker).
+    transition_to(
+        stale_dashboard_copy,
+        JobState.RUNNING,
+        job_dir=job_dir,
+        worker_pid=os.getpid(),
+    )
+
+    # Step 3: reconcile from the stale PENDING snapshot.
+    result = reconcile_stale(stale_dashboard_copy, job_dir)
+
+    assert result.status == JobState.RUNNING, (
+        f"Expected RUNNING but got {result.status!r} — reconcile_stale "
+        "abandoned a job whose worker booted after the snapshot"
+    )
+    on_disk = load_state(job_dir)
+    assert on_disk.status == JobState.RUNNING, (
+        f"On-disk status is {on_disk.status!r} — reconcile_stale persisted "
+        "ABANDONED over a live RUNNING job"
     )
 
 
