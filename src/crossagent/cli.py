@@ -14,11 +14,13 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
 from . import advisors as advisors_mod
 from . import registry as reg
+from . import runner as runner_mod
 from .advisors import Advisor
 
 
@@ -113,34 +115,74 @@ def summarize_event(event: dict[str, Any]) -> None:
               file=sys.stderr)
 
 
-def _run_stream(cmd: list[str], cwd: str | None) -> tuple[int, dict[str, Any] | None]:
-    proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, bufsize=1)
-    assert proc.stdout is not None and proc.stderr is not None
-    final: dict[str, Any] | None = None
-    for line in proc.stdout:
+class _StreamConsumer:
+    """Consumer used by the old ``_run_stream`` path: parse JSON events, capture result."""
+
+    def __init__(self) -> None:
+        self.final: dict[str, Any] | None = None
+
+    def consume_stdout(self, line: str) -> None:
         stripped = line.strip()
         if not stripped:
-            continue
+            return
         try:
             event = json.loads(stripped)
         except json.JSONDecodeError:
             print(stripped, file=sys.stderr)
-            continue
+            return
         summarize_event(event)
         if event.get("type") == "result":
-            final = event
-    err = proc.stderr.read()
-    if err:
-        print(err, file=sys.stderr, end="")
-    return proc.wait(), final
+            self.final = event
+
+    def consume_stderr(self, line: str) -> None:
+        print(line, file=sys.stderr, end="")
+
+    def finish(self, exit_code: int) -> dict[str, Any] | None:
+        return self.final
+
+
+class _TextConsumer:
+    """Consumer used by the old ``_run_text`` path: stream stdout to disk, stderr to screen."""
+
+    def __init__(self) -> None:
+        self._fd, self._path = tempfile.mkstemp(prefix="crossagent_stdout_", suffix=".txt")
+        self._file = os.fdopen(self._fd, "w", encoding="utf-8")
+
+    def consume_stdout(self, line: str) -> None:
+        self._file.write(line)
+
+    def consume_stderr(self, line: str) -> None:
+        print(line, file=sys.stderr, end="")
+
+    def finish(self, exit_code: int) -> str:
+        self._file.flush()
+        self._file.seek(0)
+        return self._file.read()
+
+    def cleanup(self) -> None:
+        try:
+            self._file.close()
+        except OSError:
+            pass
+        try:
+            os.unlink(self._path)
+        except OSError:
+            pass
+
+
+def _run_stream(cmd: list[str], cwd: str | None) -> tuple[int, dict[str, Any] | None]:
+    consumer = _StreamConsumer()
+    outcome = runner_mod.run(cmd, cwd=cwd, consumer=consumer, max_runtime_seconds=None)
+    return outcome.exit_code, outcome.result
 
 
 def _run_text(cmd: list[str], cwd: str | None) -> tuple[int, str]:
-    completed = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, check=False)
-    if completed.stderr:
-        print(completed.stderr, file=sys.stderr, end="")
-    return completed.returncode, completed.stdout
+    consumer = _TextConsumer()
+    try:
+        outcome = runner_mod.run(cmd, cwd=cwd, consumer=consumer, max_runtime_seconds=None)
+        return outcome.exit_code, outcome.result or ""
+    finally:
+        consumer.cleanup()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
