@@ -121,7 +121,10 @@ def _wait_for_terminal(job_id: str, timeout: float = 10.0) -> jobs_mod.Job:
 # =========================================================================
 
 
-def test_start_returns_job_id_and_worker_continues(state_dir, fake_codex_in_path, capsys):
+def test_start_returns_job_id_and_worker_continues(state_dir, fake_codex_in_path, monkeypatch, capsys):
+    # Keep the advisor alive briefly so start's snapshot cannot race past
+    # running into succeeded on a fast machine.
+    monkeypatch.setenv("FAKE_CODEX_SLEEP", "2")
     code = main([
         "start", "--agent", "codex",
         "--prompt", "hello worker",
