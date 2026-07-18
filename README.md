@@ -127,7 +127,7 @@ crossagent dashboard                 # serves http://127.0.0.1:8642/ and opens y
 crossagent dashboard --port 9000 --no-open
 ```
 
-![crossagent dashboard — live job table with per-job detail and stdout/stderr logs](docs/dashboard.png)
+![crossagent dashboard — live job table, per-job detail, and stdout/stderr logs](docs/dashboard.gif)
 
 The page auto-refreshes every 3 s; click a job to see its detail (status,
 elapsed, idle, last event, error) and its live stdout/stderr. The prompt is
