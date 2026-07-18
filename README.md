@@ -23,7 +23,20 @@ Coding agents are confident. That's the problem. The same model that writes the 
 
 `crossagent` makes that a one-liner. Package the decision, hand it to a peer agent, get back a structured critique — Position / Evidence / Risks / Recommendation / Unresolved — and reconcile it with your own view before you commit.
 
-## Install (under 2 minutes)
+## Install
+
+Install the CLI from PyPI (using `pipx` keeps command-line applications isolated):
+
+```bash
+pipx install crossagent
+# or: pip install crossagent
+
+crossagent --list-advisors
+```
+
+You also need at least one advisor CLI on your PATH — e.g. [`claude`](https://docs.claude.com/claude-code), `codex`, `opencode`, `commandcode`, or `gemini`.
+
+To install both the CLI and the Agent Skill from the repository:
 
 ```bash
 git clone https://github.com/datj9/crossagent.git
@@ -32,15 +45,6 @@ cd crossagent
 ```
 
 The installer checks the supported agent config dirs (`~/.claude`, `~/.codex`, `~/.config/opencode`, `~/.commandcode`, `~/.cursor`), installs the skill into those present, and installs the CLI via `pipx`/`pip`.
-
-CLI only:
-
-```bash
-pip install crossagent          # or: pipx install crossagent
-crossagent --list-advisors
-```
-
-You also need at least one advisor CLI on your PATH — e.g. [`claude`](https://docs.claude.com/claude-code), `codex`, `opencode`, `commandcode`, or `gemini`.
 
 ## Quick start
 

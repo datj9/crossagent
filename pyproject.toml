@@ -4,11 +4,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "crossagent"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Get a second opinion from another AI coding agent. Ask Claude, Codex, OpenCode, CommandCode, or Gemini — from inside the agent you already use."
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Dat Nguyen" }]
 keywords = ["claude", "codex", "opencode", "agent", "mcp", "coding-agent", "cli", "ai", "second-opinion"]
 classifiers = [
@@ -16,7 +17,14 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = []
@@ -25,12 +33,16 @@ dependencies = []
 Homepage = "https://github.com/datj9/crossagent"
 Repository = "https://github.com/datj9/crossagent"
 Issues = "https://github.com/datj9/crossagent/issues"
+Changelog = "https://github.com/datj9/crossagent/blob/main/CHANGELOG.md"
 
 [project.scripts]
 crossagent = "crossagent.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
+
+[tool.hatch.version]
+path = "src/crossagent/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/crossagent"]
