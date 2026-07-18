@@ -136,6 +136,7 @@ Only `--max-runtime` or explicit cancellation terminates the job.
 | `crossagent logs JOB_ID [--follow] [--stream stdout\|stderr]` | Read or follow an advisor's log stream. |
 | `crossagent cancel JOB_ID [--wait] [--timeout N]` | Request cancellation and optionally wait for cleanup. |
 | `crossagent list [--status STATE] [--limit N] [--json]` | Dashboard of all jobs, newest first — status, elapsed, idle, name. Reconciles stale jobs to `abandoned` so nothing is silently dropped. Use it to rediscover a job when the ID was lost. |
+| `crossagent dashboard [--host H] [--port N] [--no-open]` | Local web dashboard (default `http://127.0.0.1:8642/`): live job table, per-job detail, and stdout/stderr logs. For the human user — an agent should use `list`/`status --json` instead. |
 
 ### `start` flags
 

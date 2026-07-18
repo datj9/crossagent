@@ -12,7 +12,7 @@ crossagent --agent claude --name payments-retry-design --prompt-file /tmp/decisi
 - 🧠 **A teammate, not an oracle.** Ships a second-opinion protocol that forces an evidence-backed critique with cited files, risks, and a recommendation — then a synthesis step, so the second opinion sharpens *your* judgment instead of replacing it.
 - 🔁 **Named, resumable sessions.** Claude sessions and Codex threads resume by `advisor:name`. Fork to explore a branch.
 - 📡 **No delegated job is ever silently dropped.** Every `start` persists durable state on disk; if the parent times out or the worker dies, the job resolves to an explicit terminal state (`succeeded`/`failed`/`timed_out`/`cancelled`/`abandoned`) and stays recoverable by job ID — you never lose the answer, or the fact that there was a job at all.
-- 📊 **Full observability on every delegation.** `crossagent list` is a dashboard of all jobs (status, elapsed, idle, last event); `status --json` reports live progress; `logs --follow` tails the advisor's raw output in real time.
+- 📊 **Full observability on every delegation.** `crossagent dashboard` opens a live localhost web UI over all jobs; `crossagent list` is the same dashboard in the terminal; `status --json` reports progress; `logs --follow` tails the advisor's raw output in real time.
 - 🧩 **Agent Skill + CLI.** Installs as an [Agent Skill](https://agentskills.dev) *and* a standalone `crossagent` command. Zero runtime dependencies.
 - 🔓 **Local & open.** Runs entirely on your machine against CLIs you already have. MIT licensed.
 
@@ -114,8 +114,21 @@ A delegated job can never disappear without a trace:
 
 ### Observability: see every job's progress and output
 
-`crossagent list` is your dashboard over all delegations — including ones whose
-job ID you lost:
+Open the **web dashboard** — a live view of all jobs with per-job status and
+logs, served from the Python standard library (zero dependencies, loopback
+only by default):
+
+```bash
+crossagent dashboard                 # serves http://127.0.0.1:8642/ and opens your browser
+crossagent dashboard --port 9000 --no-open
+```
+
+The page auto-refreshes every 3 s; click a job to see its detail (status,
+elapsed, idle, last event, error) and its live stdout/stderr. The prompt is
+never served — only status metadata and advisor output logs.
+
+Prefer the terminal? `crossagent list` is the same dashboard as a table —
+including jobs whose ID you lost:
 
 ```bash
 crossagent list                      # table: job id, status, advisor, elapsed, idle, name
@@ -219,6 +232,7 @@ The skill uses the **durable job workflow** by default for agent-to-agent calls.
 - Second-opinion sessions run read-only by convention; for Claude use `--tools ""` for pure reasoning or restrict with `--allowedTools`.
 - Everything runs locally against CLIs you already trust. `crossagent` adds no network calls of its own.
 - Job state files use private permissions (0700 directories, 0600 files).
+- The web dashboard binds to loopback (`127.0.0.1`) by default, validates job IDs against a strict pattern (no path traversal), and never serves the prompt file — only status metadata and advisor output logs.
 
 ## Contributing
 

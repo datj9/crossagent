@@ -6,7 +6,14 @@ All notable changes to this project are documented here. Format loosely follows
 ## [Unreleased]
 
 ### Added
-- **Job dashboard** (`crossagent list [--status STATE] [--limit N] [--json]`):
+- **Web dashboard** (`crossagent dashboard [--host H] [--port N] [--no-open]`):
+  local web UI at `http://127.0.0.1:8642/` served entirely from the Python
+  standard library — live auto-refreshing job table, per-job detail (status,
+  elapsed, idle, last event, error), and stdout/stderr log viewer. Loopback
+  bind by default with a warning on non-loopback hosts; job IDs are validated
+  against a strict pattern (no path traversal); the prompt file is never
+  routable.
+- **Job listing** (`crossagent list [--status STATE] [--limit N] [--json]`):
   lists every job newest-first with status, advisor, elapsed, idle, and name.
   Stale `running` jobs reconcile to `abandoned` during listing and unreadable
   job directories are reported on stderr — no delegation is ever silently
