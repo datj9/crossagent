@@ -1,4 +1,6 @@
-from crossagent import advisors
+import pytest
+
+from crossagent import __version__, advisors
 from crossagent.advisors import Advisor
 from crossagent.cli import _redacted_command, build_command, main, parse_args
 
@@ -100,3 +102,19 @@ def test_missing_advisor_cli_exits_cleanly_without_logging_prompt(monkeypatch, c
     assert "advisor CLI not found on PATH" in captured.err
     assert "sensitive prompt" not in captured.err
     assert captured.out == ""
+
+
+def test_version_flag_prints_version_and_exits(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--version"])
+
+    assert excinfo.value.code == 0
+    assert capsys.readouterr().out.strip() == f"crossagent {__version__}"
+
+
+def test_short_version_flag_prints_version_and_exits(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["-v"])
+
+    assert excinfo.value.code == 0
+    assert capsys.readouterr().out.strip() == f"crossagent {__version__}"

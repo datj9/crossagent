@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from . import advisors as advisors_mod
 from . import jobs as jobs_mod
 from . import parsers as parsers_mod
@@ -111,6 +112,7 @@ def _run_advisor(cmd: list[str], cwd: str | None, parser_name: str) -> tuple[int
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="crossagent", description=__doc__)
+    parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--agent", "--advisor", dest="agent", default="claude",
                         help="Peer agent to ask: claude, codex, opencode, commandcode, gemini, or a custom advisor. Default: claude.")
     parser.add_argument("--name", help="Stable session name. Reused names auto-resume the stored session.")
