@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +166,65 @@ def list_status(job: Job) -> dict[str, Any]:
     d = _job_to_dict(job)
     unsafe = {"redacted_command"}
     return {k: v for k, v in d.items() if k not in unsafe}
+
+
+def runtime_status(job: Job) -> dict[str, Any]:
+    """Return the live status envelope with elapsed/idle seconds.
+
+    Prompt text and command data are never included.
+    """
+    now = datetime.now(timezone.utc)
+    started = datetime.fromisoformat(job.started_at) if job.started_at else now
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    elapsed = int((now - started).total_seconds())
+    last_activity = datetime.fromisoformat(job.last_activity_at) if job.last_activity_at else started
+    if last_activity.tzinfo is None:
+        last_activity = last_activity.replace(tzinfo=timezone.utc)
+    idle = int((now - last_activity).total_seconds())
+    return {
+        "schema_version": job.schema_version,
+        "job_id": job.job_id,
+        "status": job.status.value,
+        "advisor": job.advisor,
+        "elapsed_seconds": elapsed,
+        "idle_seconds": idle,
+        "last_event": job.last_event,
+        "updated_at": job.updated_at,
+    }
+
+
+def list_entry(job: Job) -> dict[str, Any]:
+    """Return a listing entry: runtime status plus identity fields."""
+    entry = runtime_status(job)
+    entry["name"] = job.name
+    entry["started_at"] = job.started_at
+    return entry
+
+
+def collect_jobs(
+    state_root: Path,
+    on_skip: Optional[Callable[[str, Exception], None]] = None,
+) -> list[Job]:
+    """Load every job under *state_root*, reconciling stale state.
+
+    Unreadable job directories invoke *on_skip(dir_name, exception)* when
+    provided — a job is never silently dropped from a listing.
+    """
+    if not state_root.is_dir():
+        return []
+    collected: list[Job] = []
+    for job_dir in sorted(state_root.iterdir()):
+        if not job_dir.is_dir():
+            continue
+        try:
+            job = load_state(job_dir)
+        except (FileNotFoundError, JobError) as exc:
+            if on_skip is not None:
+                on_skip(job_dir.name, exc)
+            continue
+        collected.append(reconcile_stale(job, job_dir))
+    return collected
 
 
 # ---------------------------------------------------------------------------

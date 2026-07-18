@@ -144,7 +144,7 @@ def _print_advisors() -> int:
     return 0
 
 
-_JOB_SUBCOMMANDS = {"start", "wait", "status", "result", "logs", "cancel", "list"}
+_JOB_SUBCOMMANDS = {"start", "wait", "status", "result", "logs", "cancel", "list", "dashboard"}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -225,6 +225,8 @@ def _job_subcommand(subcommand: str, argv: list[str]) -> int:
         return _cmd_cancel(args)
     if subcommand == "list":
         return _cmd_list(args)
+    if subcommand == "dashboard":
+        return _cmd_dashboard(args)
     return 2
 
 
@@ -261,6 +263,14 @@ def _parse_job_args(subcommand: str, argv: list[str]) -> argparse.Namespace:
         parser.add_argument("--limit", type=int, default=0,
                             help="Show at most N jobs, newest first (0 = all).")
         parser.add_argument("--json", action="store_true")
+    elif subcommand == "dashboard":
+        parser.add_argument("--host", default="127.0.0.1",
+                            help="Bind address (default 127.0.0.1 — loopback only).")
+        parser.add_argument("--port", type=int, default=8642,
+                            help="Port to listen on (default 8642).")
+        parser.add_argument("--no-open", dest="open_browser", action="store_false",
+                            help="Do not open the browser automatically.")
+        parser.set_defaults(open_browser=True)
     return parser.parse_args(argv)
 
 
@@ -487,7 +497,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
     if args.json:
         _json_print({
             "schema_version": 1,
-            "jobs": [_format_list_entry(job) for job in listed_jobs],
+            "jobs": [jobs_mod.list_entry(job) for job in listed_jobs],
         })
         return 0
 
@@ -496,32 +506,11 @@ def _cmd_list(args: argparse.Namespace) -> int:
 
 
 def _collect_jobs(state_root: Path) -> list[jobs_mod.Job]:
-    """Load every job under *state_root*, reconciling stale state.
-
-    Unreadable job directories are skipped with a stderr warning — a job is
-    never silently dropped from the listing.
-    """
-    if not state_root.is_dir():
-        return []
-    collected: list[jobs_mod.Job] = []
-    for job_dir in sorted(state_root.iterdir()):
-        if not job_dir.is_dir():
-            continue
-        try:
-            job = jobs_mod.load_state(job_dir)
-        except (FileNotFoundError, jobs_mod.JobError) as exc:
-            print(f"[crossagent] skipping unreadable job dir {job_dir.name}: {exc}",
-                  file=sys.stderr)
-            continue
-        collected.append(jobs_mod.reconcile_stale(job, job_dir))
-    return collected
-
-
-def _format_list_entry(job: jobs_mod.Job) -> dict[str, Any]:
-    entry = _format_status(job)
-    entry["name"] = job.name
-    entry["started_at"] = job.started_at
-    return entry
+    """Load every job under *state_root*, warning on stderr about skipped dirs."""
+    def warn_skipped(dir_name: str, exc: Exception) -> None:
+        print(f"[crossagent] skipping unreadable job dir {dir_name}: {exc}",
+              file=sys.stderr)
+    return jobs_mod.collect_jobs(state_root, on_skip=warn_skipped)
 
 
 def _print_job_table(listed_jobs: list[jobs_mod.Job]) -> None:
@@ -542,6 +531,16 @@ def _format_duration(elapsed_seconds: int, job: jobs_mod.Job) -> str:
     if job.duration_seconds is not None:
         return _format_seconds(int(job.duration_seconds))
     return _format_seconds(elapsed_seconds)
+
+
+def _cmd_dashboard(args: argparse.Namespace) -> int:
+    from . import dashboard as dashboard_mod
+    return dashboard_mod.serve(
+        args.host,
+        args.port,
+        jobs_mod.default_state_root(),
+        open_browser=args.open_browser,
+    )
 
 
 def _format_seconds(total_seconds: int) -> str:
@@ -594,25 +593,7 @@ def _json_print(data: dict[str, Any]) -> None:
 
 
 def _format_status(job: jobs_mod.Job) -> dict[str, Any]:
-    now = datetime.now(timezone.utc)
-    started = datetime.fromisoformat(job.started_at) if job.started_at else now
-    if started.tzinfo is None:
-        started = started.replace(tzinfo=timezone.utc)
-    elapsed = int((now - started).total_seconds())
-    last_activity = datetime.fromisoformat(job.last_activity_at) if job.last_activity_at else started
-    if last_activity.tzinfo is None:
-        last_activity = last_activity.replace(tzinfo=timezone.utc)
-    idle = int((now - last_activity).total_seconds())
-    return {
-        "schema_version": job.schema_version,
-        "job_id": job.job_id,
-        "status": job.status.value,
-        "advisor": job.advisor,
-        "elapsed_seconds": elapsed,
-        "idle_seconds": idle,
-        "last_event": job.last_event,
-        "updated_at": job.updated_at,
-    }
+    return jobs_mod.runtime_status(job)
 
 
 def _load_and_reconcile(job_dir: Path, job: jobs_mod.Job) -> jobs_mod.Job:
