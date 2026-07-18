@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from consult import advisors
+from crossagent import advisors
 
 
 def test_builtin_claude_is_fully_featured():

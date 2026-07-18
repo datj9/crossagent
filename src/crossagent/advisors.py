@@ -1,10 +1,10 @@
 """Advisor registry: how to invoke each peer coding-agent CLI.
 
-An *advisor* is a peer AI agent you consult for a second opinion (Claude, Codex,
+An *advisor* is a peer AI agent you ask for a second opinion (Claude, Codex,
 OpenCode, CommandCode, Gemini, ...). Each entry is a small, declarative spec that
 tells the runner how to build the command line, where the prompt goes, and how to
 read the result back out. Built-ins ship sane defaults; users override or add their
-own via ~/.config/consult/advisors.json without touching code.
+own via ~/.config/crossagent/advisors.json without touching code.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ PROMPT_DELIVERIES = frozenset({"dashdash", "positional"})
 #   "text"          -> capture raw stdout as the answer
 RESULT_PARSERS = frozenset({"claude-stream", "text"})
 
-USER_CONFIG = Path.home() / ".config" / "consult" / "advisors.json"
+USER_CONFIG = Path.home() / ".config" / "crossagent" / "advisors.json"
 
 
 @dataclass(frozen=True)

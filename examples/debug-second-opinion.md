@@ -33,10 +33,10 @@ You may run: rg, sed, git log -p on these files. Read-only. Do not run the test 
 EOF
 ```
 
-## 2. Consult a different model than the one that's stuck
+## 2. Ask a different model than the one that's stuck
 
 ```bash
-consult --agent claude --name orders-flaky-cancel --cwd "$PWD" \
+crossagent --agent claude --name orders-flaky-cancel --cwd "$PWD" \
   --tools "Read,Grep,Bash" --prompt-file /tmp/flaky.md
 ```
 

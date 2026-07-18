@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 #
-# consult installer — puts the `consult` skill into the agent skill dirs it
-# finds, and installs the `consult` CLI helper.
+# crossagent installer — puts the `crossagent` skill into the agent skill dirs
+# it finds, and installs the `crossagent` CLI helper.
 #
 # Usage:
 #   ./install.sh                      # auto-detect agents, install skill + CLI
 #   ./install.sh --skill-only         # copy the skill, skip the pip install
 #   ./install.sh --cli-only           # install the CLI, skip the skill copy
-#   ./install.sh --target DIR         # also install the skill into DIR/consult
+#   ./install.sh --target DIR         # also install the skill into DIR/crossagent
 #
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SKILL_SRC="$REPO_DIR/skills/consult"
+SKILL_SRC="$REPO_DIR/skills/crossagent"
 
 DO_SKILL=1
 DO_CLI=1
@@ -28,8 +28,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-info() { printf '\033[1;36m[consult]\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;33m[consult]\033[0m %s\n' "$*" >&2; }
+info() { printf '\033[1;36m[crossagent]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[crossagent]\033[0m %s\n' "$*" >&2; }
 
 # Agent -> skills directory. Only the ones that exist get the skill.
 declare -a SKILL_DIRS=(
@@ -43,9 +43,9 @@ declare -a SKILL_DIRS=(
 install_skill_into() {
   local dest_root="$1"
   mkdir -p "$dest_root"
-  rm -rf "$dest_root/consult"
-  cp -R "$SKILL_SRC" "$dest_root/consult"
-  info "installed skill -> $dest_root/consult"
+  rm -rf "$dest_root/crossagent"
+  cp -R "$SKILL_SRC" "$dest_root/crossagent"
+  info "installed skill -> $dest_root/crossagent"
 }
 
 if [[ "$DO_SKILL" == 1 ]]; then
@@ -75,11 +75,11 @@ if [[ "$DO_CLI" == 1 ]]; then
   else
     warn "no pip/pipx found — install the CLI manually: pip install ."
   fi
-  if command -v consult >/dev/null 2>&1; then
-    info "CLI ready: $(command -v consult)"
-    consult --list-advisors || true
+  if command -v crossagent >/dev/null 2>&1; then
+    info "CLI ready: $(command -v crossagent)"
+    crossagent --list-advisors || true
   else
-    warn "'consult' is not on PATH yet. Ensure your user bin dir is on PATH."
+    warn "'crossagent' is not on PATH yet. Ensure your user bin dir is on PATH."
   fi
 fi
 

@@ -1,6 +1,6 @@
-# Consultation Protocol
+# Second-Opinion Protocol
 
-Use this reference when a consultation affects architecture, prompt behavior,
+Use this reference when a second opinion affects architecture, prompt behavior,
 debugging strategy, eval interpretation, or another decision where the second
 opinion must be evidence-backed.
 
@@ -44,7 +44,7 @@ Start a new name when the user changes the problem, project, or decision criteri
 You are a senior teammate in a joint decision. Evaluate the problem
 independently, inspect additional context when useful, and return a
 decision-useful critique. Do not edit files unless explicitly asked. Treat this
-as a read-only consultation.
+as a read-only review.
 </role>
 
 <decision>
@@ -94,30 +94,30 @@ Return concise markdown with these sections:
 Prepare the prompt in a temporary file, then call:
 
 ```bash
-consult --agent claude \
+crossagent --agent claude \
   --name "stable-topic-name" \
   --cwd "$PWD" \
   --model sonnet \
-  --prompt-file /tmp/consult.md
+  --prompt-file /tmp/crossagent.md
 ```
 
 Useful variants:
 
 ```bash
 # Pure reasoning, no tools (Claude).
-consult --name "stable-topic-name" --tools "" --prompt-file /tmp/consult.md
+crossagent --name "stable-topic-name" --tools "" --prompt-file /tmp/crossagent.md
 
-# Consult a different advisor.
-consult --agent codex --name "stable-topic-name" --prompt-file /tmp/consult.md
+# Ask a different advisor.
+crossagent --agent codex --name "stable-topic-name" --prompt-file /tmp/crossagent.md
 
 # Resume a known session directly.
-consult --resume "SESSION_ID_OR_SEARCH_TERM" --prompt-file /tmp/followup.md
+crossagent --resume "SESSION_ID_OR_SEARCH_TERM" --prompt-file /tmp/followup.md
 
-# Branch the same consultation history.
-consult --name "stable-topic-name" --fork-session --prompt-file /tmp/variant.md
+# Branch the same second-opinion history.
+crossagent --name "stable-topic-name" --fork-session --prompt-file /tmp/variant.md
 
 # Add a spend cap only when the user explicitly asks (Claude via --raw-arg).
-consult --name "stable-topic-name" --raw-arg --max-budget-usd --raw-arg 0.50 \
+crossagent --name "stable-topic-name" --raw-arg --max-budget-usd --raw-arg 0.50 \
   --prompt-file /tmp/capped.md
 ```
 
@@ -135,4 +135,4 @@ consult --name "stable-topic-name" --raw-arg --max-budget-usd --raw-arg 0.50 \
 - For Claude streaming, `stream-json` requires `--verbose` (the helper adds it automatically).
 - If a variadic option like `--tools` precedes the prompt, the helper inserts `--` so the prompt is not swallowed.
 - If a session was created without persistence, do not expect it to resume even if a `session_id` was returned.
-- Experimental advisors (codex, opencode, commandcode, gemini) use best-effort default flags. If your install differs, correct them in `~/.config/consult/advisors.json`.
+- Experimental advisors (codex, opencode, commandcode, gemini) use best-effort default flags. If your install differs, correct them in `~/.config/crossagent/advisors.json`.

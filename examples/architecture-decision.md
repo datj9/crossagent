@@ -32,10 +32,10 @@ Idempotency keys already exist on the charge endpoint.
 EOF
 ```
 
-## 2. Consult
+## 2. Ask a peer
 
 ```bash
-consult --agent claude --name payments-retry-design --cwd "$PWD" \
+crossagent --agent claude --name payments-retry-design --cwd "$PWD" \
   --tools "Read,Grep" --prompt-file /tmp/retry.md
 ```
 
@@ -52,7 +52,7 @@ dropped p99 by 35% but added ~2s worst-case settlement delay. Does that change y
 recommendation?
 EOF
 
-consult --name payments-retry-design --prompt-file /tmp/retry-followup.md
+crossagent --name payments-retry-design --prompt-file /tmp/retry-followup.md
 ```
 
 ## 4. Synthesize

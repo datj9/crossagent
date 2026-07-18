@@ -1,6 +1,6 @@
-"""Run a named, resumable consultation with a peer coding-agent CLI.
+"""Run a named, resumable second-opinion session with a peer coding-agent CLI.
 
-`consult` lets one AI coding agent get a second opinion from another. It builds
+`crossagent` lets one AI coding agent get a second opinion from another. It builds
 the right command for the chosen advisor (Claude by default), keeps the process
 alive until the advisor finishes, streams progress to stderr, prints the final
 answer to stdout, and remembers the session so a follow-up can resume it.
@@ -95,7 +95,7 @@ def build_command(advisor: Advisor, args: argparse.Namespace, registry: dict[str
 def summarize_event(event: dict[str, Any]) -> None:
     kind = event.get("type")
     if kind == "system" and event.get("subtype") == "init":
-        print(f"[consult] init session={event.get('session_id')} model={event.get('model')} "
+        print(f"[crossagent] init session={event.get('session_id')} model={event.get('model')} "
               f"cwd={event.get('cwd')}", file=sys.stderr)
     elif kind == "assistant":
         message = event.get("message", {})
@@ -103,13 +103,13 @@ def summarize_event(event: dict[str, Any]) -> None:
         text = "".join(b.get("text", "") for b in blocks
                        if isinstance(b, dict) and b.get("type") == "text")
         if text:
-            print(f"[consult] assistant: {text.replace(chr(10), ' ')[:240]}", file=sys.stderr)
+            print(f"[crossagent] assistant: {text.replace(chr(10), ' ')[:240]}", file=sys.stderr)
     elif kind == "result":
-        print(f"[consult] result subtype={event.get('subtype')} session={event.get('session_id')} "
+        print(f"[crossagent] result subtype={event.get('subtype')} session={event.get('session_id')} "
               f"cost={event.get('total_cost_usd')}", file=sys.stderr)
     elif kind == "rate_limit_event":
         info = event.get("rate_limit_info", {})
-        print(f"[consult] rate_limit status={info.get('status')} resetsAt={info.get('resetsAt')}",
+        print(f"[crossagent] rate_limit status={info.get('status')} resetsAt={info.get('resetsAt')}",
               file=sys.stderr)
 
 
@@ -144,14 +144,14 @@ def _run_text(cmd: list[str], cwd: str | None) -> tuple[int, str]:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(prog="consult", description=__doc__)
+    parser = argparse.ArgumentParser(prog="crossagent", description=__doc__)
     parser.add_argument("--agent", "--advisor", dest="agent", default="claude",
-                        help="Peer agent to consult: claude, codex, opencode, commandcode, gemini, or a custom advisor. Default: claude.")
-    parser.add_argument("--name", help="Stable consultation name. Reused names auto-resume the stored session.")
+                        help="Peer agent to ask: claude, codex, opencode, commandcode, gemini, or a custom advisor. Default: claude.")
+    parser.add_argument("--name", help="Stable session name. Reused names auto-resume the stored session.")
     parser.add_argument("--resume", help="Force a --resume target: session id or search term.")
     parser.add_argument("--new-session", action="store_true", help="Ignore any stored session for --name and start fresh.")
     parser.add_argument("--fork-session", action="store_true", help="Fork a new session from the existing conversation.")
-    parser.add_argument("--prompt-file", help="Path to the consultation prompt.")
+    parser.add_argument("--prompt-file", help="Path to the second-opinion prompt.")
     parser.add_argument("--prompt", help="Prompt text. Prefer --prompt-file for long prompts.")
     parser.add_argument("--cwd", help="Working directory for the advisor. Defaults to the current directory.")
     parser.add_argument("--model", default="", help="Advisor model or alias (advisor-specific). Empty = advisor default.")
@@ -186,11 +186,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         advisor = advisors_mod.resolve(args.agent)
     except KeyError as exc:
-        print(f"[consult] {exc}", file=sys.stderr)
+        print(f"[crossagent] {exc}", file=sys.stderr)
         return 2
 
     if advisor.experimental:
-        print(f"[consult] advisor '{advisor.name}' is experimental — verify flags for your install.",
+        print(f"[crossagent] advisor '{advisor.name}' is experimental — verify flags for your install.",
               file=sys.stderr)
 
     args._prompt = read_prompt(args)
@@ -198,12 +198,12 @@ def main(argv: list[str] | None = None) -> int:
     registry = reg.load(registry_path)
     cmd, key = build_command(advisor, args, registry)
 
-    print(f"[consult] running: {_redacted_command(cmd)}", file=sys.stderr)
+    print(f"[crossagent] running: {_redacted_command(cmd)}", file=sys.stderr)
 
     try:
         return _dispatch(advisor, args, cmd, key, registry, registry_path)
     except FileNotFoundError:
-        print(f"[consult] advisor CLI not found on PATH: '{advisor.executable}'. "
+        print(f"[crossagent] advisor CLI not found on PATH: '{advisor.executable}'. "
               f"Install it, or point '{advisor.name}' at the right executable in "
               f"{advisors_mod.USER_CONFIG}.", file=sys.stderr)
         return 127
@@ -216,7 +216,7 @@ def _dispatch(advisor: Advisor, args: argparse.Namespace, cmd: list[str], key: s
         if final:
             if final.get("is_error"):
                 errors = final.get("errors") or final.get("api_error_status") or "unknown error"
-                print(f"[consult] {advisor.name} returned error: {errors}", file=sys.stderr)
+                print(f"[crossagent] {advisor.name} returned error: {errors}", file=sys.stderr)
             result = final.get("result")
             structured = final.get("structured_output")
             if result:
@@ -227,7 +227,7 @@ def _dispatch(advisor: Advisor, args: argparse.Namespace, cmd: list[str], key: s
             if key and session_id:
                 reg.record(registry_path, registry, key, session_id=session_id, name=args.name,
                            cwd=args.cwd or os.getcwd(), advisor=advisor.name, model=args.model)
-                print(f"[consult] saved session name={key} id={session_id}", file=sys.stderr)
+                print(f"[crossagent] saved session name={key} id={session_id}", file=sys.stderr)
         return code
 
     code, out = _run_text(cmd, args.cwd)

@@ -1,6 +1,6 @@
 import json
 
-from consult import registry
+from crossagent import registry
 
 
 def test_session_key_slugifies_names():

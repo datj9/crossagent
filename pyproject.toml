@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "consult-cli"
+name = "crossagent"
 version = "0.1.0"
-description = "Get a second opinion from another AI coding agent. Consult Claude, Codex, OpenCode, CommandCode, or Gemini — from inside the agent you already use."
+description = "Get a second opinion from another AI coding agent. Ask Claude, Codex, OpenCode, CommandCode, or Gemini — from inside the agent you already use."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
@@ -27,16 +27,16 @@ Repository = "https://github.com/datj9/crossagent"
 Issues = "https://github.com/datj9/crossagent/issues"
 
 [project.scripts]
-consult = "consult.cli:main"
+crossagent = "crossagent.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/consult"]
+packages = ["src/crossagent"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/consult", "skills", "examples", "README.md", "LICENSE"]
+include = ["src/crossagent", "skills", "examples", "README.md", "LICENSE"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

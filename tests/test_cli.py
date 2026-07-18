@@ -1,6 +1,6 @@
-from consult import advisors
-from consult.advisors import Advisor
-from consult.cli import _redacted_command, build_command, main, parse_args
+from crossagent import advisors
+from crossagent.advisors import Advisor
+from crossagent.cli import _redacted_command, build_command, main, parse_args
 
 
 def _args(**overrides):
@@ -70,7 +70,7 @@ def test_command_preview_redacts_every_prompt_delivery():
 
 
 def test_missing_advisor_cli_exits_cleanly_without_logging_prompt(monkeypatch, capsys):
-    missing = Advisor(name="missing", executable="consult-definitely-missing-cli")
+    missing = Advisor(name="missing", executable="crossagent-definitely-missing-cli")
     monkeypatch.setattr(advisors, "resolve", lambda _name: missing)
 
     code = main(["--agent", "missing", "--prompt", "sensitive prompt"])

@@ -1,12 +1,12 @@
-# Contributing to consult
+# Contributing to crossagent
 
 Thanks for helping make agent-to-agent second opinions better.
 
 ## Ways to contribute
 
-- **Harden an experimental advisor.** `codex`, `opencode`, `commandcode`, and `gemini` ship best-effort default flags. If you run one of these, confirm the invocation and session behavior against a real install and send a PR to `src/consult/advisors.py` (plus a test).
+- **Harden an experimental advisor.** `codex`, `opencode`, `commandcode`, and `gemini` ship best-effort default flags. If you run one of these, confirm the invocation and session behavior against a real install and send a PR to `src/crossagent/advisors.py` (plus a test).
 - **Add a new advisor.** Any CLI agent that takes a prompt and prints an answer can be an advisor. Add a built-in entry or document it as a user-config recipe in the README.
-- **Improve the consultation protocol.** The value is in the prompt quality — see `skills/consult/references/consultation-protocol.md`.
+- **Improve the second-opinion protocol.** The value is in the prompt quality — see `skills/crossagent/references/second-opinion-protocol.md`.
 
 ## Dev setup
 
@@ -27,4 +27,4 @@ The runtime has **zero Python dependencies**. Tests use `pytest` but never invok
 
 ## Reporting issues
 
-Include your advisor CLI + version, the `consult` command you ran (redact secrets), and the `[consult] running: …` line from stderr.
+Include your advisor CLI + version, the `crossagent` command you ran (redact secrets), and the `[crossagent] running: …` line from stderr.
