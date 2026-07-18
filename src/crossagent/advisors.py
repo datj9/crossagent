@@ -23,7 +23,7 @@ PROMPT_DELIVERIES = frozenset({"dashdash", "positional"})
 # How to read the advisor's answer back out of its stdout.
 #   "claude-stream" -> parse newline-delimited stream-json events, take the result event
 #   "text"          -> capture raw stdout as the answer
-RESULT_PARSERS = frozenset({"claude-stream", "text"})
+RESULT_PARSERS = frozenset({"claude-stream", "codex-jsonl", "text"})
 
 USER_CONFIG = Path.home() / ".config" / "crossagent" / "advisors.json"
 
@@ -44,16 +44,18 @@ class Advisor:
     session_name_flag: str | None = None
     fork_flag: str | None = None
     result_parser: str = "text"
+    resume_command: tuple[str, ...] | None = None
+    session_event_field: str | None = None
     experimental: bool = False
     notes: str = ""
 
     @property
     def supports_sessions(self) -> bool:
-        return self.resume_flag is not None or self.session_name_flag is not None
+        return self.resume_flag is not None or self.session_name_flag is not None or self.resume_command is not None
 
     @property
     def supports_stream(self) -> bool:
-        return self.result_parser == "claude-stream"
+        return self.result_parser in ("claude-stream", "codex-jsonl")
 
 
 # --- Built-in advisors -------------------------------------------------------
@@ -81,9 +83,13 @@ _BUILTINS: dict[str, Advisor] = {
         base_args=("exec",),
         prompt_delivery="positional",
         model_flag="--model",
-        result_parser="text",
+        json_args=("--json",),
+        stream_args=("--json",),
+        result_parser="codex-jsonl",
+        resume_command=("resume",),
+        session_event_field="thread_id",
         experimental=True,
-        notes="Uses `codex exec <prompt>` (non-interactive). Resume not wired by default.",
+        notes="Uses `codex exec --json <prompt>` with JSONL event streaming and resume.",
     ),
     "opencode": Advisor(
         name="opencode",
@@ -123,7 +129,7 @@ _ALIASES = {"cmd": "commandcode", "cc": "claude", "oc": "opencode"}
 def _coerce(name: str, raw: dict[str, Any]) -> Advisor:
     """Build an Advisor from a user-config dict, layering onto a built-in if one exists."""
     base = _BUILTINS.get(name, Advisor(name=name, executable=raw.get("executable", name)))
-    tuple_fields = {"base_args", "invoke_args", "stream_args", "json_args"}
+    tuple_fields = {"base_args", "invoke_args", "stream_args", "json_args", "resume_command"}
     overrides: dict[str, Any] = {}
     for key, value in raw.items():
         if key in tuple_fields and isinstance(value, list):

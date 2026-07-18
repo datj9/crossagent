@@ -3,6 +3,57 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses semantic versioning.
 
+## [Unreleased]
+
+### Added
+- **Web dashboard** (`crossagent dashboard [--host H] [--port N] [--no-open]`):
+  local web UI at `http://127.0.0.1:8642/` served entirely from the Python
+  standard library — live auto-refreshing job table, per-job detail (status,
+  elapsed, idle, last event, error), and stdout/stderr log viewer. Loopback
+  bind by default with a warning on non-loopback hosts; job IDs are validated
+  against a strict pattern (no path traversal); the prompt file is never
+  routable.
+- **Job listing** (`crossagent list [--status STATE] [--limit N] [--json]`):
+  lists every job newest-first with status, advisor, elapsed, idle, and name.
+  Stale `running` jobs reconcile to `abandoned` during listing and unreadable
+  job directories are reported on stderr — no delegation is ever silently
+  dropped from view. Recovers job IDs lost to a parent timeout or context reset.
+- **Durable job lifecycle** (`crossagent start`/`wait`/`status`/`result`/`logs`/`cancel`):
+  Detached worker runs the advisor in the background; job state persists to
+  `~/.local/state/crossagent/jobs/<job-id>/`. The calling agent can poll with
+  bounded waits (`--timeout`) and recover by job ID after a parent timeout.
+  States: `pending`, `running`, `succeeded`, `failed`, `timed_out`, `cancelled`,
+  `abandoned`. Terminal states are final and immutable; stale `running` state
+  reconciles to `abandoned` on status.
+- **Unified process supervisor** (`src/crossagent/runner.py`): concurrent stdout/stderr
+  reader threads + queue, per-process-group isolation, heartbeat emission, idle
+  warning, max-runtime enforcement, and graceful then forced process-tree cleanup.
+- **Codex JSONL event streaming** (`result_parser = "codex-jsonl"`): the built-in
+  Codex adapter now uses `codex exec --json` and the `CodexJsonlParser` extracts
+  `agent_message` as the final answer, captures `thread_id` from `thread.started`,
+  detects `turn.failed`/`error` as failure, and builds `codex exec resume <id>` for
+  follow-ups. Malformed lines are preserved in diagnostic logs and ignored safely.
+- **Advisor parser interface** (`src/crossagent/parsers.py`): all advisor output
+  (text, Claude stream-json, Codex JSONL) goes through a common `EventParser`
+  protocol with `consume_stdout`/`consume_stderr`/`finish`, wired into both the
+  foreground CLI and the durable worker.
+
+### Changed
+- The installed agent skill (`skills/crossagent/SKILL.md`) now defaults to the
+  durable job workflow for agent-to-agent calls (start → bounded wait → recover
+  by job ID). The synchronous foreground shortcut is documented as an alternative.
+- README and skill documentation now specify precise lifecycle semantics
+  (heartbeat 15 s, idle warning 120 s, termination grace 10 s; durable start
+  defaults to 1800 s max runtime; foreground CLI remains unlimited for
+  compatibility).
+- All CLI examples in documentation have been verified against the actual
+  `argparse` surface of each subcommand.
+
+### Experimental
+- Codex JSONL support is experimental. The built-in
+  flags match `codex exec --json`. If your install differs, override in
+  `~/.config/crossagent/advisors.json`.
+
 ## [0.1.0] - 2026-07-18
 
 ### Added

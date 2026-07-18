@@ -89,9 +89,42 @@ Return concise markdown with these sections:
 </response_format>
 ```
 
-## Running The Helper
+## Running The Helper (Durable)
 
-Prepare the prompt in a temporary file, then call:
+For agent-to-agent calls where the parent tool call may time out, use the durable
+job workflow. This survives the calling agent's wall-clock limit.
+
+```bash
+# 1. Prepare the prompt in a temporary file, then start a durable job.
+crossagent start \
+  --agent claude \
+  --name "stable-topic-name" \
+  --cwd "$PWD" \
+  --model sonnet \
+  --prompt-file /tmp/crossagent.md \
+  --json
+
+# Output includes a job_id; retain it.
+```
+
+```bash
+# 2. Poll with bounded waits. Never wait indefinitely.
+crossagent wait JOB_ID --timeout 45 --json
+
+# If still running: do other work, then poll again.
+```
+
+```bash
+# 3. If the parent times out, recover by job ID.
+crossagent status JOB_ID --json
+
+# 4. On success, fetch the result.
+crossagent result JOB_ID
+```
+
+### Foreground shortcut (synchronous, no durability)
+
+For quick interactive use where a parent timeout is not a concern:
 
 ```bash
 crossagent --agent claude \
@@ -101,7 +134,7 @@ crossagent --agent claude \
   --prompt-file /tmp/crossagent.md
 ```
 
-Useful variants:
+### Useful variants
 
 ```bash
 # Pure reasoning, no tools (Claude).
@@ -121,6 +154,12 @@ crossagent --name "stable-topic-name" --raw-arg --max-budget-usd --raw-arg 0.50 
   --prompt-file /tmp/capped.md
 ```
 
+```bash
+# Durable variant: start a job with the same flags, then poll.
+crossagent start --agent claude --name "stable-topic-name" --tools "" \
+  --prompt-file /tmp/crossagent.md --json --max-runtime 900
+```
+
 ## Synthesizing The Answer
 
 1. Verify file/path/command claims when they matter and are cheap to check.
@@ -131,8 +170,10 @@ crossagent --name "stable-topic-name" --raw-arg --max-budget-usd --raw-arg 0.50 
 
 ## Failure Handling
 
+- **Parent timeout is not a job failure.** Recover by job ID with `crossagent status JOB_ID --json` and, if complete, `crossagent result JOB_ID`.
 - If a spend cap makes the advisor stop before the decision settles, remove or raise it deliberately and retry with a tighter context package.
 - For Claude streaming, `stream-json` requires `--verbose` (the helper adds it automatically).
-- If a variadic option like `--tools` precedes the prompt, the helper inserts `--` so the prompt is not swallowed.
+- If a variadic option like `--tools` precedes the prompt, the helper inserts `--` so the prompt is not swallowed. In the durable path, this happens in the worker's command construction.
 - If a session was created without persistence, do not expect it to resume even if a `session_id` was returned.
 - Experimental advisors (codex, opencode, commandcode, gemini) use best-effort default flags. If your install differs, correct them in `~/.config/crossagent/advisors.json`.
+- Codex now uses `--json` JSONL event streaming and supports `crossagent start` and `--name` for thread-ID storage and resume.
