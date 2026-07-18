@@ -6,6 +6,11 @@ All notable changes to this project are documented here. Format loosely follows
 ## [Unreleased]
 
 ### Added
+- **Job dashboard** (`crossagent list [--status STATE] [--limit N] [--json]`):
+  lists every job newest-first with status, advisor, elapsed, idle, and name.
+  Stale `running` jobs reconcile to `abandoned` during listing and unreadable
+  job directories are reported on stderr — no delegation is ever silently
+  dropped from view. Recovers job IDs lost to a parent timeout or context reset.
 - **Durable job lifecycle** (`crossagent start`/`wait`/`status`/`result`/`logs`/`cancel`):
   Detached worker runs the advisor in the background; job state persists to
   `~/.local/state/crossagent/jobs/<job-id>/`. The calling agent can poll with
@@ -38,7 +43,7 @@ All notable changes to this project are documented here. Format loosely follows
   `argparse` surface of each subcommand.
 
 ### Experimental
-- Codex JSONL support is experimental per the rollout strategy. The built-in
+- Codex JSONL support is experimental. The built-in
   flags match `codex exec --json`. If your install differs, override in
   `~/.config/crossagent/advisors.json`.
 

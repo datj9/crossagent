@@ -11,7 +11,8 @@ crossagent --agent claude --name payments-retry-design --prompt-file /tmp/decisi
 - 🤝 **Cross-agent, by design.** Ask **Claude, Codex, OpenCode, CommandCode, or Gemini** — from inside whichever agent you already use.
 - 🧠 **A teammate, not an oracle.** Ships a second-opinion protocol that forces an evidence-backed critique with cited files, risks, and a recommendation — then a synthesis step, so the second opinion sharpens *your* judgment instead of replacing it.
 - 🔁 **Named, resumable sessions.** Claude sessions and Codex threads resume by `advisor:name`. Fork to explore a branch.
-- 📡 **Durable, reconnection-safe jobs.** Bounded waits, heartbeats, and recovery by job ID — the job survives the parent's wall-clock timeout so you never lose the answer.
+- 📡 **No delegated job is ever silently dropped.** Every `start` persists durable state on disk; if the parent times out or the worker dies, the job resolves to an explicit terminal state (`succeeded`/`failed`/`timed_out`/`cancelled`/`abandoned`) and stays recoverable by job ID — you never lose the answer, or the fact that there was a job at all.
+- 📊 **Full observability on every delegation.** `crossagent list` is a dashboard of all jobs (status, elapsed, idle, last event); `status --json` reports live progress; `logs --follow` tails the advisor's raw output in real time.
 - 🧩 **Agent Skill + CLI.** Installs as an [Agent Skill](https://agentskills.dev) *and* a standalone `crossagent` command. Zero runtime dependencies.
 - 🔓 **Local & open.** Runs entirely on your machine against CLIs you already have. MIT licensed.
 
@@ -97,6 +98,49 @@ crossagent status job_20260718T100000_a1b2c3d4 --json
 crossagent result job_20260718T100000_a1b2c3d4
 ```
 
+### No silent drops
+
+A delegated job can never disappear without a trace:
+
+- Job state is persisted to disk (`~/.local/state/crossagent/jobs/<id>/`) before
+  the worker even launches, and every transition is written atomically.
+- If the worker process dies, the next `status`, `wait`, or `list` reconciles the
+  stale `running` state to an explicit `abandoned` — with the reason in `error`.
+- Every outcome is one of seven explicit states: `pending`, `running`,
+  `succeeded`, `failed`, `timed_out`, `cancelled`, `abandoned`. There is no
+  "gone" state.
+- Unreadable job directories are reported on stderr during `list`, never
+  skipped silently.
+
+### Observability: see every job's progress and output
+
+`crossagent list` is your dashboard over all delegations — including ones whose
+job ID you lost:
+
+```bash
+crossagent list                      # table: job id, status, advisor, elapsed, idle, name
+crossagent list --status running     # only active jobs
+crossagent list --limit 10 --json    # newest 10, machine-readable
+```
+
+```
+JOB ID                             STATUS     ADVISOR       ELAPSED   IDLE  NAME
+job_20260718T104500_ee55ff66       running    codex           3m07s     8s  order-workflow-design
+job_20260718T100000_aa11bb22       succeeded  claude          2m41s      -  payments-retry-design
+```
+
+Per-job progress and output:
+
+```bash
+crossagent status <job-id> --json    # elapsed_seconds, idle_seconds, last_event
+crossagent logs <job-id> --follow    # tail the advisor's live output
+crossagent logs <job-id> --stream stderr   # advisor diagnostics
+```
+
+`idle_seconds` distinguishes a healthy long-running advisor (recent output) from
+a silent one; the worker also emits heartbeats every 15 s and an idle warning at
+120 s to the job's log.
+
 Full reference: [`skills/crossagent/SKILL.md`](skills/crossagent/SKILL.md) and
 [examples/durable-job-recovery.md](examples/durable-job-recovery.md).
 
@@ -124,7 +168,7 @@ your agent ──▶ crossagent CLI ──▶ peer agent's CLI (claude -p / code
 
 1. You (or your agent) package the decision using the [second-opinion protocol](skills/crossagent/references/second-opinion-protocol.md).
 2. **Foreground:** `crossagent` runs the advisor synchronously, streams progress to stderr, and prints the answer to stdout.
-3. **Durable:** `crossagent start` spawns a detached worker that runs the advisor, persists state to disk, and returns a `job_id` immediately. Then `crossagent wait`/`status`/`result` retrieve the outcome.
+3. **Durable:** `crossagent start` spawns a detached worker that runs the advisor, persists state to disk, and returns a `job_id` immediately. Then `crossagent wait`/`status`/`result` retrieve the outcome, and `crossagent list` shows all jobs at a glance.
 4. For session-capable advisors (Claude with `stream-json`, Codex with `--json` JSONL), it stores the `session_id`/`thread_id` keyed by `advisor:name` so the next turn resumes.
 
 ## Advisors

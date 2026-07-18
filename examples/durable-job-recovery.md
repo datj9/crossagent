@@ -68,6 +68,19 @@ The calling agent's tool-call limit expires. The agent's next message contains
 the saved `job_id`. The agent **must not** start a new `crossagent start` for
 the same decision — it recovers.
 
+### Lost the job ID?
+
+If the parent's context was reset and the `job_id` is gone, list all jobs and
+find yours by name, advisor, and start time:
+
+```bash
+crossagent list --json
+crossagent list --status running     # only active jobs
+```
+
+Nothing is silently dropped: a job whose worker died shows up as `abandoned`,
+and unreadable job directories are reported on stderr.
+
 ## Step 4: Check status
 
 ```bash

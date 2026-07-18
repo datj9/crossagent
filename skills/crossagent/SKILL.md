@@ -1,7 +1,7 @@
 ---
 name: crossagent
 description: Use when the user wants a second opinion from another AI coding agent before deciding — "crossagent", "ask Claude", "hoi y voi Claude", "ask Codex", "debate with Claude", "get a second opinion", "what would Claude/Codex say". Runs crossagent to ask a peer agent (Claude, Codex, OpenCode, CommandCode, Gemini) via its CLI with named, resumable Claude sessions, streamed progress, a packaged context prompt, and a final synthesis comparing both viewpoints.
-version: 0.1.0
+version: 0.2.0
 author: Dat Nguyen
 ---
 
@@ -92,7 +92,10 @@ crossagent cancel job_20260718T100000_a1b2c3d4 --wait
 ```
 
 9. Keep the job ID in your working context. The same session name may appear in
-   multiple job IDs if the user retries; the job ID is the unique handle.
+   multiple job IDs if the user retries; the job ID is the unique handle. If the
+   ID is ever lost (e.g. after a context reset), recover it with
+   `crossagent list --json` — every job stays visible there until you delete its
+   state directory.
 
 ### Foreground shortcut (synchronous, no durability)
 
@@ -132,6 +135,7 @@ Only `--max-runtime` or explicit cancellation terminates the job.
 | `crossagent result JOB_ID` | Print the completed advisor answer to stdout. |
 | `crossagent logs JOB_ID [--follow] [--stream stdout\|stderr]` | Read or follow an advisor's log stream. |
 | `crossagent cancel JOB_ID [--wait] [--timeout N]` | Request cancellation and optionally wait for cleanup. |
+| `crossagent list [--status STATE] [--limit N] [--json]` | Dashboard of all jobs, newest first — status, elapsed, idle, name. Reconciles stale jobs to `abandoned` so nothing is silently dropped. Use it to rediscover a job when the ID was lost. |
 
 ### `start` flags
 
