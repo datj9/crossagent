@@ -42,6 +42,11 @@ _TERMINAL_STATES = frozenset({
     JobState.ABANDONED,
 })
 
+# A job is persisted before its detached worker has had a chance to record its
+# PID. Readers such as the dashboard must not treat that normal launch window
+# as evidence that the worker died.
+_PENDING_STARTUP_GRACE_SECONDS = 10
+
 
 def is_terminal(state: JobState) -> bool:
     """Return True when *state* is a terminal outcome."""
@@ -396,6 +401,9 @@ def reconcile_stale(job: Job, job_dir: Path) -> Job:
     """
     if is_terminal(job.status):
         return job
+    if (job.status == JobState.PENDING and job.worker_pid is None
+            and _pending_startup_grace_active(job)):
+        return job
     if job.worker_pid is None or not _pid_exists(job.worker_pid):
         return transition_to(
             job,
@@ -404,6 +412,21 @@ def reconcile_stale(job: Job, job_dir: Path) -> Job:
             error="Worker process no longer exists",
         )
     return job
+
+
+def _pending_startup_grace_active(job: Job) -> bool:
+    """Return whether a newly persisted pending job may still be launching."""
+    timestamp = job.updated_at or job.started_at
+    if not timestamp:
+        return False
+    try:
+        created = datetime.fromisoformat(timestamp)
+    except (TypeError, ValueError):
+        return False
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    age_seconds = (datetime.now(timezone.utc) - created).total_seconds()
+    return 0 <= age_seconds < _PENDING_STARTUP_GRACE_SECONDS
 
 
 def _pid_exists(pid: int) -> bool:
