@@ -115,6 +115,23 @@ def test_codex_parser_extracts_agent_message_blocks():
     assert result.result == "part1 part2"
 
 
+def test_codex_parser_extracts_agent_message_text_field():
+    """Real `codex exec --json` puts the answer in item.text, not item.content."""
+    parser = parsers.CodexJsonlParser()
+    for line in _emit(
+        {"type": "thread.started", "thread_id": "thread_abc"},
+        {"type": "turn.started"},
+        {"type": "item.completed", "item": {
+            "id": "item_4", "type": "agent_message", "text": "the final answer",
+        }},
+        {"type": "turn.completed"},
+    ):
+        parser.consume_stdout(line + "\n")
+    result = parser.finish(0)
+    assert result.result == "the final answer"
+    assert result.failure is False
+
+
 def test_codex_parser_turn_failed_is_failure():
     parser = parsers.CodexJsonlParser()
     for line in _emit(
