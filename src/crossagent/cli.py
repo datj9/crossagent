@@ -144,7 +144,7 @@ def _print_advisors() -> int:
     return 0
 
 
-_JOB_SUBCOMMANDS = {"start", "wait", "status", "result", "logs", "cancel"}
+_JOB_SUBCOMMANDS = {"start", "wait", "status", "result", "logs", "cancel", "list"}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -223,6 +223,8 @@ def _job_subcommand(subcommand: str, argv: list[str]) -> int:
         return _cmd_logs(args)
     if subcommand == "cancel":
         return _cmd_cancel(args)
+    if subcommand == "list":
+        return _cmd_list(args)
     return 2
 
 
@@ -253,6 +255,12 @@ def _parse_job_args(subcommand: str, argv: list[str]) -> argparse.Namespace:
         parser.add_argument("job_id")
         parser.add_argument("--wait", action="store_true")
         parser.add_argument("--timeout", type=float, default=45.0)
+    elif subcommand == "list":
+        parser.add_argument("--status", choices=[s.value for s in jobs_mod.JobState],
+                            help="Only show jobs in this state.")
+        parser.add_argument("--limit", type=int, default=0,
+                            help="Show at most N jobs, newest first (0 = all).")
+        parser.add_argument("--json", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -463,6 +471,87 @@ def _cmd_cancel(args: argparse.Namespace) -> int:
             print(f"[crossagent] job did not terminate within {args.timeout}s", file=sys.stderr)
             return 1
     return 0
+
+
+def _cmd_list(args: argparse.Namespace) -> int:
+    state_root = jobs_mod.default_state_root()
+    listed_jobs = _collect_jobs(state_root)
+
+    if args.status:
+        listed_jobs = [job for job in listed_jobs if job.status.value == args.status]
+
+    listed_jobs.sort(key=lambda job: (job.started_at, job.job_id), reverse=True)
+    if args.limit > 0:
+        listed_jobs = listed_jobs[: args.limit]
+
+    if args.json:
+        _json_print({
+            "schema_version": 1,
+            "jobs": [_format_list_entry(job) for job in listed_jobs],
+        })
+        return 0
+
+    _print_job_table(listed_jobs)
+    return 0
+
+
+def _collect_jobs(state_root: Path) -> list[jobs_mod.Job]:
+    """Load every job under *state_root*, reconciling stale state.
+
+    Unreadable job directories are skipped with a stderr warning — a job is
+    never silently dropped from the listing.
+    """
+    if not state_root.is_dir():
+        return []
+    collected: list[jobs_mod.Job] = []
+    for job_dir in sorted(state_root.iterdir()):
+        if not job_dir.is_dir():
+            continue
+        try:
+            job = jobs_mod.load_state(job_dir)
+        except (FileNotFoundError, jobs_mod.JobError) as exc:
+            print(f"[crossagent] skipping unreadable job dir {job_dir.name}: {exc}",
+                  file=sys.stderr)
+            continue
+        collected.append(jobs_mod.reconcile_stale(job, job_dir))
+    return collected
+
+
+def _format_list_entry(job: jobs_mod.Job) -> dict[str, Any]:
+    entry = _format_status(job)
+    entry["name"] = job.name
+    entry["started_at"] = job.started_at
+    return entry
+
+
+def _print_job_table(listed_jobs: list[jobs_mod.Job]) -> None:
+    if not listed_jobs:
+        print("[crossagent] no jobs found", file=sys.stderr)
+        return
+    header = f"{'JOB ID':<34} {'STATUS':<10} {'ADVISOR':<12} {'ELAPSED':>8} {'IDLE':>6}  NAME"
+    print(header)
+    for job in listed_jobs:
+        entry = _format_status(job)
+        elapsed = _format_duration(entry["elapsed_seconds"], job)
+        idle = "-" if jobs_mod.is_terminal(job.status) else _format_seconds(entry["idle_seconds"])
+        print(f"{job.job_id:<34} {job.status.value:<10} {job.advisor:<12} "
+              f"{elapsed:>8} {idle:>6}  {job.name}")
+
+
+def _format_duration(elapsed_seconds: int, job: jobs_mod.Job) -> str:
+    if job.duration_seconds is not None:
+        return _format_seconds(int(job.duration_seconds))
+    return _format_seconds(elapsed_seconds)
+
+
+def _format_seconds(total_seconds: int) -> str:
+    if total_seconds < 60:
+        return f"{total_seconds}s"
+    minutes, seconds = divmod(total_seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m{seconds:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
 
 
 # ---------------------------------------------------------------------------

@@ -342,6 +342,151 @@ def test_unknown_job_returns_error(state_dir, capsys):
     assert captured.out == ""
 
 
+# =========================================================================
+# list: dashboard over all jobs — nothing silently dropped
+# =========================================================================
+
+
+def _write_manual_job(
+    state_root: Path,
+    job_id: str,
+    status: jobs_mod.JobState,
+    *,
+    advisor: str = "codex",
+    name: str = "",
+    started_at: str = "",
+    worker_pid: "int | None" = None,
+    prompt: str = "hello",
+) -> None:
+    """Persist a job state dir directly, without launching a real worker."""
+    job_dir = state_root / job_id
+    job_dir.mkdir(parents=True)
+    now = datetime.now(timezone.utc).isoformat()
+    job = jobs_mod.Job(
+        schema_version=1,
+        job_id=job_id,
+        status=status,
+        advisor=advisor,
+        name=name,
+        cwd=os.getcwd(),
+        redacted_command=f"{advisor} exec <prompt>",
+        worker_pid=worker_pid,
+        started_at=started_at or now,
+        updated_at=now,
+        last_activity_at=now,
+        last_event="worker.started",
+    )
+    jobs_mod.save_state(job_dir, job)
+    (job_dir / "prompt").write_text(prompt, encoding="utf-8")
+
+
+def test_list_shows_all_jobs_newest_first(state_dir, capsys):
+    _write_manual_job(state_dir, "job_20260718T090000_aaaa1111",
+                      jobs_mod.JobState.SUCCEEDED,
+                      started_at="2026-07-18T09:00:00+00:00", name="older-job")
+    _write_manual_job(state_dir, "job_20260718T110000_bbbb2222",
+                      jobs_mod.JobState.FAILED,
+                      started_at="2026-07-18T11:00:00+00:00", name="newer-job")
+
+    code = main(["list", "--json"])
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    response = json.loads(captured.out)
+    assert response["schema_version"] == 1
+    job_ids = [entry["job_id"] for entry in response["jobs"]]
+    assert job_ids == ["job_20260718T110000_bbbb2222", "job_20260718T090000_aaaa1111"]
+    newest = response["jobs"][0]
+    assert newest["status"] == "failed"
+    assert newest["advisor"] == "codex"
+    assert newest["name"] == "newer-job"
+    assert "elapsed_seconds" in newest
+    assert "idle_seconds" in newest
+    assert "last_event" in newest
+
+
+def test_list_reconciles_stale_running_to_abandoned(state_dir, capsys):
+    _write_manual_job(state_dir, "job_stale_for_list",
+                      jobs_mod.JobState.RUNNING, worker_pid=99999999)
+
+    code = main(["list", "--json"])
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    response = json.loads(captured.out)
+    assert len(response["jobs"]) == 1
+    assert response["jobs"][0]["status"] == "abandoned"
+
+
+def test_list_filters_by_status(state_dir, capsys):
+    _write_manual_job(state_dir, "job_list_ok", jobs_mod.JobState.SUCCEEDED)
+    _write_manual_job(state_dir, "job_list_bad", jobs_mod.JobState.FAILED)
+
+    code = main(["list", "--status", "failed", "--json"])
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    response = json.loads(captured.out)
+    assert [entry["job_id"] for entry in response["jobs"]] == ["job_list_bad"]
+
+
+def test_list_respects_limit(state_dir, capsys):
+    for hour in ("09", "10", "11"):
+        _write_manual_job(state_dir, f"job_20260718T{hour}0000_cccc3333",
+                          jobs_mod.JobState.SUCCEEDED,
+                          started_at=f"2026-07-18T{hour}:00:00+00:00")
+
+    code = main(["list", "--limit", "2", "--json"])
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    response = json.loads(captured.out)
+    assert len(response["jobs"]) == 2
+    assert response["jobs"][0]["job_id"] == "job_20260718T110000_cccc3333"
+
+
+def test_list_empty_state_root_is_ok(state_dir, capsys):
+    code = main(["list", "--json"])
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    response = json.loads(captured.out)
+    assert response["jobs"] == []
+
+
+def test_list_human_output_is_a_table(state_dir, capsys):
+    _write_manual_job(state_dir, "job_table_row", jobs_mod.JobState.SUCCEEDED,
+                      name="table-test")
+
+    code = main(["list"])
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    assert "JOB ID" in captured.out
+    assert "job_table_row" in captured.out
+    assert "succeeded" in captured.out
+    assert "table-test" in captured.out
+
+
+def test_list_never_exposes_prompt(state_dir, capsys):
+    secret = "LIST_SECRET_PROMPT_99"
+    _write_manual_job(state_dir, "job_list_secret", jobs_mod.JobState.RUNNING,
+                      worker_pid=99999999, prompt=secret)
+
+    main(["list", "--json"])
+    assert secret not in capsys.readouterr().out
+    main(["list"])
+    assert secret not in capsys.readouterr().out
+
+
+def test_list_skips_corrupt_state_with_warning(state_dir, capsys):
+    _write_manual_job(state_dir, "job_list_good", jobs_mod.JobState.SUCCEEDED)
+    corrupt_dir = state_dir / "job_list_corrupt"
+    corrupt_dir.mkdir(parents=True)
+    (corrupt_dir / "state.json").write_text("{not json", encoding="utf-8")
+
+    code = main(["list", "--json"])
+    captured = capsys.readouterr()
+    assert code == 0
+    response = json.loads(captured.out)
+    assert [entry["job_id"] for entry in response["jobs"]] == ["job_list_good"]
+    assert "job_list_corrupt" in captured.err  # skipped loudly, not silently
+
+
 def test_logs_reads_stdout(state_dir, fake_codex_in_path, monkeypatch, capsys):
     monkeypatch.setenv("FAKE_CODEX_STDOUT_COUNT", "1")
     monkeypatch.setenv("FAKE_CODEX_STDOUT_SIZE", "30")
