@@ -28,6 +28,7 @@ from crossagent.cli import main
 
 
 _FAKE_CODEX_SCRIPT = '''#!/usr/bin/env python3
+import json
 import os
 import sys
 import time
@@ -38,17 +39,27 @@ stdout_size = int(os.environ.get("FAKE_CODEX_STDOUT_SIZE", "30"))
 stderr_count = int(os.environ.get("FAKE_CODEX_STDERR_COUNT", "0"))
 stderr_size = int(os.environ.get("FAKE_CODEX_STDERR_SIZE", "30"))
 exit_code = int(os.environ.get("FAKE_CODEX_EXIT_CODE", "0"))
+failure = os.environ.get("FAKE_CODEX_FAILURE", "")
 
 if sleep:
     time.sleep(sleep)
 
+print(json.dumps({"type": "thread.started", "thread_id": "thread_test_123"}))
+print(json.dumps({"type": "turn.started"}))
+
 for i in range(stdout_count):
     payload = max(0, stdout_size - 14)
-    print(f"stdout {i:05d} " + "x" * payload)
+    content = f"stdout {i:05d} " + "x" * payload
+    print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "content": content}}))
 
 for i in range(stderr_count):
     payload = max(0, stderr_size - 14)
     print(f"stderr {i:05d} " + "x" * payload, file=sys.stderr)
+
+if failure:
+    print(json.dumps({"type": "turn.failed", "error": failure}))
+else:
+    print(json.dumps({"type": "turn.completed"}))
 
 sys.exit(exit_code)
 '''
@@ -82,6 +93,7 @@ def _reset_codex_env(monkeypatch):
         "FAKE_CODEX_STDERR_COUNT",
         "FAKE_CODEX_STDERR_SIZE",
         "FAKE_CODEX_EXIT_CODE",
+        "FAKE_CODEX_FAILURE",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -342,4 +354,6 @@ def test_logs_reads_stdout(state_dir, fake_codex_in_path, monkeypatch, capsys):
     code = main(["logs", job_id])
     captured = capsys.readouterr()
     assert code == 0
-    assert captured.out.strip().startswith("stdout 00000")
+    # stdout.log contains the raw Codex JSONL lines.
+    assert "stdout 00000" in captured.out
+    assert "item.completed" in captured.out

@@ -11,12 +11,15 @@ import json
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 from . import jobs as jobs_mod
+from . import parsers as parsers_mod
+from . import registry as reg_mod
 from . import runner as runner_mod
 
 
@@ -29,7 +32,7 @@ class _JobCommand:
     command: list[str]
     prompt_delivery: str
     cwd: str
-    stream: bool
+    result_parser: str
     registry_path: str
     key: str
     name: Optional[str]
@@ -38,107 +41,34 @@ class _JobCommand:
 
 
 # ---------------------------------------------------------------------------
-# Worker consumer
+# Logging parser wrapper
 # ---------------------------------------------------------------------------
 
-class _WorkerTextConsumer:
-    """Streams stdout/stderr to their log files and writes stdout to result.md."""
-
-    def __init__(self, stdout_log: Path, stderr_log: Path, result_path: Path) -> None:
-        self._stdout_file = open(stdout_log, "w", encoding="utf-8")
-        self._stderr_file = open(stderr_log, "w", encoding="utf-8")
-        self._result_file = open(result_path, "w", encoding="utf-8")
-
-    def consume_stdout(self, line: str) -> None:
-        self._stdout_file.write(line)
-        self._result_file.write(line)
-
-    def consume_stderr(self, line: str) -> None:
-        self._stderr_file.write(line)
-
-    def finish(self, exit_code: int) -> None:
-        self._stdout_file.close()
-        self._stderr_file.close()
-        self._result_file.close()
-
-    def get_result(self) -> Optional[str]:
-        return None
-
-
-class _WorkerStreamConsumer:
-    """Logs stdout/stderr, delegates stream-json parsing to the CLI consumer, and
-    records the final result.
-    """
+class _LoggingParser:
+    """Wrap a parser and mirror stdout/stderr to their log files."""
 
     def __init__(
         self,
+        parser: parsers_mod.EventParser,
         stdout_log: Path,
         stderr_log: Path,
-        registry_path: Path,
-        key: str,
-        name: Optional[str],
-        cwd: str,
-        advisor: str,
-        model: str,
     ) -> None:
+        self._parser = parser
         self._stdout_file = open(stdout_log, "w", encoding="utf-8")
         self._stderr_file = open(stderr_log, "w", encoding="utf-8")
-        self._registry_path = registry_path
-        self._key = key
-        self._name = name
-        self._cwd = cwd
-        self._advisor = advisor
-        self._model = model
-        # Lazy import to avoid circular dependency with cli.py.
-        from . import cli as cli_mod
-        self._stream_consumer = cli_mod._StreamConsumer()
 
     def consume_stdout(self, line: str) -> None:
         self._stdout_file.write(line)
-        self._stream_consumer.consume_stdout(line)
+        self._parser.consume_stdout(line)
 
     def consume_stderr(self, line: str) -> None:
         self._stderr_file.write(line)
-        self._stream_consumer.consume_stderr(line)
+        self._parser.consume_stderr(line)
 
-    def finish(self, exit_code: int) -> Optional[dict[str, Any]]:
-        return self._stream_consumer.finish(exit_code)
-
-    def get_result(self) -> Optional[str]:
-        final = self._stream_consumer.finish(0)
-        if not final:
-            return None
-        self._record_session(final)
-        result = final.get("result")
-        if result is not None:
-            return result
-        structured = final.get("structured_output")
-        if structured is not None:
-            return json.dumps(structured, indent=2, sort_keys=True)
-        return None
-
-    def _record_session(self, final: dict[str, Any]) -> None:
-        if not self._key or not self._registry_path:
-            return
-        session_id = final.get("session_id")
-        if not session_id:
-            return
-        from . import registry as reg_mod
-        registry = reg_mod.load(self._registry_path)
-        reg_mod.record(
-            self._registry_path,
-            registry,
-            self._key,
-            session_id=session_id,
-            name=self._name,
-            cwd=self._cwd,
-            advisor=self._advisor,
-            model=self._model,
-        )
-
-    def close(self) -> None:
+    def finish(self, exit_code: int) -> parsers_mod.ParsedResult:
         self._stdout_file.close()
         self._stderr_file.close()
+        return self._parser.finish(exit_code)
 
 
 # ---------------------------------------------------------------------------
@@ -163,19 +93,24 @@ def worker_main(job_id: str, state_dir: Path) -> int:
     stderr_log = job_dir / "stderr.log"
     result_path = job_dir / "result.md"
 
-    if command.stream:
-        consumer: Any = _WorkerStreamConsumer(
-            stdout_log,
-            stderr_log,
-            Path(command.registry_path),
-            command.key,
-            command.name,
-            command.cwd,
-            command.advisor,
-            command.model,
+    last_state_write = time.monotonic()
+
+    def _on_activity(stream: str) -> None:
+        nonlocal job, last_state_write
+        now = time.monotonic()
+        if now - last_state_write < 1.0:
+            return
+        last_state_write = now
+        job = jobs_mod.transition_to(
+            job,
+            jobs_mod.JobState.RUNNING,
+            job_dir=job_dir,
+            last_activity_at=datetime.now(timezone.utc).isoformat(),
+            last_event=f"{stream}.activity",
         )
-    else:
-        consumer = _WorkerTextConsumer(stdout_log, stderr_log, result_path)
+
+    parser = parsers_mod.get_parser(command.result_parser, on_activity=_on_activity)
+    consumer = _LoggingParser(parser, stdout_log, stderr_log)
 
     def _should_cancel() -> bool:
         return jobs_mod.cancel_requested(job_dir)
@@ -200,12 +135,32 @@ def worker_main(job_id: str, state_dir: Path) -> int:
             should_cancel=_should_cancel,
         )
     finally:
-        if hasattr(consumer, "close"):
-            consumer.close()
+        consumer.finish(0)
 
-    result = consumer.get_result()
-    if result is not None:
-        result_path.write_text(result, encoding="utf-8")
+    parsed = outcome.result if isinstance(outcome.result, parsers_mod.ParsedResult) else parsers_mod.ParsedResult()
+
+    if parsed.session_id:
+        job = jobs_mod.transition_to(
+            job,
+            jobs_mod.JobState.RUNNING,
+            job_dir=job_dir,
+            advisor_session_id=parsed.session_id,
+        )
+        if command.key:
+            registry = reg_mod.load(Path(command.registry_path))
+            reg_mod.record(
+                Path(command.registry_path),
+                registry,
+                command.key,
+                session_id=parsed.session_id,
+                name=command.name,
+                cwd=command.cwd,
+                advisor=command.advisor,
+                model=command.model,
+            )
+
+    if parsed.result is not None:
+        result_path.write_text(parsed.result, encoding="utf-8")
         _chmod_private(result_path)
 
     if outcome.timed_out:
@@ -214,6 +169,9 @@ def worker_main(job_id: str, state_dir: Path) -> int:
     elif outcome.cancelled:
         final_state = jobs_mod.JobState.CANCELLED
         error = "Cancelled by user"
+    elif parsed.failure:
+        final_state = jobs_mod.JobState.FAILED
+        error = parsed.error or "Advisor reported a failure"
     elif outcome.exit_code == 0:
         final_state = jobs_mod.JobState.SUCCEEDED
         error = None
@@ -246,7 +204,7 @@ def _load_command(job_dir: Path) -> _JobCommand:
         command=list(data["command"]),
         prompt_delivery=str(data["prompt_delivery"]),
         cwd=str(data["cwd"]),
-        stream=bool(data["stream"]),
+        result_parser=str(data.get("result_parser", "text")),
         registry_path=str(data["registry_path"]),
         key=str(data["key"]),
         name=data.get("name"),

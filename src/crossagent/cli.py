@@ -14,7 +14,6 @@ import os
 import shlex
 import subprocess
 import sys
-import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +21,7 @@ from typing import Any
 
 from . import advisors as advisors_mod
 from . import jobs as jobs_mod
+from . import parsers as parsers_mod
 from . import registry as reg
 from . import runner as runner_mod
 from . import worker as worker_mod
@@ -86,8 +86,12 @@ def build_command(advisor: Advisor, args: argparse.Namespace, registry: dict[str
     if advisor.supports_sessions:
         if args.resume and advisor.resume_flag:
             cmd.extend([advisor.resume_flag, args.resume])
-        elif stored_id and not args.new_session and advisor.resume_flag:
-            cmd.extend([advisor.resume_flag, stored_id])
+        elif stored_id and not args.new_session:
+            if advisor.resume_command:
+                cmd.extend(advisor.resume_command)
+                cmd.append(stored_id)
+            elif advisor.resume_flag:
+                cmd.extend([advisor.resume_flag, stored_id])
         elif args.name and advisor.session_name_flag:
             cmd.extend([advisor.session_name_flag, args.name])
         if args.fork_session and advisor.fork_flag:
@@ -98,97 +102,11 @@ def build_command(advisor: Advisor, args: argparse.Namespace, registry: dict[str
     return cmd, key
 
 
-# --- Claude stream-json handling --------------------------------------------
-
-def summarize_event(event: dict[str, Any]) -> None:
-    kind = event.get("type")
-    if kind == "system" and event.get("subtype") == "init":
-        print(f"[crossagent] init session={event.get('session_id')} model={event.get('model')} "
-              f"cwd={event.get('cwd')}", file=sys.stderr)
-    elif kind == "assistant":
-        message = event.get("message", {})
-        blocks = message.get("content", []) if isinstance(message, dict) else []
-        text = "".join(b.get("text", "") for b in blocks
-                       if isinstance(b, dict) and b.get("type") == "text")
-        if text:
-            print(f"[crossagent] assistant: {text.replace(chr(10), ' ')[:240]}", file=sys.stderr)
-    elif kind == "result":
-        print(f"[crossagent] result subtype={event.get('subtype')} session={event.get('session_id')} "
-              f"cost={event.get('total_cost_usd')}", file=sys.stderr)
-    elif kind == "rate_limit_event":
-        info = event.get("rate_limit_info", {})
-        print(f"[crossagent] rate_limit status={info.get('status')} resetsAt={info.get('resetsAt')}",
-              file=sys.stderr)
-
-
-class _StreamConsumer:
-    """Consumer used by the old ``_run_stream`` path: parse JSON events, capture result."""
-
-    def __init__(self) -> None:
-        self.final: dict[str, Any] | None = None
-
-    def consume_stdout(self, line: str) -> None:
-        stripped = line.strip()
-        if not stripped:
-            return
-        try:
-            event = json.loads(stripped)
-        except json.JSONDecodeError:
-            print(stripped, file=sys.stderr)
-            return
-        summarize_event(event)
-        if event.get("type") == "result":
-            self.final = event
-
-    def consume_stderr(self, line: str) -> None:
-        print(line, file=sys.stderr, end="")
-
-    def finish(self, exit_code: int) -> dict[str, Any] | None:
-        return self.final
-
-
-class _TextConsumer:
-    """Consumer used by the old ``_run_text`` path: stream stdout to disk, stderr to screen."""
-
-    def __init__(self) -> None:
-        self._fd, self._path = tempfile.mkstemp(prefix="crossagent_stdout_", suffix=".txt")
-        self._file = os.fdopen(self._fd, "w", encoding="utf-8")
-
-    def consume_stdout(self, line: str) -> None:
-        self._file.write(line)
-
-    def consume_stderr(self, line: str) -> None:
-        print(line, file=sys.stderr, end="")
-
-    def finish(self, exit_code: int) -> str:
-        self._file.flush()
-        self._file.seek(0)
-        return self._file.read()
-
-    def cleanup(self) -> None:
-        try:
-            self._file.close()
-        except OSError:
-            pass
-        try:
-            os.unlink(self._path)
-        except OSError:
-            pass
-
-
-def _run_stream(cmd: list[str], cwd: str | None) -> tuple[int, dict[str, Any] | None]:
-    consumer = _StreamConsumer()
-    outcome = runner_mod.run(cmd, cwd=cwd, consumer=consumer, max_runtime_seconds=None)
-    return outcome.exit_code, outcome.result
-
-
-def _run_text(cmd: list[str], cwd: str | None) -> tuple[int, str]:
-    consumer = _TextConsumer()
-    try:
-        outcome = runner_mod.run(cmd, cwd=cwd, consumer=consumer, max_runtime_seconds=None)
-        return outcome.exit_code, outcome.result or ""
-    finally:
-        consumer.cleanup()
+def _run_advisor(cmd: list[str], cwd: str | None, parser_name: str) -> tuple[int, parsers_mod.ParsedResult]:
+    parser = parsers_mod.get_parser(parser_name)
+    outcome = runner_mod.run(cmd, cwd=cwd, consumer=parser, max_runtime_seconds=None)
+    parsed = outcome.result if isinstance(outcome.result, parsers_mod.ParsedResult) else parsers_mod.ParsedResult()
+    return outcome.exit_code, parsed
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -269,28 +187,21 @@ def _foreground_main(argv: list[str]) -> int:
 
 def _dispatch(advisor: Advisor, args: argparse.Namespace, cmd: list[str], key: str,
               registry: dict[str, Any], registry_path: Path) -> int:
-    if advisor.supports_stream and args.stream:
-        code, final = _run_stream(cmd, args.cwd)
-        if final:
-            if final.get("is_error"):
-                errors = final.get("errors") or final.get("api_error_status") or "unknown error"
-                print(f"[crossagent] {advisor.name} returned error: {errors}", file=sys.stderr)
-            result = final.get("result")
-            structured = final.get("structured_output")
-            if result:
-                print(result)
-            elif structured is not None:
-                print(json.dumps(structured, indent=2, sort_keys=True))
-            session_id = final.get("session_id")
-            if key and session_id:
-                reg.record(registry_path, registry, key, session_id=session_id, name=args.name,
-                           cwd=args.cwd or os.getcwd(), advisor=advisor.name, model=args.model)
-                print(f"[crossagent] saved session name={key} id={session_id}", file=sys.stderr)
-        return code
+    code, parsed = _run_advisor(cmd, args.cwd, advisor.result_parser)
 
-    code, out = _run_text(cmd, args.cwd)
-    if out.strip():
-        print(out, end="" if out.endswith("\n") else "\n")
+    if parsed.failure:
+        error = parsed.error or f"{advisor.name} exited with code {code}"
+        print(f"[crossagent] {advisor.name} returned error: {error}", file=sys.stderr)
+        return code if code != 0 else 1
+
+    if parsed.result is not None:
+        print(parsed.result, end="" if parsed.result.endswith("\n") else "\n")
+
+    if parsed.session_id and key:
+        reg.record(registry_path, registry, key, session_id=parsed.session_id, name=args.name,
+                   cwd=args.cwd or os.getcwd(), advisor=advisor.name, model=args.model)
+        print(f"[crossagent] saved session name={key} id={parsed.session_id}", file=sys.stderr)
+
     return code
 
 
@@ -579,7 +490,7 @@ def _write_command_info(
         "command": cmd,
         "prompt_delivery": advisor.prompt_delivery,
         "cwd": args.cwd or os.getcwd(),
-        "stream": bool(advisor.supports_stream and args.stream),
+        "result_parser": advisor.result_parser,
         "registry_path": str(registry_path),
         "key": key,
         "name": args.name,

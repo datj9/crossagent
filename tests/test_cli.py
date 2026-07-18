@@ -49,6 +49,26 @@ def test_codex_uses_positional_prompt():
     assert key == ""  # no --name given -> no session key
 
 
+def test_codex_command_includes_json_flag():
+    cmd, _ = build_command(advisors.resolve("codex"), _args(agent="codex"), {"sessions": {}})
+    assert "--json" in cmd
+
+
+def test_codex_no_stream_still_includes_json_flag():
+    cmd, _ = build_command(advisors.resolve("codex"), _args(agent="codex", stream=False), {"sessions": {}})
+    assert "--json" in cmd
+
+
+def test_codex_resumes_stored_thread():
+    registry = {"sessions": {"codex:topic-a": {"session_id": "thread-123"}}}
+    cmd, _ = build_command(advisors.resolve("codex"), _args(agent="codex", name="topic-a"), registry)
+    assert cmd[:2] == ["codex", "exec"]
+    assert "resume" in cmd
+    assert "thread-123" in cmd
+    assert cmd[-1] == "hello?"
+    assert "--json" in cmd
+
+
 def test_gemini_uses_flag_delivery():
     cmd, _ = build_command(advisors.resolve("gemini"), _args(agent="gemini"), {"sessions": {}})
     assert cmd[-2:] == ["-p", "hello?"]
