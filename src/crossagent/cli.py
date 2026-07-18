@@ -15,12 +15,16 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from . import advisors as advisors_mod
+from . import jobs as jobs_mod
 from . import registry as reg
 from . import runner as runner_mod
+from . import worker as worker_mod
 from .advisors import Advisor
 
 
@@ -51,7 +55,8 @@ def _redacted_command(cmd: list[str]) -> str:
     return shlex.join([*cmd[:-1], "<prompt>"])
 
 
-def build_command(advisor: Advisor, args: argparse.Namespace, registry: dict[str, Any]) -> tuple[list[str], str]:
+def build_command(advisor: Advisor, args: argparse.Namespace, registry: dict[str, Any],
+                  *, include_prompt: bool = True) -> tuple[list[str], str]:
     cmd = [advisor.executable, *advisor.base_args, *advisor.invoke_args]
 
     if args.model and advisor.model_flag:
@@ -88,7 +93,8 @@ def build_command(advisor: Advisor, args: argparse.Namespace, registry: dict[str
         if args.fork_session and advisor.fork_flag:
             cmd.append(advisor.fork_flag)
 
-    _append_prompt(cmd, advisor, prompt=args._prompt)
+    if include_prompt:
+        _append_prompt(cmd, advisor, prompt=args._prompt)
     return cmd, key
 
 
@@ -220,7 +226,17 @@ def _print_advisors() -> int:
     return 0
 
 
+_JOB_SUBCOMMANDS = {"start", "wait", "status", "result", "logs", "cancel"}
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] in _JOB_SUBCOMMANDS:
+        return _job_subcommand(argv[0], argv[1:])
+    return _foreground_main(argv)
+
+
+def _foreground_main(argv: list[str]) -> int:
     args = parse_args(argv)
     if args.list_advisors:
         return _print_advisors()
@@ -276,6 +292,356 @@ def _dispatch(advisor: Advisor, args: argparse.Namespace, cmd: list[str], key: s
     if out.strip():
         print(out, end="" if out.endswith("\n") else "\n")
     return code
+
+
+# ---------------------------------------------------------------------------
+# Durable job subcommands
+# ---------------------------------------------------------------------------
+
+def _job_subcommand(subcommand: str, argv: list[str]) -> int:
+    args = _parse_job_args(subcommand, argv)
+    if subcommand == "start":
+        return _cmd_start(args)
+    if subcommand == "wait":
+        return _cmd_wait(args)
+    if subcommand == "status":
+        return _cmd_status(args)
+    if subcommand == "result":
+        return _cmd_result(args)
+    if subcommand == "logs":
+        return _cmd_logs(args)
+    if subcommand == "cancel":
+        return _cmd_cancel(args)
+    return 2
+
+
+def _parse_job_args(subcommand: str, argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog=f"crossagent {subcommand}")
+    if subcommand == "start":
+        _add_advisor_args(parser)
+        parser.add_argument("--max-runtime", type=float, default=1800.0,
+                            help="Maximum seconds the advisor may run (default 1800).")
+        parser.add_argument("--termination-grace", type=float, default=10.0)
+        parser.add_argument("--json", action="store_true")
+        parser.set_defaults(stream=True)
+    elif subcommand == "wait":
+        parser.add_argument("job_id")
+        parser.add_argument("--timeout", type=float, default=45.0)
+        parser.add_argument("--require-complete", action="store_true")
+        parser.add_argument("--json", action="store_true")
+    elif subcommand == "status":
+        parser.add_argument("job_id")
+        parser.add_argument("--json", action="store_true")
+    elif subcommand == "result":
+        parser.add_argument("job_id")
+    elif subcommand == "logs":
+        parser.add_argument("job_id")
+        parser.add_argument("--follow", action="store_true")
+        parser.add_argument("--stream", choices=["stdout", "stderr"], default="stdout")
+    elif subcommand == "cancel":
+        parser.add_argument("job_id")
+        parser.add_argument("--wait", action="store_true")
+        parser.add_argument("--timeout", type=float, default=45.0)
+    return parser.parse_args(argv)
+
+
+def _add_advisor_args(parser: argparse.ArgumentParser) -> None:
+    """Add the same advisor/invocation flags used by the foreground CLI."""
+    parser.add_argument("--agent", "--advisor", dest="agent", default="claude")
+    parser.add_argument("--name")
+    parser.add_argument("--resume")
+    parser.add_argument("--new-session", action="store_true")
+    parser.add_argument("--fork-session", action="store_true")
+    parser.add_argument("--prompt-file")
+    parser.add_argument("--prompt")
+    parser.add_argument("--cwd")
+    parser.add_argument("--model", default="")
+    parser.add_argument("--safe-mode", action="store_true")
+    parser.add_argument("--no-stream", dest="stream", action="store_false")
+    parser.add_argument("--partial", action="store_true")
+    parser.add_argument("--tools")
+    parser.add_argument("--allowed-tools", action="append", default=[])
+    parser.add_argument("--permission-mode")
+    parser.add_argument("--system-prompt")
+    parser.add_argument("--raw-arg", action="append", default=[])
+    parser.add_argument("--registry", default=str(reg.DEFAULT_REGISTRY))
+
+
+def _cmd_start(args: argparse.Namespace) -> int:
+    try:
+        advisor = advisors_mod.resolve(args.agent)
+    except KeyError as exc:
+        print(f"[crossagent] {exc}", file=sys.stderr)
+        return 2
+
+    args._prompt = read_prompt(args)
+    registry_path = Path(args.registry).expanduser()
+    registry = reg.load(registry_path)
+    cmd, key = build_command(advisor, args, registry, include_prompt=False)
+
+    state_root = jobs_mod.default_state_root()
+    job_id = jobs_mod.generate_job_id()
+    job_dir = jobs_mod.create_job_dir(state_root, job_id)
+
+    _write_job_prompt(job_dir, args._prompt)
+    _write_command_info(job_dir, advisor, args, cmd, key, registry_path)
+
+    now = datetime.now(timezone.utc).isoformat()
+    job = jobs_mod.Job(
+        schema_version=1,
+        job_id=job_id,
+        status=jobs_mod.JobState.PENDING,
+        advisor=advisor.name,
+        name=args.name or "",
+        cwd=args.cwd or os.getcwd(),
+        redacted_command=_redacted_command([*cmd, "<prompt>"]),
+        started_at=now,
+        updated_at=now,
+        last_activity_at=now,
+        last_event="start.created",
+        max_runtime_seconds=int(args.max_runtime),
+        termination_grace_seconds=int(args.termination_grace),
+    )
+    jobs_mod.save_state(job_dir, job)
+
+    try:
+        worker_proc = worker_mod.start_worker(job_id, state_root)
+    except OSError as exc:
+        print(f"[crossagent] failed to launch worker: {exc}", file=sys.stderr)
+        return 1
+
+    # Wait briefly for the worker to confirm it has taken over.
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        try:
+            job = jobs_mod.load_state(job_dir)
+            if job.status != jobs_mod.JobState.PENDING:
+                break
+        except Exception:
+            pass
+        if worker_proc.poll() is not None:
+            break
+        time.sleep(0.05)
+
+    try:
+        job = jobs_mod.load_state(job_dir)
+    except Exception:
+        pass
+
+    if args.json:
+        _json_print({
+            "schema_version": job.schema_version,
+            "job_id": job.job_id,
+            "status": job.status.value,
+            "advisor": job.advisor,
+            "started_at": job.started_at,
+        })
+    else:
+        print(f"[crossagent] started {job.job_id} ({job.status.value})", file=sys.stderr)
+        print(job.job_id)
+    return 0 if worker_proc.poll() is None or job.status != jobs_mod.JobState.PENDING else 1
+
+
+def _cmd_wait(args: argparse.Namespace) -> int:
+    state_root = jobs_mod.default_state_root()
+    job_dir = jobs_mod.job_dir_path(state_root, args.job_id)
+    try:
+        job = jobs_mod.load_state(job_dir)
+    except FileNotFoundError:
+        print(f"[crossagent] unknown job: {args.job_id}", file=sys.stderr)
+        return 2
+
+    job = _load_and_reconcile(job_dir, job)
+    deadline = time.monotonic() + args.timeout
+    while not jobs_mod.is_terminal(job.status) and time.monotonic() < deadline:
+        time.sleep(0.1)
+        job = _load_and_reconcile(job_dir, job)
+
+    if args.json:
+        _json_print(_format_status(job))
+    else:
+        print(f"[crossagent] {job.job_id} status={job.status.value}", file=sys.stderr)
+
+    if args.require_complete and job.status != jobs_mod.JobState.SUCCEEDED:
+        return 1
+    return 0
+
+
+def _cmd_status(args: argparse.Namespace) -> int:
+    state_root = jobs_mod.default_state_root()
+    job_dir = jobs_mod.job_dir_path(state_root, args.job_id)
+    try:
+        job = jobs_mod.load_state(job_dir)
+    except FileNotFoundError:
+        print(f"[crossagent] unknown job: {args.job_id}", file=sys.stderr)
+        return 2
+
+    job = _load_and_reconcile(job_dir, job)
+    if args.json:
+        _json_print(_format_status(job))
+    else:
+        print(f"[crossagent] {job.job_id} status={job.status.value}", file=sys.stderr)
+    return 0
+
+
+def _cmd_result(args: argparse.Namespace) -> int:
+    state_root = jobs_mod.default_state_root()
+    job_dir = jobs_mod.job_dir_path(state_root, args.job_id)
+    try:
+        job = jobs_mod.load_state(job_dir)
+    except FileNotFoundError:
+        print(f"[crossagent] unknown job: {args.job_id}", file=sys.stderr)
+        return 2
+
+    if job.status != jobs_mod.JobState.SUCCEEDED:
+        print(f"[crossagent] job {job.job_id} is {job.status.value} — no result available",
+              file=sys.stderr)
+        return 1
+
+    result_path = job_dir / "result.md"
+    if not result_path.exists():
+        print(f"[crossagent] result file missing for {job.job_id}", file=sys.stderr)
+        return 1
+
+    print(result_path.read_text(encoding="utf-8"), end="")
+    return 0
+
+
+def _cmd_logs(args: argparse.Namespace) -> int:
+    state_root = jobs_mod.default_state_root()
+    job_dir = jobs_mod.job_dir_path(state_root, args.job_id)
+    try:
+        jobs_mod.load_state(job_dir)
+    except FileNotFoundError:
+        print(f"[crossagent] unknown job: {args.job_id}", file=sys.stderr)
+        return 2
+
+    log_path = job_dir / f"{args.stream}.log"
+    if not log_path.exists():
+        return 0
+
+    if args.follow:
+        return _follow_log(log_path, job_dir)
+
+    print(log_path.read_text(encoding="utf-8"), end="")
+    return 0
+
+
+def _cmd_cancel(args: argparse.Namespace) -> int:
+    state_root = jobs_mod.default_state_root()
+    job_dir = jobs_mod.job_dir_path(state_root, args.job_id)
+    try:
+        job = jobs_mod.load_state(job_dir)
+    except FileNotFoundError:
+        print(f"[crossagent] unknown job: {args.job_id}", file=sys.stderr)
+        return 2
+
+    if jobs_mod.is_terminal(job.status):
+        print(f"[crossagent] job {job.job_id} is already {job.status.value}", file=sys.stderr)
+        return 0
+
+    jobs_mod.create_cancel_request(job_dir)
+    print(f"[crossagent] cancellation requested for {job.job_id}", file=sys.stderr)
+
+    if args.wait:
+        deadline = time.monotonic() + args.timeout
+        while not jobs_mod.is_terminal(job.status) and time.monotonic() < deadline:
+            time.sleep(0.1)
+            job = _load_and_reconcile(job_dir, job)
+        if not jobs_mod.is_terminal(job.status):
+            print(f"[crossagent] job did not terminate within {args.timeout}s", file=sys.stderr)
+            return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand helpers
+# ---------------------------------------------------------------------------
+
+def _write_job_prompt(job_dir: Path, prompt: str) -> None:
+    prompt_path = job_dir / "prompt"
+    prompt_path.write_text(prompt, encoding="utf-8")
+    try:
+        prompt_path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def _write_command_info(
+    job_dir: Path,
+    advisor: Advisor,
+    args: argparse.Namespace,
+    cmd: list[str],
+    key: str,
+    registry_path: Path,
+) -> None:
+    info = {
+        "command": cmd,
+        "prompt_delivery": advisor.prompt_delivery,
+        "cwd": args.cwd or os.getcwd(),
+        "stream": bool(advisor.supports_stream and args.stream),
+        "registry_path": str(registry_path),
+        "key": key,
+        "name": args.name,
+        "model": args.model,
+        "advisor": advisor.name,
+    }
+    jobs_mod.atomic_json_write(info, job_dir / "command.json")
+
+
+def _json_print(data: dict[str, Any]) -> None:
+    print(json.dumps(data, indent=2, sort_keys=True))
+
+
+def _format_status(job: jobs_mod.Job) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    started = datetime.fromisoformat(job.started_at) if job.started_at else now
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    elapsed = int((now - started).total_seconds())
+    last_activity = datetime.fromisoformat(job.last_activity_at) if job.last_activity_at else started
+    if last_activity.tzinfo is None:
+        last_activity = last_activity.replace(tzinfo=timezone.utc)
+    idle = int((now - last_activity).total_seconds())
+    return {
+        "schema_version": job.schema_version,
+        "job_id": job.job_id,
+        "status": job.status.value,
+        "advisor": job.advisor,
+        "elapsed_seconds": elapsed,
+        "idle_seconds": idle,
+        "last_event": job.last_event,
+        "updated_at": job.updated_at,
+    }
+
+
+def _load_and_reconcile(job_dir: Path, job: jobs_mod.Job) -> jobs_mod.Job:
+    try:
+        fresh = jobs_mod.load_state(job_dir)
+    except FileNotFoundError:
+        return job
+    return jobs_mod.reconcile_stale(fresh, job_dir)
+
+
+def _follow_log(path: Path, job_dir: Path) -> int:
+    with open(path, "r", encoding="utf-8") as f:
+        while True:
+            line = f.readline()
+            if line:
+                print(line, end="")
+                continue
+            if not _job_active(job_dir):
+                break
+            time.sleep(0.1)
+    return 0
+
+
+def _job_active(job_dir: Path) -> bool:
+    try:
+        job = jobs_mod.load_state(job_dir)
+    except Exception:
+        return False
+    return not jobs_mod.is_terminal(job.status)
 
 
 if __name__ == "__main__":
