@@ -3,6 +3,20 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses semantic versioning.
 
+## [0.1.3] - 2026-07-18
+
+### Fixed
+- Stop the dashboard reconciler from corrupting job state: after observing a
+  worker PID die, `reconcile_stale` re-reads `state.json` and re-runs the full
+  liveness decision (terminal state, pending grace, live worker PID) on the
+  fresh copy before abandoning — closing the TOCTOU race that could flip
+  succeeded jobs to `abandoned`.
+- Treat `PermissionError` from `kill(pid, 0)` as "process alive" (EPERM means
+  the PID exists) instead of presuming the worker dead.
+- Allow a slow-booting worker to reclaim a job the reconciler marked
+  `abandoned` during the startup grace window, clearing stale abandonment
+  artefacts instead of crashing on an illegal state transition.
+
 ## [0.1.2] - 2026-07-18
 
 ### Fixed
