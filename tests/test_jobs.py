@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from crossagent.jobs import (
@@ -451,6 +452,24 @@ def test_reconcile_stale_no_worker_pid(tmp_path):
     result = reconcile_stale(job, job_dir)
     assert result.status == JobState.ABANDONED
     assert result.error is not None
+
+
+def test_reconcile_stale_recent_pending_job_keeps_starting(tmp_path):
+    job_dir = create_job_dir(tmp_path, "job_rec_pending_recent")
+    now = datetime.now(timezone.utc).isoformat()
+    job = Job(job_id="job_rec_pending_recent", status=JobState.PENDING,
+              worker_pid=None, updated_at=now)
+    result = reconcile_stale(job, job_dir)
+    assert result.status == JobState.PENDING
+
+
+def test_reconcile_stale_old_pending_job_is_abandoned(tmp_path):
+    job_dir = create_job_dir(tmp_path, "job_rec_pending_old")
+    old = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    job = Job(job_id="job_rec_pending_old", status=JobState.PENDING,
+              worker_pid=None, updated_at=old)
+    result = reconcile_stale(job, job_dir)
+    assert result.status == JobState.ABANDONED
 
 
 def test_reconcile_stale_missing_worker(tmp_path):

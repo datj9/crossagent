@@ -112,6 +112,25 @@ def test_api_jobs_lists_jobs(state_dir, server_url):
     assert "idle_seconds" in entry
 
 
+def test_api_jobs_lists_live_running_job(state_dir, server_url):
+    _write_manual_job(state_dir, "job_dash_running", jobs_mod.JobState.RUNNING,
+                      worker_pid=os.getpid())
+    status, body = _get(server_url + "/api/jobs")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["jobs"][0]["job_id"] == "job_dash_running"
+    assert payload["jobs"][0]["status"] == "running"
+
+
+def test_api_jobs_does_not_abandon_job_during_startup(state_dir, server_url):
+    _write_manual_job(state_dir, "job_dash_starting", jobs_mod.JobState.PENDING)
+    status, body = _get(server_url + "/api/jobs")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["jobs"][0]["job_id"] == "job_dash_starting"
+    assert payload["jobs"][0]["status"] == "pending"
+
+
 def test_api_jobs_reconciles_stale_to_abandoned(state_dir, server_url):
     _write_manual_job(state_dir, "job_dash_stale", jobs_mod.JobState.RUNNING,
                       worker_pid=99999999)
