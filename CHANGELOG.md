@@ -3,6 +3,12 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses semantic versioning.
 
+## [0.1.4] - 2026-07-18
+
+### Added
+- `-v` / `--version` flag on the top-level CLI: prints `crossagent <version>`
+  and exits.
+
 ## [0.1.3] - 2026-07-18
 
 ### Fixed
