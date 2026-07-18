@@ -57,8 +57,18 @@ def assert_valid_transition(from_state: JobState, to_state: JobState) -> None:
     """Raise :class:`ValueError` if moving from a terminal state to a different one.
 
     Transitioning to the same state is always allowed (no-op).
+
+    Special case: ABANDONED → RUNNING is permitted so that a slow-starting
+    worker (whose startup exceeded the pending grace window) can reclaim the
+    job instead of crashing and leaving it permanently stuck.  ABANDONED is a
+    reconciler *presumption*, not a confirmed terminal outcome, so this
+    one reclaim edge is safe.  All other terminal states remain frozen.
     """
     if is_terminal(from_state) and from_state != to_state:
+        # Allow the reconciler-presumed ABANDONED state to be reclaimed by a
+        # late-booting worker transitioning back to RUNNING.
+        if from_state == JobState.ABANDONED and to_state == JobState.RUNNING:
+            return
         raise ValueError(
             f"Cannot transition from terminal state '{from_state.value}' "
             f"to '{to_state.value}'"
@@ -361,6 +371,12 @@ def transition_to(
     """Return a new ``Job`` with *new_status*, rejecting invalid regressions.
 
     If *job_dir* is supplied the updated state is also persisted atomically.
+
+    When reclaiming an ABANDONED job back to a nonterminal state (the one
+    permitted ABANDONED → RUNNING edge), stale terminal fields written during
+    the abandonment (error, finished_at, duration_seconds) are cleared so they
+    do not linger on the recovered job.  Callers may override any of these by
+    passing explicit keyword arguments.
     """
     assert_valid_transition(job.status, new_status)
     now_utc = datetime.now(timezone.utc)
@@ -376,6 +392,12 @@ def transition_to(
             started = started.replace(tzinfo=timezone.utc)
         updates["finished_at"] = now
         updates["duration_seconds"] = (now_utc - started).total_seconds()
+    # Reclaim edge: ABANDONED → nonterminal.  Clear stale abandonment artefacts
+    # unless the caller explicitly overrides them.
+    elif job.status == JobState.ABANDONED and not is_terminal(new_status):
+        updates.setdefault("error", None)
+        updates.setdefault("finished_at", None)
+        updates.setdefault("duration_seconds", None)
     new_job = _update_job(job, updates)
     if job_dir is not None:
         save_state(job_dir, new_job)
@@ -398,6 +420,12 @@ def reconcile_stale(job: Job, job_dir: Path) -> Job:
 
     Returns the (potentially updated) Job.  The updated state is persisted
     if a transition occurs.
+
+    TOCTOU guard: the worker always writes its terminal state to disk *before*
+    exiting.  After confirming the PID is gone we therefore re-read state.json
+    from disk — if the fresh copy is already terminal (worker wrote it), we
+    return that authoritative state without writing ABANDONED on top.  Only
+    when the freshly-loaded state is still nonterminal do we persist ABANDONED.
     """
     if is_terminal(job.status):
         return job
@@ -405,8 +433,18 @@ def reconcile_stale(job: Job, job_dir: Path) -> Job:
             and _pending_startup_grace_active(job)):
         return job
     if job.worker_pid is None or not _pid_exists(job.worker_pid):
+        # Re-load from disk to close the TOCTOU window: the worker may have
+        # written a terminal state between our last read and now.
+        try:
+            fresh_job = load_state(job_dir)
+        except (FileNotFoundError, JobError):
+            # state.json is unreadable — fall back to the in-memory copy.
+            fresh_job = job
+        if is_terminal(fresh_job.status):
+            # Worker already persisted its outcome; honour it.
+            return fresh_job
         return transition_to(
-            job,
+            fresh_job,
             JobState.ABANDONED,
             job_dir=job_dir,
             error="Worker process no longer exists",
@@ -430,7 +468,14 @@ def _pending_startup_grace_active(job: Job) -> bool:
 
 
 def _pid_exists(pid: int) -> bool:
-    """Best-effort check whether *pid* refers to a live process."""
+    """Best-effort check whether *pid* refers to a live process.
+
+    On POSIX, ``os.kill(pid, 0)`` semantics:
+      - No exception        → process exists and is signalable.
+      - ``PermissionError`` → EPERM: process EXISTS but is owned by another user.
+      - ``ProcessLookupError`` → ESRCH: process does not exist.
+      - Other ``OSError``  → treat conservatively as dead.
+    """
     if sys.platform == "win32":
         try:
             import ctypes
@@ -445,7 +490,13 @@ def _pid_exists(pid: int) -> bool:
     try:
         os.kill(pid, 0)
         return True
-    except (OSError, PermissionError):
+    except PermissionError:
+        # EPERM: the process exists but is owned by a different user.
+        return True
+    except ProcessLookupError:
+        # ESRCH: no process with this PID.
+        return False
+    except OSError:
         return False
 
 

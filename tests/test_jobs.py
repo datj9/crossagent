@@ -15,6 +15,10 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import subprocess
+
+import pytest
+
 from crossagent.jobs import (
     CorruptStateError,
     InvalidStateError,
@@ -22,6 +26,7 @@ from crossagent.jobs import (
     JobState,
     _job_to_dict,
     _dict_to_job,
+    _pid_exists,
     assert_valid_transition,
     atomic_json_read,
     atomic_json_write,
@@ -87,10 +92,16 @@ def test_transition_terminal_to_different_raises():
 
 
 def test_transition_all_terminal_to_non_terminal_raises():
+    # ABANDONED → RUNNING is the one permitted reclaim edge; skip that pair.
+    reclaim_edge = (JobState.ABANDONED, JobState.RUNNING)
     for terminal in JobState:
         if not is_terminal(terminal):
             continue
         for non_terminal in (JobState.PENDING, JobState.RUNNING):
+            if (terminal, non_terminal) == reclaim_edge:
+                # This edge must NOT raise — it is intentionally allowed.
+                assert_valid_transition(terminal, non_terminal)  # no exception
+                continue
             try:
                 assert_valid_transition(terminal, non_terminal)
                 assert False, f"Expected ValueError: {terminal} -> {non_terminal}"
@@ -510,3 +521,199 @@ def test_dict_to_job_missing_optional_defaults():
     job = _dict_to_job(d)
     assert job.worker_pid is None
     assert job.advisor == ""
+
+
+# =========================================================================
+# Regression tests for the three-part TOCTOU / abandoned-race bug fix
+# =========================================================================
+
+
+def test_reconcile_stale_does_not_overwrite_terminal_write_after_load(tmp_path):
+    """Race #1 (TOCTOU): stale RUNNING dashboard copy must not clobber SUCCEEDED.
+
+    Sequence under test:
+      1. Dashboard loads state.json while worker is RUNNING → gets a RUNNING copy.
+      2. Worker writes SUCCEEDED to disk and exits (PID gone).
+      3. reconcile_stale is called with the stale RUNNING copy.
+
+    Fixed behaviour: reconcile_stale re-reads disk after seeing the PID gone
+    and finds SUCCEEDED → returns SUCCEEDED without persisting ABANDONED.
+    Old behaviour: would call transition_to(ABANDONED) on the stale copy and
+    overwrite the on-disk SUCCEEDED.
+    """
+    job_dir = create_job_dir(tmp_path, "job_toctou")
+
+    # Spawn a real subprocess as the fake worker so we have a live PID.
+    worker_proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    worker_pid = worker_proc.pid
+
+    # Step 1: persist RUNNING with the live worker PID.
+    running_job = Job(
+        job_id="job_toctou",
+        status=JobState.RUNNING,
+        worker_pid=worker_pid,
+        started_at=datetime.now(timezone.utc).isoformat(),
+    )
+    save_state(job_dir, running_job)
+
+    # Step 2: dashboard loads the state (simulates the stale in-memory copy).
+    stale_dashboard_copy = load_state(job_dir)
+    assert stale_dashboard_copy.status == JobState.RUNNING
+
+    # Step 3: worker finishes — write SUCCEEDED to disk, then kill and wait.
+    succeeded_job = transition_to(stale_dashboard_copy, JobState.SUCCEEDED, job_dir=job_dir)
+    assert succeeded_job.status == JobState.SUCCEEDED
+
+    # Terminate the subprocess and wait so the PID is truly gone.
+    worker_proc.kill()
+    worker_proc.wait()
+
+    # Step 4: reconcile_stale is called with the stale RUNNING copy (not the fresh one).
+    # The PID is now gone, but state.json on disk already says SUCCEEDED.
+    result = reconcile_stale(stale_dashboard_copy, job_dir)
+
+    # Both the returned job and on-disk state must be SUCCEEDED, not ABANDONED.
+    assert result.status == JobState.SUCCEEDED, (
+        f"Expected SUCCEEDED but got {result.status!r} — "
+        "reconcile_stale overwrote the worker's terminal state with ABANDONED"
+    )
+    on_disk = load_state(job_dir)
+    assert on_disk.status == JobState.SUCCEEDED, (
+        f"On-disk status is {on_disk.status!r} — reconcile_stale persisted ABANDONED "
+        "on top of the worker-written SUCCEEDED"
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX os.kill(pid, 0) semantics only")
+def test_pid_exists_treats_permission_error_as_alive(monkeypatch):
+    """EPERM from os.kill means the process EXISTS but is not signalable.
+
+    Old code caught (OSError, PermissionError) together → returned False.
+    Fixed code catches PermissionError separately → returns True.
+    """
+    import crossagent.jobs as jobs_module
+
+    def raise_permission_error(pid: int, sig: int) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(jobs_module.os, "kill", raise_permission_error)
+    assert jobs_module._pid_exists(12345) is True
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX os.kill(pid, 0) semantics only")
+def test_pid_exists_treats_process_lookup_error_as_dead(monkeypatch):
+    """ESRCH from os.kill means no process with this PID exists."""
+    import crossagent.jobs as jobs_module
+
+    def raise_no_such_process(pid: int, sig: int) -> None:
+        raise ProcessLookupError(3, "No such process")
+
+    monkeypatch.setattr(jobs_module.os, "kill", raise_no_such_process)
+    assert jobs_module._pid_exists(12345) is False
+
+
+def test_abandoned_job_can_be_reclaimed_to_running():
+    """ABANDONED → RUNNING must be a permitted transition (reclaim edge).
+
+    All other terminal → RUNNING (or any non-terminal) transitions must still raise.
+    """
+    # Reclaim edge: must NOT raise.
+    assert_valid_transition(JobState.ABANDONED, JobState.RUNNING)
+
+    # Other terminal states must remain frozen against non-terminal targets.
+    for from_state in (JobState.SUCCEEDED, JobState.CANCELLED, JobState.FAILED, JobState.TIMED_OUT):
+        try:
+            assert_valid_transition(from_state, JobState.RUNNING)
+            assert False, f"Expected ValueError for {from_state} -> RUNNING"
+        except ValueError:
+            pass
+
+    # ABANDONED → SUCCEEDED (same terminal, different value) must still raise.
+    try:
+        assert_valid_transition(JobState.ABANDONED, JobState.SUCCEEDED)
+        assert False, "Expected ValueError for ABANDONED -> SUCCEEDED"
+    except ValueError:
+        pass
+
+
+def test_reclaim_clears_stale_abandonment_fields(tmp_path):
+    """Reclaiming an ABANDONED job via transition_to(RUNNING) clears error/finished_at/duration_seconds.
+
+    When the reconciler wrongly abandons a job (race #2), the late-booting worker
+    reclaims it with ABANDONED → RUNNING.  The abandonment artefacts written during
+    the false ABANDONED transition must not carry forward onto the recovered job.
+    """
+    job_dir = create_job_dir(tmp_path, "job_reclaim_fields")
+    started = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+
+    # Build an ABANDONED job that has all the error/timing artefacts set.
+    abandoned_job = Job(
+        job_id="job_reclaim_fields",
+        status=JobState.ABANDONED,
+        started_at=started,
+        finished_at=datetime.now(timezone.utc).isoformat(),
+        duration_seconds=5.0,
+        error="Worker process no longer exists",
+    )
+
+    # Reclaim via transition_to — the fixed code clears abandonment artefacts.
+    reclaimed = transition_to(abandoned_job, JobState.RUNNING)
+
+    assert reclaimed.status == JobState.RUNNING
+    assert reclaimed.error is None, f"error should be cleared, got {reclaimed.error!r}"
+    assert reclaimed.finished_at is None, f"finished_at should be cleared, got {reclaimed.finished_at!r}"
+    assert reclaimed.duration_seconds is None, f"duration_seconds should be cleared, got {reclaimed.duration_seconds!r}"
+
+
+def test_reconciled_abandoned_pending_job_recovers_when_worker_boots(tmp_path):
+    """End-to-end of the slow-boot race (race #2).
+
+    Sequence:
+      1. PENDING job saved with timestamps 15+ seconds in the past, no worker_pid.
+      2. reconcile_stale runs → sees no PID, grace window expired → persists ABANDONED.
+      3. Late worker boots: loads state, sees ABANDONED, calls transition_to(RUNNING).
+         Fixed behaviour: transition succeeds (ABANDONED → RUNNING reclaim edge allowed).
+         Old behaviour: ValueError raised, worker crashes, job stuck abandoned forever.
+    """
+    job_dir = create_job_dir(tmp_path, "job_slow_boot")
+    stale_timestamp = (datetime.now(timezone.utc) - timedelta(seconds=15)).isoformat()
+
+    # Step 1: persist an old PENDING job with no worker_pid.
+    pending_job = Job(
+        job_id="job_slow_boot",
+        status=JobState.PENDING,
+        worker_pid=None,
+        updated_at=stale_timestamp,
+        started_at=stale_timestamp,
+    )
+    save_state(job_dir, pending_job)
+
+    # Step 2: reconcile_stale should abandon the stale pending job.
+    result = reconcile_stale(pending_job, job_dir)
+    assert result.status == JobState.ABANDONED, (
+        f"Expected reconcile_stale to produce ABANDONED for an old PENDING job, got {result.status!r}"
+    )
+    on_disk_after_reconcile = load_state(job_dir)
+    assert on_disk_after_reconcile.status == JobState.ABANDONED
+
+    # Step 3: simulate the late worker booting — load state, see ABANDONED, transition to RUNNING.
+    # Use os.getpid() as a known-live worker_pid.
+    late_boot_state = load_state(job_dir)
+    assert late_boot_state.status == JobState.ABANDONED
+
+    # This must NOT raise ValueError — ABANDONED → RUNNING is the reclaim edge.
+    recovered = transition_to(
+        late_boot_state,
+        JobState.RUNNING,
+        job_dir=job_dir,
+        worker_pid=os.getpid(),
+    )
+
+    assert recovered.status == JobState.RUNNING
+    on_disk_recovered = load_state(job_dir)
+    assert on_disk_recovered.status == JobState.RUNNING
+    assert on_disk_recovered.worker_pid == os.getpid()
