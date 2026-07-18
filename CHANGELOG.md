@@ -3,6 +3,15 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses semantic versioning.
 
+## [0.1.2] - 2026-07-18
+
+### Fixed
+- Extract the final Codex response from the `item.text` field emitted by current
+  `codex exec --json` versions, while retaining support for older content shapes.
+- Keep newly launched jobs visible on the dashboard by allowing the detached
+  worker a short startup grace period to record its PID. Stale running jobs and
+  genuinely orphaned pending jobs are still reconciled to `abandoned`.
+
 ## [0.1.1] - 2026-07-18
 
 ### Added
