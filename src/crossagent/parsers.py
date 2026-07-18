@@ -248,6 +248,11 @@ class CodexJsonlParser(EventParser):
 
     @staticmethod
     def _extract_message_text(item: dict[str, Any]) -> Optional[str]:
+        # `codex exec --json` emits the answer as item.text; older/alternate
+        # shapes carry item.content as a string or a list of text blocks.
+        text = item.get("text")
+        if isinstance(text, str):
+            return text
         content = item.get("content")
         if isinstance(content, str):
             return content
