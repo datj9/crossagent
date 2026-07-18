@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses semantic versioning.
 
-## [Unreleased]
+## [0.1.1] - 2026-07-18
 
 ### Added
 - **Web dashboard** (`crossagent dashboard [--host H] [--port N] [--no-open]`):
