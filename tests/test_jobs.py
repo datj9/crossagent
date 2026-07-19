@@ -40,6 +40,7 @@ from crossagent.jobs import (
     list_status,
     load_state,
     reconcile_stale,
+    runtime_status,
     save_state,
     status_response,
     transition_to,
@@ -773,3 +774,35 @@ def test_reconciled_abandoned_pending_job_recovers_when_worker_boots(tmp_path):
     on_disk_recovered = load_state(job_dir)
     assert on_disk_recovered.status == JobState.RUNNING
     assert on_disk_recovered.worker_pid == os.getpid()
+
+
+# =========================================================================
+# Z-suffix timestamp tolerance (Python 3.9/3.10 compat)
+# =========================================================================
+
+
+def test_runtime_status_handles_z_suffix_timestamps():
+    """Z-suffixed UTC timestamps must not crash runtime_status on Python 3.9/3.10."""
+    job = Job(
+        job_id="job_z_suffix",
+        status=JobState.RUNNING,
+        started_at="2026-07-19T00:00:00Z",
+        last_activity_at="2026-07-19T00:00:30Z",
+    )
+    result = runtime_status(job)
+    assert result["status"] == "running"
+    assert result["elapsed_seconds"] >= 0
+    assert result["idle_seconds"] >= 0
+
+
+def test_transition_to_handles_z_suffix_started_at(tmp_path):
+    job = Job(
+        job_id="job_z_transition",
+        status=JobState.RUNNING,
+        started_at="2026-07-19T00:00:00Z",
+    )
+    updated = transition_to(job, JobState.SUCCEEDED, job_dir=tmp_path)
+    assert updated.status == JobState.SUCCEEDED
+    assert updated.finished_at is not None
+    assert updated.duration_seconds is not None
+    assert updated.duration_seconds >= 0
