@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import tempfile
 from dataclasses import asdict, dataclass, fields
@@ -17,10 +18,22 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+# Lineage parent ids arrive from CLI flags and environment variables, so they
+# are untrusted. Only the generated ``job_<...>`` shape is accepted; rejecting
+# anything else prevents ``../`` traversal or absolute-path escapes out of the
+# state root when a parent directory is resolved.
+_SAFE_JOB_ID_PATTERN = re.compile(r"^job_[A-Za-z0-9_\-]+$")
+
+
+def _is_safe_job_id(job_id: str) -> bool:
+    """Return True if *job_id* is a syntactically valid, path-safe job id."""
+    return bool(_SAFE_JOB_ID_PATTERN.match(job_id))
+
 
 # ---------------------------------------------------------------------------
 # State machine
 # ---------------------------------------------------------------------------
+
 
 class JobState(str, Enum):
     """All possible job lifecycle states."""
@@ -34,18 +47,21 @@ class JobState(str, Enum):
     ABANDONED = "abandoned"
 
 
-_TERMINAL_STATES = frozenset({
-    JobState.SUCCEEDED,
-    JobState.FAILED,
-    JobState.TIMED_OUT,
-    JobState.CANCELLED,
-    JobState.ABANDONED,
-})
+_TERMINAL_STATES = frozenset(
+    {
+        JobState.SUCCEEDED,
+        JobState.FAILED,
+        JobState.TIMED_OUT,
+        JobState.CANCELLED,
+        JobState.ABANDONED,
+    }
+)
 
 # A job is persisted before its detached worker has had a chance to record its
 # PID. Readers such as the dashboard must not treat that normal launch window
 # as evidence that the worker died.
 _PENDING_STARTUP_GRACE_SECONDS = 10
+MAX_NESTING_DEPTH = 8
 
 
 def is_terminal(state: JobState) -> bool:
@@ -79,6 +95,7 @@ def assert_valid_transition(from_state: JobState, to_state: JobState) -> None:
 # Data model
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class Job:
     """Immutable representation of a durable job's persisted state.
@@ -86,7 +103,7 @@ class Job:
     Every JSON response includes *schema_version*, *job_id*, and *status*.
     """
 
-    schema_version: int = 1
+    schema_version: int = 2
     job_id: str = ""
     status: JobState = JobState.PENDING
     advisor: str = ""
@@ -107,11 +124,16 @@ class Job:
     error: Optional[str] = None
     finished_at: Optional[str] = None
     duration_seconds: Optional[float] = None
+    trace_id: Optional[str] = None
+    parent_job_id: Optional[str] = None
+    orchestrator_label: Optional[str] = None
+    nesting_depth: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
 # Job ID generation
 # ---------------------------------------------------------------------------
+
 
 def generate_job_id() -> str:
     """Return a unique, sortable-ish, filesystem-safe job ID."""
@@ -120,9 +142,17 @@ def generate_job_id() -> str:
     return f"job_{ts}_{rand}"
 
 
+def generate_trace_id() -> str:
+    """Return an opaque trace identifier suitable for a job lineage tree."""
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    rand = os.urandom(4).hex()
+    return f"trace_{ts}_{rand}"
+
+
 # ---------------------------------------------------------------------------
 # State-root resolution
 # ---------------------------------------------------------------------------
+
 
 def default_state_root() -> Path:
     """Return the default root directory for job state.
@@ -139,6 +169,197 @@ def default_state_root() -> Path:
     if xdg:
         return Path(xdg) / "crossagent" / "jobs"
     return Path.home() / ".local" / "state" / "crossagent" / "jobs"
+
+
+# ---------------------------------------------------------------------------
+# Lineage resolution
+# ---------------------------------------------------------------------------
+
+
+def _walk_ancestor_chain(
+    start_job_id: str,
+    state_root: Path,
+    *,
+    new_job_id: str | None = None,
+    max_hops: int | None = None,
+) -> list[Job]:
+    """Walk the parent chain from *start_job_id* toward the root.
+
+    Returns a list of ancestor ``Job`` objects in order (parent, grandparent,
+    …).  Raises :class:`LineageError` if a cycle or self-reference is
+    detected.  The walk is bounded by *max_hops* (default
+    ``MAX_NESTING_DEPTH + 2``) so corrupt data cannot loop forever.
+    """
+    if max_hops is None:
+        max_hops = MAX_NESTING_DEPTH + 2
+    visited: set[str] = set()
+    ancestors: list[Job] = []
+    current_id = start_job_id
+    for _ in range(max_hops):
+        if current_id in visited:
+            raise LineageError(
+                f"Cycle detected in job lineage: job '{current_id}' "
+                f"appears twice in the ancestor chain"
+            )
+        visited.add(current_id)
+        if not _is_safe_job_id(current_id):
+            break
+        job_dir = job_dir_path(state_root, current_id)
+        try:
+            current = load_state(job_dir)
+        except (FileNotFoundError, JobError):
+            break
+        ancestors.append(current)
+        if current.parent_job_id is None:
+            break
+        if new_job_id is not None and current.parent_job_id == new_job_id:
+            raise LineageError(
+                f"Cycle detected: job '{new_job_id}' would be its own ancestor"
+            )
+        if current.parent_job_id in visited:
+            raise LineageError(
+                f"Cycle detected in job lineage: job '{current.parent_job_id}' "
+                f"appears twice in the ancestor chain"
+            )
+        current_id = current.parent_job_id
+    return ancestors
+
+
+def resolve_lineage(
+    *,
+    no_parent: bool = False,
+    parent_flag: str | None = None,
+    parent_env: str | None = None,
+    trace_flag: str | None = None,
+    trace_env: str | None = None,
+    label_flag: str | None = None,
+    label_env: str | None = None,
+    depth_env: str | None = None,
+    state_root: Path | None = None,
+    new_job_id: str | None = None,
+) -> tuple[str | None, str, str | None, int | None]:
+    """Resolve job lineage from CLI flags, env vars, and parent job state.
+
+    Returns ``(parent_job_id, trace_id, orchestrator_label, nesting_depth)``.
+
+    Validation rules (applied when a parent id is present):
+
+    1. EXPLICIT parent (``--parent`` flag) that cannot be loaded → raise
+       :class:`LineageError`.
+    2. INHERITED parent (``CROSSAGENT_PARENT_JOB_ID`` env) that cannot be loaded
+       → produce an ORPHAN: keep the parent id, ``nesting_depth = None``, do
+       **not** raise.
+    3. Loadable parent + ``--trace-id`` that differs from the parent's trace
+       → raise :class:`LineageError`.
+    4. Cycle in the ancestor chain → raise :class:`LineageError`.
+    5. Computed depth exceeds :data:`MAX_NESTING_DEPTH` → raise
+       :class:`LineageError`.
+    6. No parent → top-level, ``depth = 1``.
+    """
+    root = state_root if state_root is not None else default_state_root()
+
+    # --- PARENT ---
+    if no_parent:
+        parent = None
+        parent_source: str | None = None
+    elif parent_flag is not None:
+        parent = parent_flag
+        parent_source = "explicit"
+    elif parent_env is not None:
+        parent = parent_env
+        parent_source = "inherited"
+    else:
+        parent = None
+        parent_source = None
+
+    # --- NO PARENT: TOP-LEVEL ---
+    if parent is None:
+        trace_id = trace_flag or trace_env or generate_trace_id()
+        label = label_flag or label_env or None
+        return None, trace_id, label, 1
+
+    # --- PARENT ID MUST BE PATH-SAFE (untrusted flag/env input) ---
+    if not _is_safe_job_id(parent):
+        if parent_source == "explicit":
+            raise LineageError(
+                f"Invalid parent job id '{parent}': not a valid job identifier"
+            )
+        # Inherited but malformed → orphan; never build a filesystem path from it.
+        trace_id = trace_flag or trace_env or generate_trace_id()
+        label = label_flag or label_env or None
+        return parent, trace_id, label, None
+
+    # --- PARENT EXISTS: TRY TO LOAD ---
+    parent_dir = root / parent
+    try:
+        parent_job = load_state(parent_dir)
+    except (FileNotFoundError, JobError):
+        parent_job = None
+
+    # --- UNLOADABLE PARENT ---
+    if parent_job is None:
+        if parent_source == "explicit":
+            raise LineageError(
+                f"Parent job '{parent}' not found in state root '{root}'"
+            )
+        # Inherited orphan: keep parent_job_id; depth is genuinely unknown.
+        # (depth_env is intentionally ignored — an untrusted env hint must not
+        # fabricate a depth; the graph surfaces the missing parent instead.)
+        trace_id = trace_flag or trace_env or generate_trace_id()
+        label = label_flag or label_env or None
+        return parent, trace_id, label, None
+
+    # --- LOADABLE PARENT: VALIDATION ---
+
+    # Rule 3: explicit --trace-id conflicts with parent's trace.
+    if (
+        trace_flag is not None
+        and parent_job.trace_id is not None
+        and trace_flag != parent_job.trace_id
+    ):
+        raise LineageError(
+            f"Trace ID conflict: --trace-id '{trace_flag}' does not match "
+            f"parent job '{parent}' trace '{parent_job.trace_id}'"
+        )
+
+    # Rule 4: cycle detection + Rule 5: depth computation.
+    ancestors = _walk_ancestor_chain(parent, root, new_job_id=new_job_id)
+    reached_root = bool(ancestors) and ancestors[-1].parent_job_id is None
+    if reached_root:
+        # Complete chain to a top-level job — the walked length is authoritative.
+        depth: int | None = len(ancestors) + 1
+    elif parent_job.nesting_depth is not None:
+        # The chain is incomplete (a mid-chain ancestor is missing or corrupt),
+        # so the walked length understates the true depth. Trust the parent's
+        # own recorded depth: a deep parent with a broken chain must not be able
+        # to masquerade as shallow and slip under the depth cap.
+        depth = parent_job.nesting_depth + 1
+    else:
+        # Both the chain and the parent's stored depth are unknown (e.g. a child
+        # of an orphan). Use the walked length as a conservative LOWER BOUND so
+        # the cap still applies and orphan-under-orphan nesting can't grow
+        # unbounded; recording it lets deeper descendants keep counting up.
+        depth = len(ancestors) + 1
+
+    if depth is not None and depth > MAX_NESTING_DEPTH:
+        raise LineageError(
+            f"Maximum nesting depth ({MAX_NESTING_DEPTH}) exceeded: "
+            f"new job would be at depth {depth}"
+        )
+
+    # --- RESOLVE REMAINING FIELDS ---
+    trace_id = parent_job.trace_id or trace_flag or trace_env or generate_trace_id()
+
+    if label_flag is not None:
+        label: str | None = label_flag
+    elif parent_job.orchestrator_label is not None:
+        label = parent_job.orchestrator_label
+    elif label_env is not None:
+        label = label_env
+    else:
+        label = None
+
+    return parent, trace_id, label, depth
 
 
 # ---------------------------------------------------------------------------
@@ -192,11 +413,33 @@ def runtime_status(job: Job) -> dict[str, Any]:
     started = datetime.fromisoformat(job.started_at) if job.started_at else now
     if started.tzinfo is None:
         started = started.replace(tzinfo=timezone.utc)
-    elapsed = int((now - started).total_seconds())
-    last_activity = datetime.fromisoformat(job.last_activity_at) if job.last_activity_at else started
+    last_activity = (
+        datetime.fromisoformat(job.last_activity_at)
+        if job.last_activity_at
+        else started
+    )
     if last_activity.tzinfo is None:
         last_activity = last_activity.replace(tzinfo=timezone.utc)
-    idle = int((now - last_activity).total_seconds())
+
+    if is_terminal(job.status):
+        if job.duration_seconds is not None:
+            elapsed = round(job.duration_seconds)
+        elif job.finished_at and job.started_at:
+            finished = datetime.fromisoformat(job.finished_at)
+            if finished.tzinfo is None:
+                finished = finished.replace(tzinfo=timezone.utc)
+            elapsed = int((finished - started).total_seconds())
+        else:
+            elapsed = int((now - started).total_seconds())
+        idle = 0
+    else:
+        elapsed = int((now - started).total_seconds())
+        idle = int((now - last_activity).total_seconds())
+
+    # Never report negative durations — clock skew, timezone confusion, or a
+    # started_at slightly in the future must not surface as a negative counter.
+    elapsed = max(0, elapsed)
+    idle = max(0, idle)
     return {
         "schema_version": job.schema_version,
         "job_id": job.job_id,
@@ -206,6 +449,10 @@ def runtime_status(job: Job) -> dict[str, Any]:
         "idle_seconds": idle,
         "last_event": job.last_event,
         "updated_at": job.updated_at,
+        "trace_id": job.trace_id,
+        "parent_job_id": job.parent_job_id,
+        "orchestrator_label": job.orchestrator_label,
+        "nesting_depth": job.nesting_depth,
     }
 
 
@@ -246,6 +493,7 @@ def collect_jobs(
 # Atomic I/O
 # ---------------------------------------------------------------------------
 
+
 def atomic_json_write(data: dict[str, Any], path: Path, *, mode: int = 0o600) -> None:
     """Write *data* as JSON to *path* atomically via temp sibling + os.replace.
 
@@ -282,6 +530,7 @@ def atomic_json_read(path: Path) -> dict[str, Any]:
 # Job directory helpers
 # ---------------------------------------------------------------------------
 
+
 def create_job_dir(state_root: Path, job_id: str) -> Path:
     """Create and return the private directory for *job_id* (mode 0o700)."""
     job_dir = state_root / job_id
@@ -307,6 +556,7 @@ def _ensure_private_file(path: Path) -> None:
 # Cancel request
 # ---------------------------------------------------------------------------
 
+
 def create_cancel_request(job_dir: Path) -> Path:
     """Create a ``cancel.request`` file in *job_dir* and return its path."""
     path = job_dir / "cancel.request"
@@ -323,6 +573,7 @@ def cancel_requested(job_dir: Path) -> bool:
 # ---------------------------------------------------------------------------
 # State lifecycle
 # ---------------------------------------------------------------------------
+
 
 def save_state(job_dir: Path, job: Job) -> Path:
     """Atomically write ``state.json`` in *job_dir* and return its path."""
@@ -351,7 +602,7 @@ def load_state(job_dir: Path) -> Job:
         raise InvalidStateError(f"Expected a mapping, got {type(data).__name__}")
 
     ver = data.get("schema_version")
-    if ver != 1:
+    if ver not in (1, 2):
         raise InvalidStateError(f"Unsupported schema_version {ver}")
 
     raw = data.get("status")
@@ -415,6 +666,7 @@ def _update_job(job: Job, updates: dict[str, Any]) -> Job:
 # Stale-state reconciliation
 # ---------------------------------------------------------------------------
 
+
 def reconcile_stale(job: Job, job_dir: Path) -> Job:
     """If *job* has a nonterminal state but the worker is gone, mark abandoned.
 
@@ -459,8 +711,11 @@ def _worker_presumed_dead(job: Job) -> bool:
     """
     if is_terminal(job.status):
         return False
-    if (job.status == JobState.PENDING and job.worker_pid is None
-            and _pending_startup_grace_active(job)):
+    if (
+        job.status == JobState.PENDING
+        and job.worker_pid is None
+        and _pending_startup_grace_active(job)
+    ):
         return False
     return job.worker_pid is None or not _pid_exists(job.worker_pid)
 
@@ -492,6 +747,7 @@ def _pid_exists(pid: int) -> bool:
     if sys.platform == "win32":
         try:
             import ctypes
+
             kernel32 = ctypes.windll.kernel32
             handle = kernel32.OpenProcess(0x1000, False, pid)
             if handle:
@@ -517,6 +773,7 @@ def _pid_exists(pid: int) -> bool:
 # Exceptions
 # ---------------------------------------------------------------------------
 
+
 class JobError(Exception):
     """Base exception for job-related errors."""
 
@@ -532,3 +789,7 @@ class CorruptStateError(JobError):
 
 class InvalidStateError(JobError):
     """The stored state violates the expected schema."""
+
+
+class LineageError(JobError):
+    """Lineage validation failed (unknown parent, cycle, depth exceeded, etc.)."""

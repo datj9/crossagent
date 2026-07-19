@@ -10,7 +10,7 @@ own via ~/.config/crossagent/advisors.json without touching code.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -51,7 +51,11 @@ class Advisor:
 
     @property
     def supports_sessions(self) -> bool:
-        return self.resume_flag is not None or self.session_name_flag is not None or self.resume_command is not None
+        return (
+            self.resume_flag is not None
+            or self.session_name_flag is not None
+            or self.resume_command is not None
+        )
 
     @property
     def supports_stream(self) -> bool:
@@ -128,8 +132,16 @@ _ALIASES = {"cmd": "commandcode", "cc": "claude", "oc": "opencode"}
 
 def _coerce(name: str, raw: dict[str, Any]) -> Advisor:
     """Build an Advisor from a user-config dict, layering onto a built-in if one exists."""
-    base = _BUILTINS.get(name, Advisor(name=name, executable=raw.get("executable", name)))
-    tuple_fields = {"base_args", "invoke_args", "stream_args", "json_args", "resume_command"}
+    base = _BUILTINS.get(
+        name, Advisor(name=name, executable=raw.get("executable", name))
+    )
+    tuple_fields = {
+        "base_args",
+        "invoke_args",
+        "stream_args",
+        "json_args",
+        "resume_command",
+    }
     overrides: dict[str, Any] = {}
     for key, value in raw.items():
         if key in tuple_fields and isinstance(value, list):
@@ -168,5 +180,7 @@ def resolve(name: str, config_path: Path | None = None) -> Advisor:
     registry = available(config_path)
     if canonical not in registry:
         known = ", ".join(sorted(registry))
-        raise KeyError(f"Unknown advisor '{name}'. Known advisors: {known}. Add your own in {USER_CONFIG}.")
+        raise KeyError(
+            f"Unknown advisor '{name}'. Known advisors: {known}. Add your own in {USER_CONFIG}."
+        )
     return registry[canonical]

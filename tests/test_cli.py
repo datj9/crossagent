@@ -21,7 +21,9 @@ def _args(**overrides):
 
 
 def test_claude_command_defaults_to_streaming_and_dashdash():
-    cmd, key = build_command(advisors.resolve("claude"), _args(name="topic-a"), {"sessions": {}})
+    cmd, key = build_command(
+        advisors.resolve("claude"), _args(name="topic-a"), {"sessions": {}}
+    )
     assert cmd[:2] == ["claude", "-p"]
     assert "--output-format" in cmd and "stream-json" in cmd
     assert cmd[-2:] == ["--", "hello?"]
@@ -38,13 +40,17 @@ def test_claude_resumes_stored_session():
 
 def test_new_session_ignores_stored_id():
     registry = {"sessions": {"claude:topic-a": {"session_id": "sess-123"}}}
-    cmd, _ = build_command(advisors.resolve("claude"), _args(name="topic-a", new_session=True), registry)
+    cmd, _ = build_command(
+        advisors.resolve("claude"), _args(name="topic-a", new_session=True), registry
+    )
     assert "--resume" not in cmd
     assert cmd[cmd.index("--name") + 1] == "topic-a"
 
 
 def test_codex_uses_positional_prompt():
-    cmd, key = build_command(advisors.resolve("codex"), _args(agent="codex"), {"sessions": {}})
+    cmd, key = build_command(
+        advisors.resolve("codex"), _args(agent="codex"), {"sessions": {}}
+    )
     assert cmd[:2] == ["codex", "exec"]
     assert cmd[-1] == "hello?"
     assert "--" not in cmd
@@ -52,18 +58,24 @@ def test_codex_uses_positional_prompt():
 
 
 def test_codex_command_includes_json_flag():
-    cmd, _ = build_command(advisors.resolve("codex"), _args(agent="codex"), {"sessions": {}})
+    cmd, _ = build_command(
+        advisors.resolve("codex"), _args(agent="codex"), {"sessions": {}}
+    )
     assert "--json" in cmd
 
 
 def test_codex_no_stream_still_includes_json_flag():
-    cmd, _ = build_command(advisors.resolve("codex"), _args(agent="codex", stream=False), {"sessions": {}})
+    cmd, _ = build_command(
+        advisors.resolve("codex"), _args(agent="codex", stream=False), {"sessions": {}}
+    )
     assert "--json" in cmd
 
 
 def test_codex_resumes_stored_thread():
     registry = {"sessions": {"codex:topic-a": {"session_id": "thread-123"}}}
-    cmd, _ = build_command(advisors.resolve("codex"), _args(agent="codex", name="topic-a"), registry)
+    cmd, _ = build_command(
+        advisors.resolve("codex"), _args(agent="codex", name="topic-a"), registry
+    )
     assert cmd[:2] == ["codex", "exec"]
     assert "resume" in cmd
     assert "thread-123" in cmd
@@ -72,12 +84,16 @@ def test_codex_resumes_stored_thread():
 
 
 def test_gemini_uses_flag_delivery():
-    cmd, _ = build_command(advisors.resolve("gemini"), _args(agent="gemini"), {"sessions": {}})
+    cmd, _ = build_command(
+        advisors.resolve("gemini"), _args(agent="gemini"), {"sessions": {}}
+    )
     assert cmd[-2:] == ["-p", "hello?"]
 
 
 def test_model_flag_only_added_when_supported_and_requested():
-    cmd, _ = build_command(advisors.resolve("claude"), _args(model="opus"), {"sessions": {}})
+    cmd, _ = build_command(
+        advisors.resolve("claude"), _args(model="opus"), {"sessions": {}}
+    )
     assert cmd[cmd.index("--model") + 1] == "opus"
 
 

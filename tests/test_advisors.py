@@ -33,12 +33,16 @@ def test_experimental_advisors_are_flagged():
 
 def test_user_config_overrides_builtin(tmp_path):
     cfg = tmp_path / "advisors.json"
-    cfg.write_text(json.dumps({
-        "advisors": {
-            "codex": {"executable": "my-codex", "base_args": ["run", "--fast"]},
-            "myllm": {"executable": "myllm", "prompt_delivery": "flag:-q"},
-        }
-    }))
+    cfg.write_text(
+        json.dumps(
+            {
+                "advisors": {
+                    "codex": {"executable": "my-codex", "base_args": ["run", "--fast"]},
+                    "myllm": {"executable": "myllm", "prompt_delivery": "flag:-q"},
+                }
+            }
+        )
+    )
     registry = advisors.available(cfg)
     assert registry["codex"].executable == "my-codex"
     assert registry["codex"].base_args == ("run", "--fast")
