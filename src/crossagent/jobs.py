@@ -366,6 +366,7 @@ def transition_to(
     new_status: JobState,
     *,
     job_dir: Optional[Path] = None,
+    actor: str = "user",
     **overrides: Any,
 ) -> Job:
     """Return a new ``Job`` with *new_status*, rejecting invalid regressions.
@@ -404,6 +405,7 @@ def transition_to(
         append_event(
             job_dir,
             "transition",
+            actor=actor,
             from_state=job.status.value,
             to_state=new_status.value,
             error=updates.get("error"),
@@ -454,6 +456,7 @@ def reconcile_stale(job: Job, job_dir: Path) -> Job:
         fresh_job,
         JobState.ABANDONED,
         job_dir=job_dir,
+        actor="system:reconcile",
         error="Worker process no longer exists",
     )
 
@@ -545,7 +548,7 @@ class InvalidStateError(JobError):
 # Audit log
 # ---------------------------------------------------------------------------
 
-def append_event(job_dir: Path, event: str, **payload: Any) -> None:
+def append_event(job_dir: Path, event: str, *, actor: str = "user", **payload: Any) -> None:
     """Append one JSON line to <job_dir>/events.jsonl.
 
     Atomic on POSIX for lines under the pipe buffer (our payloads are ~200 bytes).
@@ -558,7 +561,12 @@ def append_event(job_dir: Path, event: str, **payload: Any) -> None:
     """
     import sys
     line = json.dumps(
-        {"ts": datetime.now(timezone.utc).isoformat(), "event": event, **payload},
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+            "actor": actor,
+            **payload,
+        },
         sort_keys=True,
     )
     try:

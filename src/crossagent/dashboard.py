@@ -240,6 +240,18 @@ _PAGE_HTML = """<!doctype html>
   pre { background: #010409; border: 1px solid #21262d; border-radius: 6px;
         padding: 12px; overflow: auto; max-height: 55vh; white-space: pre-wrap;
         word-break: break-word; font-size: 12px; }
+  #audit-feed { display: none; background: #010409; border: 1px solid #21262d;
+                border-radius: 6px; padding: 12px; overflow-y: auto;
+                max-height: 55vh; font-size: 12px; }
+  .audit-row { padding: 4px 0; border-bottom: 1px solid #161b22; }
+  .audit-row:last-child { border-bottom: none; }
+  .audit-ts { color: #7d8590; margin-right: 8px; }
+  .audit-actor { display: inline-block; min-width: 130px; font-size: 11px;
+                 padding: 1px 6px; border-radius: 3px; margin-right: 8px; }
+  .audit-actor-user { background: #1f3a5f; color: #79c0ff; }
+  .audit-actor-system { background: #30363d; color: #9da7b3; }
+  .audit-transition { color: #e6edf3; }
+  .audit-error { color: #ff7b72; margin-left: 8px; }
   .empty { color: #7d8590; padding: 24px; }
 </style>
 </head>
@@ -266,6 +278,7 @@ _PAGE_HTML = """<!doctype html>
 "use strict";
 let selectedJobId = null;
 let logStream = "stdout";
+let detailTab = "stdout";
 const terminal = new Set(["succeeded", "failed", "timed_out", "cancelled", "abandoned"]);
 
 const knownStatuses = new Set(["pending", "running", "succeeded", "failed",
@@ -318,13 +331,16 @@ async function refreshJobs() {
 async function refreshDetail() {
   if (!selectedJobId) return;
   const pane = document.getElementById("detail-pane");
-  const [detailResponse, logsResponse] = await Promise.all([
+  const isAudit = detailTab === "audit";
+  const fetches = [
     fetch("/api/jobs/" + selectedJobId),
-    fetch("/api/jobs/" + selectedJobId + "/logs?stream=" + logStream),
-  ]);
+    isAudit
+      ? fetch("/api/jobs/" + selectedJobId + "/audit")
+      : fetch("/api/jobs/" + selectedJobId + "/logs?stream=" + logStream),
+  ];
+  const [detailResponse, secondaryResponse] = await Promise.all(fetches);
   if (!detailResponse.ok) { pane.innerHTML = '<div class="empty">Job not found.</div>'; return; }
   const job = await detailResponse.json();
-  const logs = await logsResponse.text();
   pane.innerHTML =
     "<h2>" + escapeHtml(job.job_id) + "</h2>" +
     "<dl>" +
@@ -339,13 +355,53 @@ async function refreshDetail() {
     '<div class="tabs">' +
     '<button id="tab-stdout">stdout</button>' +
     '<button id="tab-stderr">stderr</button>' +
+    '<button id="tab-audit">audit</button>' +
     "</div>" +
-    "<pre id=\\"logs\\"></pre>";
-  document.getElementById("logs").textContent = logs || "(no output yet)";
-  for (const stream of ["stdout", "stderr"]) {
-    const tab = document.getElementById("tab-" + stream);
-    tab.classList.toggle("active", logStream === stream);
-    tab.onclick = () => { logStream = stream; refreshDetail(); };
+    "<pre id=\\"logs\\"></pre>" +
+    '<div id="audit-feed"></div>';
+
+  for (const tab of ["stdout", "stderr", "audit"]) {
+    const btn = document.getElementById("tab-" + tab);
+    btn.classList.toggle("active", detailTab === tab);
+    btn.onclick = () => {
+      detailTab = tab;
+      if (tab === "stdout" || tab === "stderr") logStream = tab;
+      refreshDetail();
+    };
+  }
+
+  const logsEl = document.getElementById("logs");
+  const auditEl = document.getElementById("audit-feed");
+  if (isAudit) {
+    logsEl.style.display = "none";
+    auditEl.style.display = "block";
+    const auditPayload = await secondaryResponse.json();
+    const events = auditPayload.events || [];
+    if (events.length === 0) {
+      auditEl.innerHTML = '<span class="empty">No audit events yet.</span>';
+    } else {
+      let html = "";
+      for (const ev of events) {
+        const actor = ev.actor || "user";
+        const actorClass = actor.startsWith("system") ? "audit-actor-system" : "audit-actor-user";
+        const ts = escapeHtml(ev.ts || "");
+        let body = escapeHtml(ev.from_state || "?") + " &rarr; " + escapeHtml(ev.to_state || "?");
+        if (ev.error) body += '<span class="audit-error">' + escapeHtml(ev.error) + "</span>";
+        html +=
+          '<div class="audit-row">' +
+          '<span class="audit-ts">' + ts + "</span>" +
+          '<span class="audit-actor ' + actorClass + '">' + escapeHtml(actor) + "</span>" +
+          '<span class="audit-transition">' + body + "</span>" +
+          "</div>";
+      }
+      auditEl.innerHTML = html;
+      auditEl.scrollTop = auditEl.scrollHeight;
+    }
+  } else {
+    logsEl.style.display = "block";
+    auditEl.style.display = "none";
+    const logs = await secondaryResponse.text();
+    logsEl.textContent = logs || "(no output yet)";
   }
 }
 

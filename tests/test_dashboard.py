@@ -245,3 +245,31 @@ def test_api_job_audit_unknown_job_is_404(server_url):
         assert exc.code == 404
     else:
         raise AssertionError("expected 404")
+
+
+def test_dashboard_html_has_audit_tab(server_url):
+    response = urllib.request.urlopen(server_url + "/")
+    body = response.read().decode("utf-8")
+    assert 'id="tab-audit"' in body
+    assert "let detailTab" in body
+
+
+def test_api_job_audit_returns_actor_field(state_dir, server_url):
+    import os
+    from crossagent.jobs import (
+        Job, JobState, save_state, job_dir_path, append_event,
+    )
+    job_dir = job_dir_path(state_dir, "job_actor_test")
+    job_dir.mkdir(parents=True, exist_ok=True)
+    save_state(job_dir, Job(
+        job_id="job_actor_test",
+        status=JobState.SUCCEEDED,
+        started_at="2026-07-19T00:00:00+00:00",
+        worker_pid=os.getpid(),
+    ))
+    append_event(job_dir, "transition", actor="user",
+                 from_state="running", to_state="succeeded")
+    response = urllib.request.urlopen(server_url + "/api/jobs/job_actor_test/audit")
+    payload = json.loads(response.read().decode("utf-8"))
+    assert len(payload["events"]) == 1
+    assert payload["events"][0]["actor"] == "user"
