@@ -219,3 +219,29 @@ def test_page_escapes_job_fields_before_dom_insertion(server_url):
 def test_cli_wires_dashboard_subcommand():
     from crossagent.cli import _JOB_SUBCOMMANDS
     assert "dashboard" in _JOB_SUBCOMMANDS
+
+
+def test_api_job_audit_returns_events(state_dir, server_url):
+    job_dir = state_dir / "job_test_audit"
+    _write_manual_job(state_dir, "job_test_audit", jobs_mod.JobState.RUNNING,
+                      worker_pid=os.getpid())
+    (job_dir / "events.jsonl").write_text(
+        '{"ts":"2026-07-19T10:00:00+00:00","event":"transition","from_state":"pending","to_state":"running"}\n'
+        '{"ts":"2026-07-19T10:01:00+00:00","event":"transition","from_state":"running","to_state":"succeeded"}\n',
+        encoding="utf-8",
+    )
+    response = urllib.request.urlopen(server_url + "/api/jobs/job_test_audit/audit")
+    payload = json.loads(response.read().decode("utf-8"))
+    assert payload["job_id"] == "job_test_audit"
+    assert len(payload["events"]) == 2
+    assert payload["events"][0]["from_state"] == "pending"
+    assert payload["events"][1]["to_state"] == "succeeded"
+
+
+def test_api_job_audit_unknown_job_is_404(server_url):
+    try:
+        urllib.request.urlopen(server_url + "/api/jobs/job_does_not_exist/audit")
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 404
+    else:
+        raise AssertionError("expected 404")

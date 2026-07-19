@@ -166,6 +166,39 @@ def test_transition_to_persists_when_job_dir_given(tmp_path):
     assert loaded.status == JobState.SUCCEEDED
 
 
+def test_append_event_writes_jsonl_line(tmp_path):
+    from crossagent.jobs import append_event
+    append_event(tmp_path, "transition", from_state="pending", to_state="running")
+    log_path = tmp_path / "events.jsonl"
+    assert log_path.exists()
+    import json as _json
+    line = log_path.read_text(encoding="utf-8").strip()
+    parsed = _json.loads(line)
+    assert parsed["event"] == "transition"
+    assert parsed["from_state"] == "pending"
+    assert parsed["to_state"] == "running"
+    assert "ts" in parsed
+
+
+def test_transition_to_appends_audit_event(tmp_path):
+    job = Job(job_id="job_audit", status=JobState.RUNNING, started_at="2026-07-19T10:00:00+00:00")
+    transition_to(job, JobState.SUCCEEDED, job_dir=tmp_path)
+    log_path = tmp_path / "events.jsonl"
+    assert log_path.exists()
+    import json as _json
+    lines = [l for l in log_path.read_text().splitlines() if l.strip()]
+    assert len(lines) == 1
+    parsed = _json.loads(lines[0])
+    assert parsed["from_state"] == "running"
+    assert parsed["to_state"] == "succeeded"
+
+
+def test_append_event_does_not_raise_on_unwritable_dir(tmp_path):
+    from crossagent.jobs import append_event
+    bad_dir = tmp_path / "does-not-exist"
+    append_event(bad_dir, "transition", from_state="x", to_state="y")
+
+
 # =========================================================================
 # Job ID generation
 # =========================================================================

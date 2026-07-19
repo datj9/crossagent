@@ -64,6 +64,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if match:
             self._handle_job_logs(match.group(1), parse_qs(parsed.query))
             return
+        match = re.match(r"^/api/jobs/([^/]+)/audit$", path)
+        if match:
+            self._handle_job_audit(match.group(1))
+            return
         self._send_json(404, {"error": "not found"})
 
     # -- routes -----------------------------------------------------------
@@ -100,6 +104,33 @@ class DashboardHandler(BaseHTTPRequestHandler):
         log_path = jobs_mod.job_dir_path(self.server.state_root, job_id) / f"{stream}.log"
         content = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
         self._send(200, "text/plain; charset=utf-8", content.encode("utf-8"))
+
+    def _handle_job_audit(self, job_id: str) -> None:
+        job = self._load_job(job_id)
+        if job is None:
+            self._send_json(404, {"error": "unknown job"})
+            return
+        log_path = (
+            jobs_mod.job_dir_path(self.server.state_root, job_id) / "events.jsonl"
+        )
+        events: list[dict[str, Any]] = []
+        if log_path.exists():
+            for line in log_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        self._send_json(
+            200,
+            {
+                "schema_version": 1,
+                "job_id": job_id,
+                "events": events,
+            },
+        )
 
     # -- helpers ----------------------------------------------------------
 
