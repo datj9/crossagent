@@ -41,7 +41,7 @@ crossagent start \
 
 # Output (stdout):
 # {
-#   "schema_version": 1,
+#   "schema_version": 2,
 #   "job_id": "job_20260718T100000_a1b2c3d4",
 #   "status": "running",
 #   "advisor": "claude",
@@ -136,7 +136,7 @@ Only `--max-runtime` or explicit cancellation terminates the job.
 | `crossagent logs JOB_ID [--follow] [--stream stdout\|stderr]` | Read or follow an advisor's log stream. |
 | `crossagent cancel JOB_ID [--wait] [--timeout N]` | Request cancellation and optionally wait for cleanup. |
 | `crossagent list [--status STATE] [--limit N] [--json]` | Dashboard of all jobs, newest first — status, elapsed, idle, name. Reconciles stale jobs to `abandoned` so nothing is silently dropped. Use it to rediscover a job when the ID was lost. |
-| `crossagent dashboard [--host H] [--port N] [--no-open]` | Local web dashboard (default `http://127.0.0.1:8642/`): live job table, per-job detail, and stdout/stderr logs. For the human user — an agent should use `list`/`status --json` instead. |
+| `crossagent dashboard [--host H] [--port N] [--no-open]` | Local web dashboard (default `http://127.0.0.1:8642/`): live job table, an orchestrator graph of main-agent → sub-jobs, and a per-job detail pane with a friendly event feed plus raw stdout/stderr. For the human user — an agent should use `list`/`status --json` instead. |
 
 ### `start` flags
 
@@ -150,6 +150,27 @@ Plus:
 - `--max-runtime SECONDS` (default 1800 — 30 minutes, safe for agent-started jobs)
 - `--termination-grace SECONDS` (default 10)
 - `--json` (machine-readable output)
+
+Lineage (groups delegations into one tree in the dashboard graph):
+- `--parent JOB_ID` — mark this job a child of an existing job
+- `--no-parent` — force a top-level job
+- `--trace-id ID` — join or start a specific trace / tree
+- `--orchestrator-label TEXT` — display name for the tree's root node
+
+### Grouping your delegations (do this once per conversation)
+
+So the dashboard's graph can show all of one conversation's delegations under a
+single root, export ONE stable trace id at the start of the session and reuse it
+for every `crossagent start`:
+
+```bash
+export CROSSAGENT_TRACE_ID="trace_<slug-for-this-conversation>"
+export CROSSAGENT_ORCHESTRATOR_LABEL="Claude Code"   # optional root label
+```
+
+Nested delegations (an advisor that itself calls crossagent) inherit the trace
+automatically — you only set it for your own top-level calls. Without a shared
+trace id, each top-level job appears as its own single-node tree.
 
 ## CLI Helper
 

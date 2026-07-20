@@ -22,6 +22,7 @@ from typing import Any, Callable, Optional, Protocol, TextIO, Tuple
 # Consumer protocol
 # ---------------------------------------------------------------------------
 
+
 class LineConsumer(Protocol):
     """Pluggable consumer of stdout/stderr lines."""
 
@@ -39,6 +40,7 @@ class LineConsumer(Protocol):
 # Outcome
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class RunOutcome:
     """Structured result of running one advisor."""
@@ -55,6 +57,7 @@ class RunOutcome:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def run(
     cmd: list[str],
@@ -113,7 +116,10 @@ def run(
 
             # Timeout / cancellation checks
             if not termination_started:
-                if max_runtime_seconds is not None and (now - start_mono) >= max_runtime_seconds:
+                if (
+                    max_runtime_seconds is not None
+                    and (now - start_mono) >= max_runtime_seconds
+                ):
                     timed_out = True
                     termination_started = True
                     termination_start_mono = time.monotonic()
@@ -153,7 +159,10 @@ def run(
                     last_activity_mono = now
                     idle_warning_emitted = False
 
-                if now - last_activity_mono >= idle_warning_threshold and not idle_warning_emitted:
+                if (
+                    now - last_activity_mono >= idle_warning_threshold
+                    and not idle_warning_emitted
+                ):
                     elapsed = now - start_mono
                     idle = now - last_activity_mono
                     print(_idle_warning_line(elapsed, idle), file=sys.stderr)
@@ -218,6 +227,7 @@ def run(
 # ---------------------------------------------------------------------------
 # Platform helpers
 # ---------------------------------------------------------------------------
+
 
 def _popen_kwargs() -> dict[str, Any]:
     """Return Popen kwargs that put the child in its own process group/session."""
@@ -291,6 +301,7 @@ def _windows_terminate_process(pid: int) -> None:
     """Last-resort TerminateProcess call for a single Windows PID."""
     try:
         import ctypes
+
         kernel32 = ctypes.windll.kernel32
         handle = kernel32.OpenProcess(0x0001, False, pid)
         if handle:
@@ -303,6 +314,7 @@ def _windows_terminate_process(pid: int) -> None:
 # ---------------------------------------------------------------------------
 # Reader thread
 # ---------------------------------------------------------------------------
+
 
 def _reader(
     stream: TextIO,
@@ -320,6 +332,7 @@ def _reader(
 # ---------------------------------------------------------------------------
 # Utility helpers
 # ---------------------------------------------------------------------------
+
 
 def _close_pipe(pipe: Optional[TextIO]) -> None:
     if pipe is None:

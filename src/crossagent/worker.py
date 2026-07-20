@@ -27,6 +27,7 @@ from . import runner as runner_mod
 # Command metadata
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class _JobCommand:
     command: list[str]
@@ -44,6 +45,7 @@ class _JobCommand:
 # Logging parser wrapper
 # ---------------------------------------------------------------------------
 
+
 class _LoggingParser:
     """Wrap a parser and mirror stdout/stderr to their log files."""
 
@@ -54,15 +56,17 @@ class _LoggingParser:
         stderr_log: Path,
     ) -> None:
         self._parser = parser
-        self._stdout_file = open(stdout_log, "w", encoding="utf-8")
-        self._stderr_file = open(stderr_log, "w", encoding="utf-8")
+        self._stdout_file = open(stdout_log, "w", encoding="utf-8", buffering=1)
+        self._stderr_file = open(stderr_log, "w", encoding="utf-8", buffering=1)
 
     def consume_stdout(self, line: str) -> None:
         self._stdout_file.write(line)
+        self._stdout_file.flush()
         self._parser.consume_stdout(line)
 
     def consume_stderr(self, line: str) -> None:
         self._stderr_file.write(line)
+        self._stderr_file.flush()
         self._parser.consume_stderr(line)
 
     def finish(self, exit_code: int) -> parsers_mod.ParsedResult:
@@ -74,6 +78,7 @@ class _LoggingParser:
 # ---------------------------------------------------------------------------
 # Worker entry point
 # ---------------------------------------------------------------------------
+
 
 def worker_main(job_id: str, state_dir: Path) -> int:
     """Run the advisor for *job_id* and persist the full lifecycle.
@@ -125,10 +130,13 @@ def worker_main(job_id: str, state_dir: Path) -> int:
         last_event="worker.started",
     )
 
+    advisor_env = build_advisor_env(job, state_dir)
+
     try:
         outcome = runner_mod.run(
             cmd,
             cwd=command.cwd,
+            env=advisor_env,
             consumer=consumer,
             max_runtime_seconds=job.max_runtime_seconds,
             termination_grace_seconds=job.termination_grace_seconds,
@@ -137,7 +145,11 @@ def worker_main(job_id: str, state_dir: Path) -> int:
     finally:
         consumer.finish(0)
 
-    parsed = outcome.result if isinstance(outcome.result, parsers_mod.ParsedResult) else parsers_mod.ParsedResult()
+    parsed = (
+        outcome.result
+        if isinstance(outcome.result, parsers_mod.ParsedResult)
+        else parsers_mod.ParsedResult()
+    )
 
     if parsed.session_id:
         job = jobs_mod.transition_to(
@@ -197,6 +209,7 @@ def worker_main(job_id: str, state_dir: Path) -> int:
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _load_command(job_dir: Path) -> _JobCommand:
     path = job_dir / "command.json"
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -230,15 +243,53 @@ def _chmod_private(path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Advisor environment builder
+# ---------------------------------------------------------------------------
+
+
+def build_advisor_env(job: jobs_mod.Job, state_root: Path) -> dict[str, str]:
+    """Build the environment dict for the advisor subprocess with lineage vars.
+
+    Starts from ``os.environ.copy()`` and overwrites (does not setdefault) the
+    ``CROSSAGENT_PARENT_JOB_ID``, ``CROSSAGENT_TRACE_ID``,
+    ``CROSSAGENT_ORCHESTRATOR_LABEL``, ``CROSSAGENT_NESTING_DEPTH``,
+    and ``CROSSAGENT_STATE_DIR`` variables so a nested ``crossagent start``
+    inside the advisor inherits the correct lineage.
+
+    This function is deliberately side-effect-free and testable without spawning
+    a process.
+    """
+    env = os.environ.copy()
+    env["CROSSAGENT_PARENT_JOB_ID"] = job.job_id
+    env["CROSSAGENT_TRACE_ID"] = job.trace_id or ""
+    env["CROSSAGENT_ORCHESTRATOR_LABEL"] = job.orchestrator_label or ""
+    env["CROSSAGENT_NESTING_DEPTH"] = (
+        str(job.nesting_depth) if job.nesting_depth is not None else ""
+    )
+    env["CROSSAGENT_STATE_DIR"] = str(state_root)
+    return env
+
+
+# ---------------------------------------------------------------------------
 # Worker launcher
 # ---------------------------------------------------------------------------
 
+
 def start_worker(job_id: str, state_root: Path) -> subprocess.Popen[Any]:
     """Launch a detached worker process for *job_id* and return its handle."""
-    cmd = [sys.executable, "-m", "crossagent", "worker", job_id, "--state-dir", str(state_root)]
+    cmd = [
+        sys.executable,
+        "-m",
+        "crossagent",
+        "worker",
+        job_id,
+        "--state-dir",
+        str(state_root),
+    ]
     # Ensure the worker can import the crossagent package even when the parent
     # was launched via PYTHONPATH/sys.path manipulation (e.g. pytest, editable installs).
     import crossagent
+
     src_dir = os.path.dirname(os.path.dirname(crossagent.__file__))
     env = os.environ.copy()
     env["PYTHONPATH"] = src_dir + os.pathsep + env.get("PYTHONPATH", "")
@@ -259,8 +310,10 @@ def start_worker(job_id: str, state_root: Path) -> subprocess.Popen[Any]:
 # CLI entry used by __main__.py
 # ---------------------------------------------------------------------------
 
+
 def parse_worker_args(argv: list[str]) -> tuple[str, Path]:
     import argparse
+
     parser = argparse.ArgumentParser(prog="crossagent worker")
     parser.add_argument("job_id")
     parser.add_argument("--state-dir", required=True)

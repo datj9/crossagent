@@ -17,6 +17,7 @@ from typing import Any, Callable, Optional
 # Result type
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class ParsedResult:
     """Final payload returned by a parser after the advisor exits."""
@@ -30,6 +31,7 @@ class ParsedResult:
 # ---------------------------------------------------------------------------
 # Parser interface
 # ---------------------------------------------------------------------------
+
 
 class EventParser:
     """Base class for advisor output parsers.
@@ -60,6 +62,7 @@ class EventParser:
 # Text parser
 # ---------------------------------------------------------------------------
 
+
 class TextParser(EventParser):
     """Capture raw stdout as the answer; echo stderr as it arrives."""
 
@@ -82,6 +85,7 @@ class TextParser(EventParser):
 # ---------------------------------------------------------------------------
 # Claude stream-json parser
 # ---------------------------------------------------------------------------
+
 
 class ClaudeStreamParser(EventParser):
     """Parse Claude's newline-delimited stream-json events."""
@@ -111,7 +115,11 @@ class ClaudeStreamParser(EventParser):
                 error="No result event received from Claude",
             )
         if self._final.get("is_error"):
-            errors = self._final.get("errors") or self._final.get("api_error_status") or "unknown error"
+            errors = (
+                self._final.get("errors")
+                or self._final.get("api_error_status")
+                or "unknown error"
+            )
             return ParsedResult(
                 failure=True,
                 error=str(errors),
@@ -169,6 +177,7 @@ class ClaudeStreamParser(EventParser):
 # Codex JSONL parser
 # ---------------------------------------------------------------------------
 
+
 class CodexJsonlParser(EventParser):
     """Parse Codex ``exec --json`` JSONL events and extract the final answer.
 
@@ -189,7 +198,10 @@ class CodexJsonlParser(EventParser):
         try:
             event = json.loads(stripped)
         except json.JSONDecodeError:
-            print(f"[crossagent] codex malformed line: {line.rstrip()[:240]}", file=sys.stderr)
+            print(
+                f"[crossagent] codex malformed line: {line.rstrip()[:240]}",
+                file=sys.stderr,
+            )
             return
 
         event_type = event.get("type")
@@ -207,7 +219,9 @@ class CodexJsonlParser(EventParser):
         elif event_type == "item.started":
             self._activity("stdout")
         elif event_type in ("turn.failed", "error"):
-            self._failure_error = event.get("error") or event.get("message") or event_type
+            self._failure_error = (
+                event.get("error") or event.get("message") or event_type
+            )
             self._activity("stdout")
 
     def finish(self, exit_code: int) -> ParsedResult:
@@ -286,4 +300,6 @@ def get_parser(
         return ClaudeStreamParser(on_activity=on_activity)
     if name == "codex-jsonl":
         return CodexJsonlParser(on_activity=on_activity)
-    raise ValueError(f"Unknown parser '{name}'. Known parsers: {', '.join(sorted(PARSER_NAMES))}")
+    raise ValueError(
+        f"Unknown parser '{name}'. Known parsers: {', '.join(sorted(PARSER_NAMES))}"
+    )

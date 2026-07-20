@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,7 +26,7 @@ from crossagent import jobs as jobs_mod
 from crossagent.cli import main
 
 
-_FAKE_CODEX_SCRIPT = '''#!/usr/bin/env python3
+_FAKE_CODEX_SCRIPT = """#!/usr/bin/env python3
 import json
 import os
 import sys
@@ -62,7 +61,7 @@ else:
     print(json.dumps({"type": "turn.completed"}))
 
 sys.exit(exit_code)
-'''
+"""
 
 
 @pytest.fixture
@@ -121,20 +120,28 @@ def _wait_for_terminal(job_id: str, timeout: float = 10.0) -> jobs_mod.Job:
 # =========================================================================
 
 
-def test_start_returns_job_id_and_worker_continues(state_dir, fake_codex_in_path, monkeypatch, capsys):
+def test_start_returns_job_id_and_worker_continues(
+    state_dir, fake_codex_in_path, monkeypatch, capsys
+):
     # Keep the advisor alive briefly so start's snapshot cannot race past
     # running into succeeded on a fast machine.
     monkeypatch.setenv("FAKE_CODEX_SLEEP", "2")
-    code = main([
-        "start", "--agent", "codex",
-        "--prompt", "hello worker",
-        "--json",
-        "--max-runtime", "30",
-    ])
+    code = main(
+        [
+            "start",
+            "--agent",
+            "codex",
+            "--prompt",
+            "hello worker",
+            "--json",
+            "--max-runtime",
+            "30",
+        ]
+    )
     captured = capsys.readouterr()
     assert code == 0, captured.err
     response = json.loads(captured.out)
-    assert response["schema_version"] == 1
+    assert response["schema_version"] == 2
     assert response["job_id"].startswith("job_")
     assert response["status"] in ("pending", "running")
     assert response["advisor"] == "codex"
@@ -151,13 +158,21 @@ def test_start_returns_job_id_and_worker_continues(state_dir, fake_codex_in_path
 # =========================================================================
 
 
-def test_status_and_result_from_separate_invocation(state_dir, fake_codex_in_path, capsys):
-    main([
-        "start", "--agent", "codex",
-        "--prompt", "hello separate",
-        "--json",
-        "--max-runtime", "30",
-    ])
+def test_status_and_result_from_separate_invocation(
+    state_dir, fake_codex_in_path, capsys
+):
+    main(
+        [
+            "start",
+            "--agent",
+            "codex",
+            "--prompt",
+            "hello separate",
+            "--json",
+            "--max-runtime",
+            "30",
+        ]
+    )
     job_id = json.loads(capsys.readouterr().out)["job_id"]
 
     job = _wait_for_terminal(job_id)
@@ -183,14 +198,22 @@ def test_status_and_result_from_separate_invocation(state_dir, fake_codex_in_pat
 # =========================================================================
 
 
-def test_wait_returns_running_within_timeout(state_dir, fake_codex_in_path, monkeypatch, capsys):
+def test_wait_returns_running_within_timeout(
+    state_dir, fake_codex_in_path, monkeypatch, capsys
+):
     monkeypatch.setenv("FAKE_CODEX_SLEEP", "5")
-    main([
-        "start", "--agent", "codex",
-        "--prompt", "sleepy",
-        "--json",
-        "--max-runtime", "60",
-    ])
+    main(
+        [
+            "start",
+            "--agent",
+            "codex",
+            "--prompt",
+            "sleepy",
+            "--json",
+            "--max-runtime",
+            "60",
+        ]
+    )
     job_id = json.loads(capsys.readouterr().out)["job_id"]
 
     start = time.monotonic()
@@ -214,21 +237,31 @@ def test_wait_returns_running_within_timeout(state_dir, fake_codex_in_path, monk
 # =========================================================================
 
 
-def test_cancel_terminates_and_persists_cancelled(state_dir, fake_codex_in_path, monkeypatch, capsys):
+def test_cancel_terminates_and_persists_cancelled(
+    state_dir, fake_codex_in_path, monkeypatch, capsys
+):
     monkeypatch.setenv("FAKE_CODEX_SLEEP", "600")
-    main([
-        "start", "--agent", "codex",
-        "--prompt", "cancel me",
-        "--json",
-        "--max-runtime", "60",
-    ])
+    main(
+        [
+            "start",
+            "--agent",
+            "codex",
+            "--prompt",
+            "cancel me",
+            "--json",
+            "--max-runtime",
+            "60",
+        ]
+    )
     job_id = json.loads(capsys.readouterr().out)["job_id"]
 
     code = main(["cancel", job_id, "--wait", "--timeout", "3"])
     captured = capsys.readouterr()
     assert code == 0, captured.err
 
-    job = jobs_mod.load_state(jobs_mod.job_dir_path(jobs_mod.default_state_root(), job_id))
+    job = jobs_mod.load_state(
+        jobs_mod.job_dir_path(jobs_mod.default_state_root(), job_id)
+    )
     assert job.status == jobs_mod.JobState.CANCELLED
 
 
@@ -265,7 +298,9 @@ def test_status_reconciles_stale_state_to_abandoned(state_dir, capsys):
             "prompt_delivery": "positional",
             "cwd": os.getcwd(),
             "stream": False,
-            "registry_path": str(Path.home() / ".config" / "crossagent" / "sessions.json"),
+            "registry_path": str(
+                Path.home() / ".config" / "crossagent" / "sessions.json"
+            ),
             "key": "",
             "name": None,
             "model": "",
@@ -289,12 +324,18 @@ def test_status_reconciles_stale_state_to_abandoned(state_dir, capsys):
 
 def test_prompt_not_exposed_in_state_or_status(state_dir, fake_codex_in_path, capsys):
     secret = "SECRET_PROMPT_42"
-    main([
-        "start", "--agent", "codex",
-        "--prompt", secret,
-        "--json",
-        "--max-runtime", "30",
-    ])
+    main(
+        [
+            "start",
+            "--agent",
+            "codex",
+            "--prompt",
+            secret,
+            "--json",
+            "--max-runtime",
+            "30",
+        ]
+    )
     job_id = json.loads(capsys.readouterr().out)["job_id"]
     _wait_for_terminal(job_id)
 
@@ -316,14 +357,22 @@ def test_prompt_not_exposed_in_state_or_status(state_dir, fake_codex_in_path, ca
 # =========================================================================
 
 
-def test_result_fails_for_non_terminal_job(state_dir, fake_codex_in_path, monkeypatch, capsys):
+def test_result_fails_for_non_terminal_job(
+    state_dir, fake_codex_in_path, monkeypatch, capsys
+):
     monkeypatch.setenv("FAKE_CODEX_SLEEP", "600")
-    main([
-        "start", "--agent", "codex",
-        "--prompt", "not done",
-        "--json",
-        "--max-runtime", "60",
-    ])
+    main(
+        [
+            "start",
+            "--agent",
+            "codex",
+            "--prompt",
+            "not done",
+            "--json",
+            "--max-runtime",
+            "60",
+        ]
+    )
     job_id = json.loads(capsys.readouterr().out)["job_id"]
 
     code = main(["result", job_id])
@@ -381,12 +430,20 @@ def _write_manual_job(
 
 
 def test_list_shows_all_jobs_newest_first(state_dir, capsys):
-    _write_manual_job(state_dir, "job_20260718T090000_aaaa1111",
-                      jobs_mod.JobState.SUCCEEDED,
-                      started_at="2026-07-18T09:00:00+00:00", name="older-job")
-    _write_manual_job(state_dir, "job_20260718T110000_bbbb2222",
-                      jobs_mod.JobState.FAILED,
-                      started_at="2026-07-18T11:00:00+00:00", name="newer-job")
+    _write_manual_job(
+        state_dir,
+        "job_20260718T090000_aaaa1111",
+        jobs_mod.JobState.SUCCEEDED,
+        started_at="2026-07-18T09:00:00+00:00",
+        name="older-job",
+    )
+    _write_manual_job(
+        state_dir,
+        "job_20260718T110000_bbbb2222",
+        jobs_mod.JobState.FAILED,
+        started_at="2026-07-18T11:00:00+00:00",
+        name="newer-job",
+    )
 
     code = main(["list", "--json"])
     captured = capsys.readouterr()
@@ -405,8 +462,9 @@ def test_list_shows_all_jobs_newest_first(state_dir, capsys):
 
 
 def test_list_reconciles_stale_running_to_abandoned(state_dir, capsys):
-    _write_manual_job(state_dir, "job_stale_for_list",
-                      jobs_mod.JobState.RUNNING, worker_pid=99999999)
+    _write_manual_job(
+        state_dir, "job_stale_for_list", jobs_mod.JobState.RUNNING, worker_pid=99999999
+    )
 
     code = main(["list", "--json"])
     captured = capsys.readouterr()
@@ -429,9 +487,12 @@ def test_list_filters_by_status(state_dir, capsys):
 
 def test_list_respects_limit(state_dir, capsys):
     for hour in ("09", "10", "11"):
-        _write_manual_job(state_dir, f"job_20260718T{hour}0000_cccc3333",
-                          jobs_mod.JobState.SUCCEEDED,
-                          started_at=f"2026-07-18T{hour}:00:00+00:00")
+        _write_manual_job(
+            state_dir,
+            f"job_20260718T{hour}0000_cccc3333",
+            jobs_mod.JobState.SUCCEEDED,
+            started_at=f"2026-07-18T{hour}:00:00+00:00",
+        )
 
     code = main(["list", "--limit", "2", "--json"])
     captured = capsys.readouterr()
@@ -450,8 +511,9 @@ def test_list_empty_state_root_is_ok(state_dir, capsys):
 
 
 def test_list_human_output_is_a_table(state_dir, capsys):
-    _write_manual_job(state_dir, "job_table_row", jobs_mod.JobState.SUCCEEDED,
-                      name="table-test")
+    _write_manual_job(
+        state_dir, "job_table_row", jobs_mod.JobState.SUCCEEDED, name="table-test"
+    )
 
     code = main(["list"])
     captured = capsys.readouterr()
@@ -464,8 +526,13 @@ def test_list_human_output_is_a_table(state_dir, capsys):
 
 def test_list_never_exposes_prompt(state_dir, capsys):
     secret = "LIST_SECRET_PROMPT_99"
-    _write_manual_job(state_dir, "job_list_secret", jobs_mod.JobState.RUNNING,
-                      worker_pid=99999999, prompt=secret)
+    _write_manual_job(
+        state_dir,
+        "job_list_secret",
+        jobs_mod.JobState.RUNNING,
+        worker_pid=99999999,
+        prompt=secret,
+    )
 
     main(["list", "--json"])
     assert secret not in capsys.readouterr().out
@@ -490,12 +557,18 @@ def test_list_skips_corrupt_state_with_warning(state_dir, capsys):
 def test_logs_reads_stdout(state_dir, fake_codex_in_path, monkeypatch, capsys):
     monkeypatch.setenv("FAKE_CODEX_STDOUT_COUNT", "1")
     monkeypatch.setenv("FAKE_CODEX_STDOUT_SIZE", "30")
-    main([
-        "start", "--agent", "codex",
-        "--prompt", "log me",
-        "--json",
-        "--max-runtime", "30",
-    ])
+    main(
+        [
+            "start",
+            "--agent",
+            "codex",
+            "--prompt",
+            "log me",
+            "--json",
+            "--max-runtime",
+            "30",
+        ]
+    )
     job_id = json.loads(capsys.readouterr().out)["job_id"]
     _wait_for_terminal(job_id)
 
@@ -505,3 +578,324 @@ def test_logs_reads_stdout(state_dir, fake_codex_in_path, monkeypatch, capsys):
     # stdout.log contains the raw Codex JSONL lines.
     assert "stdout 00000" in captured.out
     assert "item.completed" in captured.out
+
+
+# =========================================================================
+# Lineage persistence on start
+# =========================================================================
+
+
+def test_start_persists_resolved_lineage(
+    state_dir, fake_codex_in_path, monkeypatch, capsys
+):
+    """A start invocation with lineage flags persists the resolved lineage."""
+    # Create a real parent so --parent resolves and inherits trace.
+    parent_id = "job_parent_001"
+    parent_dir = state_dir / parent_id
+    parent_dir.mkdir(parents=True)
+    parent_job = jobs_mod.Job(
+        job_id=parent_id,
+        schema_version=2,
+        status=jobs_mod.JobState.SUCCEEDED,
+        trace_id="trace_parent",
+    )
+    jobs_mod.save_state(parent_dir, parent_job)
+
+    monkeypatch.setenv("FAKE_CODEX_SLEEP", "2")
+    code = main(
+        [
+            "start",
+            "--agent",
+            "codex",
+            "--prompt",
+            "lineage test",
+            "--parent",
+            parent_id,
+            "--orchestrator-label",
+            "my-tree",
+            "--json",
+            "--max-runtime",
+            "30",
+        ]
+    )
+    assert code == 0
+    job_id = json.loads(capsys.readouterr().out)["job_id"]
+
+    job = jobs_mod.load_state(state_dir / job_id)
+    assert job.parent_job_id == parent_id
+    assert job.trace_id == "trace_parent"  # inherited from parent
+    assert job.orchestrator_label == "my-tree"
+    assert job.nesting_depth == 2  # 1 ancestor (parent) + 1
+
+
+def test_start_persists_lineage_from_env_vars(
+    state_dir, fake_codex_in_path, monkeypatch, capsys
+):
+    """A start invocation with env vars persists the resolved lineage."""
+    # Create a real parent so the inherited env resolves.
+    parent_id = "job_env_parent"
+    parent_dir = state_dir / parent_id
+    parent_dir.mkdir(parents=True)
+    parent_job = jobs_mod.Job(
+        job_id=parent_id,
+        schema_version=2,
+        status=jobs_mod.JobState.SUCCEEDED,
+        trace_id="trace_env_001",
+    )
+    jobs_mod.save_state(parent_dir, parent_job)
+
+    monkeypatch.setenv("FAKE_CODEX_SLEEP", "2")
+    monkeypatch.setenv("CROSSAGENT_PARENT_JOB_ID", parent_id)
+    monkeypatch.setenv("CROSSAGENT_TRACE_ID", "trace_env_001")
+    monkeypatch.setenv("CROSSAGENT_ORCHESTRATOR_LABEL", "env-tree")
+
+    code = main(
+        [
+            "start",
+            "--agent",
+            "codex",
+            "--prompt",
+            "env lineage test",
+            "--json",
+            "--max-runtime",
+            "30",
+        ]
+    )
+    assert code == 0
+    job_id = json.loads(capsys.readouterr().out)["job_id"]
+
+    job = jobs_mod.load_state(state_dir / job_id)
+    assert job.parent_job_id == parent_id
+    assert job.trace_id == "trace_env_001"
+    assert job.orchestrator_label == "env-tree"
+    assert job.nesting_depth == 2  # 1 ancestor (parent) + 1
+
+
+def test_start_with_no_parent_flag_resets_lineage(
+    state_dir, fake_codex_in_path, monkeypatch, capsys
+):
+    """--no-parent forces top-level regardless of env."""
+    monkeypatch.setenv("FAKE_CODEX_SLEEP", "2")
+    monkeypatch.setenv("CROSSAGENT_PARENT_JOB_ID", "job_env_parent")
+
+    code = main(
+        [
+            "start",
+            "--agent",
+            "codex",
+            "--prompt",
+            "no parent test",
+            "--no-parent",
+            "--json",
+            "--max-runtime",
+            "30",
+        ]
+    )
+    assert code == 0
+    job_id = json.loads(capsys.readouterr().out)["job_id"]
+
+    job = jobs_mod.load_state(state_dir / job_id)
+    assert job.parent_job_id is None
+    assert job.nesting_depth == 1
+
+
+def test_start_lineage_explicit_flag_overrides_env(
+    state_dir, fake_codex_in_path, monkeypatch, capsys
+):
+    """Explicit CLI flags override env vars."""
+    monkeypatch.setenv("FAKE_CODEX_SLEEP", "2")
+    monkeypatch.setenv("CROSSAGENT_TRACE_ID", "env_trace_should_not_appear")
+
+    code = main(
+        [
+            "start",
+            "--agent",
+            "codex",
+            "--prompt",
+            "flag override test",
+            "--trace-id",
+            "flag_trace_value",
+            "--orchestrator-label",
+            "flag_label",
+            "--json",
+            "--max-runtime",
+            "30",
+        ]
+    )
+    assert code == 0
+    job_id = json.loads(capsys.readouterr().out)["job_id"]
+
+    job = jobs_mod.load_state(state_dir / job_id)
+    assert job.trace_id == "flag_trace_value"
+    assert job.orchestrator_label == "flag_label"
+
+
+# =========================================================================
+# Lineage validation  (CLI integration)
+# =========================================================================
+
+
+def test_start_explicit_missing_parent_exits_nonzero(state_dir, monkeypatch, capsys):
+    """--parent with a non-existent job exits nonzero with a clear message."""
+    monkeypatch.setenv("FAKE_CODEX_SLEEP", "2")
+    code = main(
+        [
+            "start",
+            "--agent",
+            "codex",
+            "--prompt",
+            "test",
+            "--parent",
+            "job_does_not_exist",
+            "--json",
+            "--max-runtime",
+            "30",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code != 0, f"expected nonzero exit, got {code}"
+    assert "not found" in captured.err
+
+
+def test_start_inherited_missing_parent_produces_orphan(
+    state_dir, fake_codex_in_path, monkeypatch, capsys
+):
+    """CROSSAGENT_PARENT_JOB_ID pointing at a non-existent job is an orphan:
+    succeeds, keeps parent_job_id, depth None."""
+    monkeypatch.setenv("FAKE_CODEX_SLEEP", "2")
+    monkeypatch.setenv("CROSSAGENT_PARENT_JOB_ID", "job_nonexistent_parent")
+    code = main(
+        [
+            "start",
+            "--agent",
+            "codex",
+            "--prompt",
+            "orphan test",
+            "--json",
+            "--max-runtime",
+            "30",
+        ]
+    )
+    assert code == 0, f"expected success for inherited orphan, got {code}"
+    job_id = json.loads(capsys.readouterr().out)["job_id"]
+    job = jobs_mod.load_state(state_dir / job_id)
+    assert job.parent_job_id == "job_nonexistent_parent"
+    assert job.nesting_depth is None
+
+
+def test_start_trace_conflict_with_parent_exits_nonzero(state_dir, monkeypatch, capsys):
+    """--trace-id that differs from a loadable parent's trace exits nonzero."""
+    parent_id = "job_parent_tc"
+    parent_dir = state_dir / parent_id
+    parent_dir.mkdir(parents=True)
+    parent_job = jobs_mod.Job(
+        job_id=parent_id,
+        schema_version=2,
+        status=jobs_mod.JobState.SUCCEEDED,
+        trace_id="trace_parent_val",
+    )
+    jobs_mod.save_state(parent_dir, parent_job)
+
+    monkeypatch.setenv("FAKE_CODEX_SLEEP", "2")
+    code = main(
+        [
+            "start",
+            "--agent",
+            "codex",
+            "--prompt",
+            "trace conflict",
+            "--parent",
+            parent_id,
+            "--trace-id",
+            "trace_different",
+            "--json",
+            "--max-runtime",
+            "30",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code != 0, f"expected nonzero exit, got {code}"
+    assert "Trace ID conflict" in captured.err
+
+
+def test_start_cycle_detected_exits_nonzero(state_dir, monkeypatch, capsys):
+    """A cycle in the parent chain exits nonzero."""
+    # Build A -> B -> A
+    job_a_id = "job_cycle_cli_a"
+    job_b_id = "job_cycle_cli_b"
+    job_a = jobs_mod.Job(
+        job_id=job_a_id,
+        schema_version=2,
+        status=jobs_mod.JobState.SUCCEEDED,
+        parent_job_id=job_b_id,
+    )
+    job_b = jobs_mod.Job(
+        job_id=job_b_id,
+        schema_version=2,
+        status=jobs_mod.JobState.SUCCEEDED,
+        parent_job_id=job_a_id,
+    )
+    (state_dir / job_a_id).mkdir(parents=True)
+    (state_dir / job_b_id).mkdir(parents=True)
+    jobs_mod.save_state(state_dir / job_a_id, job_a)
+    jobs_mod.save_state(state_dir / job_b_id, job_b)
+
+    monkeypatch.setenv("FAKE_CODEX_SLEEP", "2")
+    code = main(
+        [
+            "start",
+            "--agent",
+            "codex",
+            "--prompt",
+            "cycle test",
+            "--parent",
+            job_a_id,
+            "--json",
+            "--max-runtime",
+            "30",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code != 0, f"expected nonzero exit, got {code}"
+    assert "Cycle detected" in captured.err
+
+
+def test_start_depth_cap_exits_nonzero(state_dir, monkeypatch, capsys):
+    """Starting a child beyond MAX_NESTING_DEPTH exits nonzero."""
+    jobs_mod.MAX_NESTING_DEPTH = 3  # lower for test
+
+    try:
+        prev_id = None
+        for i in range(3, 0, -1):
+            jid = f"job_dc_{i}"
+            job = jobs_mod.Job(
+                job_id=jid,
+                schema_version=2,
+                status=jobs_mod.JobState.SUCCEEDED,
+                parent_job_id=prev_id,
+            )
+            (state_dir / jid).mkdir(parents=True)
+            jobs_mod.save_state(state_dir / jid, job)
+            prev_id = jid
+
+        monkeypatch.setenv("FAKE_CODEX_SLEEP", "2")
+        code = main(
+            [
+                "start",
+                "--agent",
+                "codex",
+                "--prompt",
+                "depth cap",
+                "--parent",
+                prev_id,
+                "--json",
+                "--max-runtime",
+                "30",
+            ]
+        )
+        captured = capsys.readouterr()
+        assert code != 0, f"expected nonzero exit, got {code}"
+        assert "Maximum nesting depth" in captured.err
+        assert "exceeded" in captured.err
+    finally:
+        jobs_mod.MAX_NESTING_DEPTH = 8  # restore

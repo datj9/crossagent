@@ -49,9 +49,23 @@ def test_text_parser_returns_stdout():
 def test_claude_parser_extracts_result_and_session():
     parser = parsers.ClaudeStreamParser()
     for line in _emit(
-        {"type": "system", "subtype": "init", "session_id": "sess-1", "model": "sonnet", "cwd": "/tmp"},
-        {"type": "assistant", "message": {"content": [{"type": "text", "text": "thinking"}]}},
-        {"type": "result", "result": "final answer", "session_id": "sess-1", "subtype": "final"},
+        {
+            "type": "system",
+            "subtype": "init",
+            "session_id": "sess-1",
+            "model": "sonnet",
+            "cwd": "/tmp",
+        },
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "thinking"}]},
+        },
+        {
+            "type": "result",
+            "result": "final answer",
+            "session_id": "sess-1",
+            "subtype": "final",
+        },
     ):
         parser.consume_stdout(line + "\n")
     result = parser.finish(0)
@@ -89,7 +103,10 @@ def test_codex_parser_extracts_thread_id():
     for line in _emit(
         {"type": "thread.started", "thread_id": "thread_abc"},
         {"type": "turn.started"},
-        {"type": "item.completed", "item": {"type": "agent_message", "content": "hello"}},
+        {
+            "type": "item.completed",
+            "item": {"type": "agent_message", "content": "hello"},
+        },
         {"type": "turn.completed"},
     ):
         parser.consume_stdout(line + "\n")
@@ -104,10 +121,16 @@ def test_codex_parser_extracts_agent_message_blocks():
     for line in _emit(
         {"type": "thread.started", "thread_id": "thread_abc"},
         {"type": "turn.started"},
-        {"type": "item.completed", "item": {"type": "agent_message", "content": [
-            {"type": "text", "text": "part1 "},
-            {"type": "text", "text": "part2"},
-        ]}},
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "content": [
+                    {"type": "text", "text": "part1 "},
+                    {"type": "text", "text": "part2"},
+                ],
+            },
+        },
         {"type": "turn.completed"},
     ):
         parser.consume_stdout(line + "\n")
@@ -121,9 +144,14 @@ def test_codex_parser_extracts_agent_message_text_field():
     for line in _emit(
         {"type": "thread.started", "thread_id": "thread_abc"},
         {"type": "turn.started"},
-        {"type": "item.completed", "item": {
-            "id": "item_4", "type": "agent_message", "text": "the final answer",
-        }},
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "item_4",
+                "type": "agent_message",
+                "text": "the final answer",
+            },
+        },
         {"type": "turn.completed"},
     ):
         parser.consume_stdout(line + "\n")
@@ -189,7 +217,7 @@ def test_codex_parser_malformed_lines_are_ignored():
     parser = parsers.CodexJsonlParser()
     for line in [
         '{"type": "thread.started", "thread_id": "thread_abc"}',
-        'not valid json',
+        "not valid json",
         '{"type": "turn.completed"}',
     ]:
         parser.consume_stdout(line + "\n")
@@ -208,7 +236,10 @@ def test_codex_parser_activity_callback():
     for line in _emit(
         {"type": "thread.started", "thread_id": "thread_abc"},
         {"type": "turn.started"},
-        {"type": "item.completed", "item": {"type": "agent_message", "content": "hello"}},
+        {
+            "type": "item.completed",
+            "item": {"type": "agent_message", "content": "hello"},
+        },
         {"type": "item.started", "item": {"type": "command", "command": "ls"}},
         {"type": "turn.completed"},
     ):
@@ -229,7 +260,10 @@ def test_codex_parser_summaries_do_not_leak_content():
         for line in _emit(
             {"type": "thread.started", "thread_id": "thread_abc"},
             {"type": "turn.started"},
-            {"type": "item.completed", "item": {"type": "agent_message", "content": "SECRET_PROMPT_DATA"}},
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "content": "SECRET_PROMPT_DATA"},
+            },
             {"type": "turn.completed"},
         ):
             parser.consume_stdout(line + "\n")

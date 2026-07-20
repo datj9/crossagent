@@ -12,7 +12,7 @@ crossagent --agent claude --name payments-retry-design --prompt-file /tmp/decisi
 - 🧠 **A teammate, not an oracle.** Ships a second-opinion protocol that forces an evidence-backed critique with cited files, risks, and a recommendation — then a synthesis step, so the second opinion sharpens *your* judgment instead of replacing it.
 - 🔁 **Named, resumable sessions.** Claude sessions and Codex threads resume by `advisor:name`. Fork to explore a branch.
 - 📡 **No delegated job is ever silently dropped.** Every `start` persists durable state on disk; if the parent times out or the worker dies, the job resolves to an explicit terminal state (`succeeded`/`failed`/`timed_out`/`cancelled`/`abandoned`) and stays recoverable by job ID — you never lose the answer, or the fact that there was a job at all.
-- 📊 **Full observability on every delegation.** `crossagent dashboard` opens a live localhost web UI over all jobs; `crossagent list` is the same dashboard in the terminal; `status --json` reports progress; `logs --follow` tails the advisor's raw output in real time.
+- 📊 **Full observability on every delegation.** `crossagent dashboard` opens a live localhost web UI over all jobs — with a **friendly event feed** that turns raw advisor JSON into readable messages, tool calls, and results, and an **orchestrator graph** that shows your main agent and the sub-jobs it (and they) spawned. `crossagent list` is the same job table in the terminal; `status --json` reports progress; `logs --follow` tails raw output in real time.
 - 🧩 **Agent Skill + CLI.** Installs as an [Agent Skill](https://agentskills.dev) *and* a standalone `crossagent` command. Zero runtime dependencies.
 - 🔓 **Local & open.** Runs entirely on your machine against CLIs you already have. MIT licensed.
 
@@ -86,7 +86,7 @@ crossagent start \
   --prompt-file /tmp/decision.md \
   --json
 
-# Returns {"schema_version":1,"job_id":"job_...","status":"running",...}
+# Returns {"schema_version":2,"job_id":"job_...","status":"running",...}
 ```
 
 Then poll with bounded waits, never indefinitely:
@@ -127,9 +127,31 @@ crossagent dashboard                 # serves http://127.0.0.1:8642/ and opens y
 crossagent dashboard --port 9000 --no-open
 ```
 
-The page auto-refreshes every 3 s; click a job to see its detail (status,
-elapsed, idle, last event, error) and its live stdout/stderr. The prompt is
-never served — only status metadata and advisor output logs.
+The page auto-refreshes every 3 s without flicker; click any job — in the list
+or the graph — to see its detail (status, elapsed, idle, last event, error) and
+its output. Three views of that output share a tab strip:
+
+- **events** (default) — a friendly, live-appending feed that parses the
+  advisor's stream into readable rows: session init, assistant messages, tool
+  calls (with collapsible args/output), thinking, rate-limit notices, and the
+  final result. It follows the tail as output arrives and shows a *"↓ N new
+  events"* chip when you scroll up.
+- **stdout** / **stderr** — the raw advisor logs, unchanged.
+
+The prompt is never served — only status metadata and advisor output logs.
+
+#### Orchestrator graph
+
+Toggle **List → Graph** to see how a piece of work fanned out. The dashboard
+draws a tree of your **main agent** and the crossagent sub-jobs it spawned — and,
+recursively, any sub-jobs *they* spawned. Nodes are coloured and labelled by
+status (never colour alone); click one to open its feed. Drag to pan, scroll to
+zoom, press **f** (or the **Fit** button) to frame everything.
+
+Because crossagent only runs the sub-jobs — the main agent lives *outside* it —
+the root node is synthesized per delegation *trace*. See
+[Orchestration lineage](#orchestration-lineage--the-trace-convention) for how
+delegations get grouped into one tree.
 
 Prefer the terminal? `crossagent list` is the same dashboard as a table —
 including jobs whose ID you lost:
@@ -173,6 +195,52 @@ Full reference: [`skills/crossagent/SKILL.md`](skills/crossagent/SKILL.md) and
 
 The idle threshold warns via stderr but never kills the advisor. Only
 `--max-runtime` or explicit cancellation (`crossagent cancel`) terminates.
+
+## Orchestration lineage & the trace convention
+
+When a coding agent fires several `crossagent` delegations for one piece of work,
+the dashboard's graph can group them into a single tree — *if* it knows they
+belong together. crossagent captures two kinds of lineage.
+
+**Automatic (nesting).** When an advisor is itself a coding agent that calls
+`crossagent start` again, the child links to its parent with no extra work:
+crossagent injects `CROSSAGENT_PARENT_JOB_ID`, `CROSSAGENT_TRACE_ID`, and
+`CROSSAGENT_STATE_DIR` into the advisor's environment, so recursive delegations
+inherit their ancestry.
+
+**The top-level trace convention (one line, for agents & humans alike).**
+crossagent *cannot* know that several independent top-level `crossagent start`
+calls came from the same conversation — nothing links them unless you say so. The
+convention: **export one stable trace id per conversation and reuse it.**
+
+```bash
+# Once, at the start of a conversation / session:
+export CROSSAGENT_TRACE_ID="trace_$(date +%Y%m%d)-my-feature"
+
+# Every delegation this session now groups under one root in the graph:
+crossagent start --agent claude --name design ...
+crossagent start --agent codex  --name review ...
+```
+
+Give the root a readable name with `--orchestrator-label "Claude Code"` (or
+`CROSSAGENT_ORCHESTRATOR_LABEL`); without one the graph labels it **"External
+caller"**. Delegations with no shared trace simply appear as their own
+single-node trees — never merged on a guess.
+
+You can also set lineage explicitly per call:
+
+| Flag | Meaning |
+|---|---|
+| `--parent <job-id>` | This delegation is a child of an existing job |
+| `--no-parent` | Force a top-level job (ignore any inherited parent) |
+| `--trace-id <id>` | Join (or start) a specific trace / tree |
+| `--orchestrator-label <text>` | Display name for the tree's root node |
+
+Lineage is validated: an explicit parent that doesn't exist, a `--trace-id` that
+conflicts with the parent's trace, a cycle, or nesting deeper than 8 is rejected;
+a *missing inherited* parent is kept as an orphan (drawn with a dashed edge)
+rather than silently dropped. Parent ids are strictly validated, so a crafted
+`--parent` can't traverse outside the job store.
 
 ## How it works
 
