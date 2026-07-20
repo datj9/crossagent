@@ -3,6 +3,29 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses semantic versioning.
 
+## [0.1.5] - 2026-07-20
+
+### Added
+- **Orchestrator graph + job lineage** (`src/crossagent/graph.py`): the dashboard
+  now renders a directed graph of job nodes plus synthesized orchestrator-root
+  nodes (keyed by `trace_id`), with cycle-safe edge linking and built-in
+  diagnostics for data-integrity issues. Exposed via new dashboard endpoints and
+  surfaced in the web UI.
+- **Live event feed** (`src/crossagent/feed.py`): pure event normalizer that
+  converts raw advisor stdout lines (Claude stream-json, Codex JSONL, or plain
+  text) into structured feed events streamed by the dashboard event-stream
+  endpoint — independent of the stateful parser classes, zero side effects.
+- **Append-only `events.jsonl` audit log per job**: the worker now appends every
+  lifecycle event to `~/.local/state/crossagent/jobs/<job-id>/events.jsonl`, and
+  the dashboard reads it back for per-job replay and audit.
+
+### Fixed
+- Dashboard polling is now adaptive: it backs off when no jobs are running and
+  tightens up when there is live activity, instead of polling at a fixed rate.
+- Tolerate `Z`-suffixed ISO timestamps (`...Z`) when parsing job state on
+  Python 3.9 and 3.10, where `datetime.fromisoformat` did not yet accept the
+  `Z` suffix.
+
 ## [0.1.4] - 2026-07-18
 
 ### Added
