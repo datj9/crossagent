@@ -378,6 +378,7 @@ def transition_to(
     new_status: JobState,
     *,
     job_dir: Optional[Path] = None,
+    actor: str = "user",
     **overrides: Any,
 ) -> Job:
     """Return a new ``Job`` with *new_status*, rejecting invalid regressions.
@@ -413,6 +414,14 @@ def transition_to(
     new_job = _update_job(job, updates)
     if job_dir is not None:
         save_state(job_dir, new_job)
+        append_event(
+            job_dir,
+            "transition",
+            actor=actor,
+            from_state=job.status.value,
+            to_state=new_status.value,
+            error=updates.get("error"),
+        )
     return new_job
 
 
@@ -459,6 +468,7 @@ def reconcile_stale(job: Job, job_dir: Path) -> Job:
         fresh_job,
         JobState.ABANDONED,
         job_dir=job_dir,
+        actor="system:reconcile",
         error="Worker process no longer exists",
     )
 
@@ -544,3 +554,37 @@ class CorruptStateError(JobError):
 
 class InvalidStateError(JobError):
     """The stored state violates the expected schema."""
+
+
+# ---------------------------------------------------------------------------
+# Audit log
+# ---------------------------------------------------------------------------
+
+def append_event(job_dir: Path, event: str, *, actor: str = "user", **payload: Any) -> None:
+    """Append one JSON line to <job_dir>/events.jsonl.
+
+    Atomic on POSIX for lines under the pipe buffer (our payloads are ~200 bytes).
+    Never raises on failure — the audit log must not break the operation it
+    observes. Errors are reported via stderr instead.
+
+    The payload MUST include enough context to reconstruct the transition. The
+    caller is responsible for not stashing prompt text or command data — those
+    are never audit-relevant.
+    """
+    import sys
+    line = json.dumps(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+            "actor": actor,
+            **payload,
+        },
+        sort_keys=True,
+    )
+    try:
+        with (job_dir / "events.jsonl").open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError as exc:
+        print(f"[crossagent] audit log write failed: {exc}", file=sys.stderr)

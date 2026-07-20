@@ -167,6 +167,88 @@ def test_transition_to_persists_when_job_dir_given(tmp_path):
     assert loaded.status == JobState.SUCCEEDED
 
 
+def test_append_event_writes_jsonl_line(tmp_path):
+    from crossagent.jobs import append_event
+    append_event(tmp_path, "transition", from_state="pending", to_state="running")
+    log_path = tmp_path / "events.jsonl"
+    assert log_path.exists()
+    import json as _json
+    line = log_path.read_text(encoding="utf-8").strip()
+    parsed = _json.loads(line)
+    assert parsed["event"] == "transition"
+    assert parsed["from_state"] == "pending"
+    assert parsed["to_state"] == "running"
+    assert "ts" in parsed
+
+
+def test_transition_to_appends_audit_event(tmp_path):
+    job = Job(job_id="job_audit", status=JobState.RUNNING, started_at="2026-07-19T10:00:00+00:00")
+    transition_to(job, JobState.SUCCEEDED, job_dir=tmp_path)
+    log_path = tmp_path / "events.jsonl"
+    assert log_path.exists()
+    import json as _json
+    lines = [l for l in log_path.read_text().splitlines() if l.strip()]
+    assert len(lines) == 1
+    parsed = _json.loads(lines[0])
+    assert parsed["from_state"] == "running"
+    assert parsed["to_state"] == "succeeded"
+    # Don't assert the full dict — actor field may grow other keys later.
+
+
+def test_append_event_does_not_raise_on_unwritable_dir(tmp_path):
+    from crossagent.jobs import append_event
+    bad_dir = tmp_path / "does-not-exist"
+    append_event(bad_dir, "transition", from_state="x", to_state="y")
+
+
+def test_append_event_records_actor(tmp_path):
+    from crossagent.jobs import append_event
+    append_event(tmp_path, "transition", actor="user", from_state="x", to_state="y")
+    append_event(tmp_path, "transition", actor="system:reconcile", from_state="y", to_state="z")
+    import json as _json
+    lines = [l for l in (tmp_path / "events.jsonl").read_text().splitlines() if l.strip()]
+    assert len(lines) == 2
+    assert _json.loads(lines[0])["actor"] == "user"
+    assert _json.loads(lines[1])["actor"] == "system:reconcile"
+
+
+def test_append_event_default_actor_is_user(tmp_path):
+    from crossagent.jobs import append_event
+    append_event(tmp_path, "transition", from_state="x", to_state="y")
+    import json as _json
+    parsed = _json.loads((tmp_path / "events.jsonl").read_text().strip())
+    assert parsed["actor"] == "user"
+
+
+def test_reconcile_stale_tags_actor_system(tmp_path):
+    """When reconcile_stale abandons a dead worker, the audit event must
+    carry actor='system:reconcile' so it can be filtered from user-initiated
+    transitions in the dashboard."""
+    import os
+    from crossagent.jobs import (
+        Job, JobState, save_state, job_dir_path, reconcile_stale,
+    )
+    fake_pid = 2_000_000
+    job = Job(
+        job_id="job_reconcile_actor",
+        status=JobState.RUNNING,
+        started_at="2026-07-19T00:00:00+00:00",
+        worker_pid=fake_pid,
+        last_activity_at="2026-07-19T00:00:00+00:00",
+    )
+    job_dir = job_dir_path(tmp_path, "job_reconcile_actor")
+    job_dir.mkdir(parents=True, exist_ok=True)
+    save_state(job_dir, job)
+    reconcile_stale(job, job_dir)
+    import json as _json
+    lines = [l for l in (job_dir / "events.jsonl").read_text().splitlines() if l.strip()]
+    assert len(lines) == 1
+    parsed = _json.loads(lines[0])
+    assert parsed["actor"] == "system:reconcile"
+    assert parsed["from_state"] == "running"
+    assert parsed["to_state"] == "abandoned"
+
+
 # =========================================================================
 # Job ID generation
 # =========================================================================
