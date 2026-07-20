@@ -216,6 +216,13 @@ def test_page_escapes_job_fields_before_dom_insertion(server_url):
                 assert "escapeHtml(" in line or "badge(" in line, line
 
 
+def test_page_html_contains_adaptive_poll(server_url):
+    response = urllib.request.urlopen(server_url + "/")
+    body = response.read().decode("utf-8")
+    assert "hasRunningJobs ? 3000 : 15000" in body
+    assert "let hasRunningJobs = false;" in body
+
+
 def test_cli_wires_dashboard_subcommand():
     from crossagent.cli import _JOB_SUBCOMMANDS
     assert "dashboard" in _JOB_SUBCOMMANDS

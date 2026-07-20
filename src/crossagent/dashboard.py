@@ -236,6 +236,7 @@ _PAGE_HTML = """<!doctype html>
 let selectedJobId = null;
 let logStream = "stdout";
 const terminal = new Set(["succeeded", "failed", "timed_out", "cancelled", "abandoned"]);
+let hasRunningJobs = false;
 
 const knownStatuses = new Set(["pending", "running", "succeeded", "failed",
                                "timed_out", "cancelled", "abandoned"]);
@@ -280,6 +281,13 @@ async function refreshJobs() {
     row.onclick = () => { selectedJobId = job.job_id; refreshDetail(); refreshJobs(); };
     body.appendChild(row);
   }
+  hasRunningJobs = false;
+  for (const job of payload.jobs) {
+    if (job.status === "running" || job.status === "pending") {
+      hasRunningJobs = true;
+      break;
+    }
+  }
   document.getElementById("refreshed").textContent =
     "refreshed " + new Date().toLocaleTimeString();
 }
@@ -318,8 +326,12 @@ async function refreshDetail() {
   }
 }
 
-refreshJobs();
-setInterval(refreshJobs, 3000);
+function pollJobs() {
+  refreshJobs().then(function () {
+    setTimeout(pollJobs, hasRunningJobs ? 3000 : 15000);
+  });
+}
+pollJobs();
 setInterval(refreshDetail, 3000);
 </script>
 </body>
