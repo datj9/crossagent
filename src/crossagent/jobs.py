@@ -48,6 +48,18 @@ _TERMINAL_STATES = frozenset({
 _PENDING_STARTUP_GRACE_SECONDS = 10
 
 
+def _parse_iso(ts: "str | None") -> "datetime | None":
+    """Parse an ISO-8601 timestamp tolerant of the trailing Z suffix.
+
+    ``datetime.fromisoformat`` rejects ``Z`` on Python 3.9/3.10. We normalize
+    it to ``+00:00`` so any UTC timestamp — whether we wrote it or an external
+    caller did — round-trips cleanly. Returns ``None`` for empty input.
+    """
+    if not ts:
+        return None
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+
 def is_terminal(state: JobState) -> bool:
     """Return True when *state* is a terminal outcome."""
     return state in _TERMINAL_STATES
@@ -189,11 +201,11 @@ def runtime_status(job: Job) -> dict[str, Any]:
     Prompt text and command data are never included.
     """
     now = datetime.now(timezone.utc)
-    started = datetime.fromisoformat(job.started_at) if job.started_at else now
+    started = _parse_iso(job.started_at) if job.started_at else now
     if started.tzinfo is None:
         started = started.replace(tzinfo=timezone.utc)
     elapsed = int((now - started).total_seconds())
-    last_activity = datetime.fromisoformat(job.last_activity_at) if job.last_activity_at else started
+    last_activity = _parse_iso(job.last_activity_at) if job.last_activity_at else started
     if last_activity.tzinfo is None:
         last_activity = last_activity.replace(tzinfo=timezone.utc)
     idle = int((now - last_activity).total_seconds())
@@ -387,7 +399,7 @@ def transition_to(
         **overrides,
     }
     if is_terminal(new_status) and job.started_at:
-        started = datetime.fromisoformat(job.started_at)
+        started = _parse_iso(job.started_at)
         if started.tzinfo is None:
             started = started.replace(tzinfo=timezone.utc)
         updates["finished_at"] = now
@@ -471,7 +483,7 @@ def _pending_startup_grace_active(job: Job) -> bool:
     if not timestamp:
         return False
     try:
-        created = datetime.fromisoformat(timestamp)
+        created = _parse_iso(timestamp)
     except (TypeError, ValueError):
         return False
     if created.tzinfo is None:
