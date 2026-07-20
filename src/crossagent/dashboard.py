@@ -73,6 +73,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if match:
             self._handle_job_events(match.group(1), parse_qs(parsed.query))
             return
+        match = re.match(r"^/api/jobs/([^/]+)/audit$", path)
+        if match:
+            self._handle_job_audit(match.group(1))
+            return
         self._send_json(404, {"error": "not found"})
 
     # -- routes -----------------------------------------------------------
@@ -259,6 +263,33 @@ class DashboardHandler(BaseHTTPRequestHandler):
             },
         )
 
+    def _handle_job_audit(self, job_id: str) -> None:
+        job = self._load_job(job_id)
+        if job is None:
+            self._send_json(404, {"error": "unknown job"})
+            return
+        log_path = (
+            jobs_mod.job_dir_path(self.server.state_root, job_id) / "events.jsonl"
+        )
+        audit_events: list[dict[str, Any]] = []
+        if log_path.exists():
+            for line in log_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    audit_events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        self._send_json(
+            200,
+            {
+                "schema_version": 1,
+                "job_id": job_id,
+                "events": audit_events,
+            },
+        )
+
     def _event_format_for_job(self, job: jobs_mod.Job) -> str:
         try:
             advisor = advisors_mod.resolve(job.advisor)
@@ -384,6 +415,18 @@ _PAGE_HTML = """<!doctype html>
   pre { background: #010409; border: 1px solid #21262d; border-radius: 6px;
         padding: 12px; overflow: auto; max-height: 55vh; white-space: pre-wrap;
         word-break: break-word; font-size: 12px; }
+  #audit-feed { display: none; background: #010409; border: 1px solid #21262d;
+                border-radius: 6px; padding: 12px; overflow-y: auto;
+                max-height: 55vh; font-size: 12px; }
+  .audit-row { padding: 4px 0; border-bottom: 1px solid #161b22; }
+  .audit-row:last-child { border-bottom: none; }
+  .audit-ts { color: #7d8590; margin-right: 8px; }
+  .audit-actor { display: inline-block; min-width: 130px; font-size: 11px;
+                 padding: 1px 6px; border-radius: 3px; margin-right: 8px; }
+  .audit-actor-user { background: #1f3a5f; color: #79c0ff; }
+  .audit-actor-system { background: #30363d; color: #9da7b3; }
+  .audit-transition { color: #e6edf3; }
+  .audit-error { color: #ff7b72; margin-left: 8px; }
   .empty { color: #7d8590; padding: 24px; }
   #events-feed { display: none; background: #010409; border: 1px solid #21262d; border-radius: 6px; padding: 12px; overflow-y: auto; max-height: 55vh; font-size: 12px; }
   .ev-init { color: #7d8590; padding: 2px 0; }
@@ -450,8 +493,10 @@ _PAGE_HTML = """<!doctype html>
 <script>
 "use strict";
 let selectedJobId = null;
+let logStream = "stdout";
 let detailTab = "events";
 const terminal = new Set(["succeeded", "failed", "timed_out", "cancelled", "abandoned"]);
+let hasRunningJobs = false;
 
 const reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 let rafId = null;
@@ -671,6 +716,13 @@ async function refreshJobs() {
     orderIndex++;
   }
 
+  hasRunningJobs = false;
+  for (const job of payload.jobs) {
+    if (job.status === "running" || job.status === "pending") {
+      hasRunningJobs = true;
+      break;
+    }
+  }
   document.getElementById("refreshed").textContent =
     "refreshed " + new Date().toLocaleTimeString();
 }
@@ -713,6 +765,7 @@ async function refreshDetail() {
       '<button id="tab-events">events</button>' +
       '<button id="tab-stdout">stdout</button>' +
       '<button id="tab-stderr">stderr</button>' +
+      '<button id="tab-audit">audit</button>' +
       "</div>" +
       '<pre id="logs"></pre>' +
       '<div id="events-feed"><div id="events-chip"><span>\u2193 <span id="pending-count">0</span> new events</span></div></div>';
@@ -722,7 +775,7 @@ async function refreshDetail() {
     pendingNew = 0;
     eventsStopped = false;
     toolRowMap = new Map();
-    for (const tab of ["events", "stdout", "stderr"]) {
+    for (const tab of ["events", "stdout", "stderr", "audit"]) {
       const btn = document.getElementById("tab-" + tab);
       btn.onclick = () => { detailTab = tab; refreshDetail(); };
     }
@@ -851,7 +904,7 @@ async function poll() {
   } catch (_e) {
     // Swallow transient fetch/JSON errors so a single blip never stops polling.
   } finally {
-    setTimeout(poll, 3000);
+    setTimeout(poll, hasRunningJobs ? 3000 : 15000);
   }
 }
 

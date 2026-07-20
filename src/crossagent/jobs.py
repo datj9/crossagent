@@ -64,6 +64,18 @@ _PENDING_STARTUP_GRACE_SECONDS = 10
 MAX_NESTING_DEPTH = 8
 
 
+def _parse_iso(ts: "str | None") -> "datetime | None":
+    """Parse an ISO-8601 timestamp tolerant of the trailing Z suffix.
+
+    ``datetime.fromisoformat`` rejects ``Z`` on Python 3.9/3.10. We normalize
+    it to ``+00:00`` so any UTC timestamp — whether we wrote it or an external
+    caller did — round-trips cleanly. Returns ``None`` for empty input.
+    """
+    if not ts:
+        return None
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+
 def is_terminal(state: JobState) -> bool:
     """Return True when *state* is a terminal outcome."""
     return state in _TERMINAL_STATES
@@ -410,14 +422,10 @@ def runtime_status(job: Job) -> dict[str, Any]:
     Prompt text and command data are never included.
     """
     now = datetime.now(timezone.utc)
-    started = datetime.fromisoformat(job.started_at) if job.started_at else now
+    started = _parse_iso(job.started_at) if job.started_at else now
     if started.tzinfo is None:
         started = started.replace(tzinfo=timezone.utc)
-    last_activity = (
-        datetime.fromisoformat(job.last_activity_at)
-        if job.last_activity_at
-        else started
-    )
+    last_activity = _parse_iso(job.last_activity_at) if job.last_activity_at else started
     if last_activity.tzinfo is None:
         last_activity = last_activity.replace(tzinfo=timezone.utc)
 
@@ -425,7 +433,7 @@ def runtime_status(job: Job) -> dict[str, Any]:
         if job.duration_seconds is not None:
             elapsed = round(job.duration_seconds)
         elif job.finished_at and job.started_at:
-            finished = datetime.fromisoformat(job.finished_at)
+            finished = _parse_iso(job.finished_at)
             if finished.tzinfo is None:
                 finished = finished.replace(tzinfo=timezone.utc)
             elapsed = int((finished - started).total_seconds())
@@ -617,6 +625,7 @@ def transition_to(
     new_status: JobState,
     *,
     job_dir: Optional[Path] = None,
+    actor: str = "user",
     **overrides: Any,
 ) -> Job:
     """Return a new ``Job`` with *new_status*, rejecting invalid regressions.
@@ -638,7 +647,7 @@ def transition_to(
         **overrides,
     }
     if is_terminal(new_status) and job.started_at:
-        started = datetime.fromisoformat(job.started_at)
+        started = _parse_iso(job.started_at)
         if started.tzinfo is None:
             started = started.replace(tzinfo=timezone.utc)
         updates["finished_at"] = now
@@ -652,6 +661,14 @@ def transition_to(
     new_job = _update_job(job, updates)
     if job_dir is not None:
         save_state(job_dir, new_job)
+        append_event(
+            job_dir,
+            "transition",
+            actor=actor,
+            from_state=job.status.value,
+            to_state=new_status.value,
+            error=updates.get("error"),
+        )
     return new_job
 
 
@@ -699,6 +716,7 @@ def reconcile_stale(job: Job, job_dir: Path) -> Job:
         fresh_job,
         JobState.ABANDONED,
         job_dir=job_dir,
+        actor="system:reconcile",
         error="Worker process no longer exists",
     )
 
@@ -726,7 +744,7 @@ def _pending_startup_grace_active(job: Job) -> bool:
     if not timestamp:
         return False
     try:
-        created = datetime.fromisoformat(timestamp)
+        created = _parse_iso(timestamp)
     except (TypeError, ValueError):
         return False
     if created.tzinfo is None:
@@ -793,3 +811,37 @@ class InvalidStateError(JobError):
 
 class LineageError(JobError):
     """Lineage validation failed (unknown parent, cycle, depth exceeded, etc.)."""
+
+
+# ---------------------------------------------------------------------------
+# Audit log
+# ---------------------------------------------------------------------------
+
+def append_event(job_dir: Path, event: str, *, actor: str = "user", **payload: Any) -> None:
+    """Append one JSON line to <job_dir>/events.jsonl.
+
+    Atomic on POSIX for lines under the pipe buffer (our payloads are ~200 bytes).
+    Never raises on failure — the audit log must not break the operation it
+    observes. Errors are reported via stderr instead.
+
+    The payload MUST include enough context to reconstruct the transition. The
+    caller is responsible for not stashing prompt text or command data — those
+    are never audit-relevant.
+    """
+    import sys
+    line = json.dumps(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+            "actor": actor,
+            **payload,
+        },
+        sort_keys=True,
+    )
+    try:
+        with (job_dir / "events.jsonl").open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError as exc:
+        print(f"[crossagent] audit log write failed: {exc}", file=sys.stderr)

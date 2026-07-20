@@ -235,6 +235,13 @@ def test_page_escapes_job_fields_before_dom_insertion(server_url):
                 ), line
 
 
+def test_page_html_contains_adaptive_poll(server_url):
+    response = urllib.request.urlopen(server_url + "/")
+    body = response.read().decode("utf-8")
+    assert "hasRunningJobs ? 3000 : 15000" in body
+    assert "let hasRunningJobs = false;" in body
+
+
 def test_cli_wires_dashboard_subcommand():
     from crossagent.cli import _JOB_SUBCOMMANDS
 
@@ -463,3 +470,42 @@ def test_api_events_utf8_byte_offset(state_dir, server_url):
     payload2 = json.loads(body2)
     assert len(payload2["events"]) == 1
     assert payload2["events"][0]["body"] == "world"
+
+
+def test_dashboard_html_has_audit_tab(server_url):
+    """Audit tab is rendered in the detail pane (PR #13 feature merged onto PR #12)."""
+    response = urllib.request.urlopen(server_url + "/")
+    body = response.read().decode("utf-8")
+    assert 'id="tab-audit"' in body
+    assert "let detailTab" in body
+
+
+def test_api_job_audit_returns_events(state_dir, server_url):
+    """GET /api/jobs/<id>/audit returns parsed events.jsonl entries."""
+    import os
+    from crossagent.jobs import (
+        Job, JobState, save_state, job_dir_path, append_event,
+    )
+    job_dir = job_dir_path(state_dir, "job_audit_evs")
+    job_dir.mkdir(parents=True, exist_ok=True)
+    save_state(job_dir, Job(
+        job_id="job_audit_evs",
+        status=JobState.SUCCEEDED,
+        started_at="2026-07-19T00:00:00+00:00",
+        worker_pid=os.getpid(),
+    ))
+    append_event(job_dir, "transition", actor="user",
+                 from_state="running", to_state="succeeded")
+    status, body = _get(server_url + "/api/jobs/job_audit_evs/audit")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["job_id"] == "job_audit_evs"
+    assert len(payload["events"]) == 1
+    assert payload["events"][0]["actor"] == "user"
+    assert payload["events"][0]["from_state"] == "running"
+    assert payload["events"][0]["to_state"] == "succeeded"
+
+
+def test_api_job_audit_unknown_job_is_404(server_url):
+    status, _ = _get(server_url + "/api/jobs/job_audit_unknown/audit")
+    assert status == 404
