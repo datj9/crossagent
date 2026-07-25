@@ -524,18 +524,27 @@ def test_api_job_audit_returns_events(state_dir, server_url):
     """GET /api/jobs/<id>/audit returns parsed events.jsonl entries."""
     import os
     from crossagent.jobs import (
-        Job, JobState, save_state, job_dir_path, append_event,
+        Job,
+        JobState,
+        save_state,
+        job_dir_path,
+        append_event,
     )
+
     job_dir = job_dir_path(state_dir, "job_audit_evs")
     job_dir.mkdir(parents=True, exist_ok=True)
-    save_state(job_dir, Job(
-        job_id="job_audit_evs",
-        status=JobState.SUCCEEDED,
-        started_at="2026-07-19T00:00:00+00:00",
-        worker_pid=os.getpid(),
-    ))
-    append_event(job_dir, "transition", actor="user",
-                 from_state="running", to_state="succeeded")
+    save_state(
+        job_dir,
+        Job(
+            job_id="job_audit_evs",
+            status=JobState.SUCCEEDED,
+            started_at="2026-07-19T00:00:00+00:00",
+            worker_pid=os.getpid(),
+        ),
+    )
+    append_event(
+        job_dir, "transition", actor="user", from_state="running", to_state="succeeded"
+    )
     status, body = _get(server_url + "/api/jobs/job_audit_evs/audit")
     assert status == 200
     payload = json.loads(body)
