@@ -34,6 +34,7 @@ from crossagent.jobs import (
     create_cancel_request,
     create_job_dir,
     default_state_root,
+    delegation_verdict,
     generate_job_id,
     generate_trace_id,
     is_terminal,
@@ -1636,3 +1637,85 @@ def test_transition_to_handles_z_suffix_started_at(tmp_path):
     assert updated.finished_at is not None
     assert updated.duration_seconds is not None
     assert updated.duration_seconds >= 0
+
+
+# =========================================================================
+# Delegation verdict (slice S3): "delegate finished" vs "work verified"
+# =========================================================================
+
+
+def _succeeded(check_exit=None):
+    check = (
+        None
+        if check_exit is None
+        else {
+            "command": "pytest",
+            "exit_code": check_exit,
+            "stdout_tail": "",
+            "stderr_tail": "",
+        }
+    )
+    return Job(job_id="job_v", status=JobState.SUCCEEDED, check_result=check)
+
+
+def test_delegation_verdict_incomplete_while_running():
+    job = Job(job_id="job_v", status=JobState.RUNNING)
+    assert delegation_verdict(job) == "incomplete"
+
+
+def test_delegation_verdict_failed_when_delegate_did_not_finish():
+    job = Job(job_id="job_v", status=JobState.FAILED)
+    assert delegation_verdict(job) == "failed"
+
+
+def test_delegation_verdict_failed_delegate_ignores_a_passing_check():
+    """A crashed delegate is a failed delegation even if a pre-existing check
+    still passes — status not SUCCEEDED dominates."""
+    job = Job(
+        job_id="job_v",
+        status=JobState.FAILED,
+        check_result={
+            "command": "pytest",
+            "exit_code": 0,
+            "stdout_tail": "",
+            "stderr_tail": "",
+        },
+    )
+    assert delegation_verdict(job) == "failed"
+
+
+def test_delegation_verdict_unverified_when_no_check():
+    assert delegation_verdict(_succeeded(check_exit=None)) == "unverified"
+
+
+def test_delegation_verdict_verified_when_check_passes():
+    assert delegation_verdict(_succeeded(check_exit=0)) == "verified"
+
+
+def test_delegation_verdict_failed_when_check_fails_despite_clean_exit():
+    """The load-bearing case: delegate exits 0 but the check fails -> failed."""
+    assert delegation_verdict(_succeeded(check_exit=1)) == "failed"
+
+
+def test_runtime_status_includes_check_fields():
+    job = _succeeded(check_exit=2)
+    result = runtime_status(job)
+    assert result["delegation_verdict"] == "failed"
+    assert result["check_result"]["exit_code"] == 2
+
+
+def test_v2_record_loads_with_check_result_none(tmp_path):
+    """A pre-S3 record on disk (no check_result key) loads as unverified, never
+    as a failed or passing check (D7: absent != false)."""
+    job_dir = create_job_dir(tmp_path, "job_v2")
+    atomic_json_write(
+        {
+            "schema_version": 2,
+            "job_id": "job_v2",
+            "status": "succeeded",
+        },
+        job_dir / "state.json",
+    )
+    loaded = load_state(job_dir)
+    assert loaded.check_result is None
+    assert delegation_verdict(loaded) == "unverified"
