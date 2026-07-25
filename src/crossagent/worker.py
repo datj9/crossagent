@@ -192,6 +192,10 @@ def worker_main(job_id: str, state_dir: Path) -> int:
         error = f"Advisor exited with code {outcome.exit_code}"
 
     now = datetime.now(timezone.utc).isoformat()
+    # Persist the advisor telemetry the parser extracted (S1). ``parsed`` fields
+    # already default to unknown maps / None when nothing was measured or the
+    # payload was malformed (D4/D7), so this never fails the job and never turns
+    # an unmeasured metric into a zero.
     jobs_mod.transition_to(
         job,
         final_state,
@@ -200,6 +204,11 @@ def worker_main(job_id: str, state_dir: Path) -> int:
         advisor_exit_code=outcome.exit_code,
         last_activity_at=now,
         last_event=final_state.value,
+        usage_details=parsed.usage_details,
+        cost_details=parsed.cost_details,
+        duration_ms=parsed.duration_ms,
+        cost_source=parsed.cost_source,
+        model_reported=parsed.model_reported,
     )
 
     return 0
