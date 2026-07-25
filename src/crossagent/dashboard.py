@@ -441,9 +441,9 @@ _PAGE_HTML = """<!doctype html>
       --neutral-bg: #eaeef2; --neutral-fg: #59636e;
       --warn-fg: #7d4e00;
       --graph-bg: #f6f8fa;
-      --graph-edge: #afb8c1;
+      --graph-edge: #7d8690;
       --graph-orch-bg: #eaeef2;
-      --graph-orch-border: #afb8c1;
+      --graph-orch-border: #7d8690;
       --graph-orch-text: #1f2328;
     }
   }
@@ -1444,7 +1444,10 @@ function paintGraph() {
     ctx.textAlign = "right";
     ctx.fillText(clipText(ctx, status.replace(/_/g, " "), r.w * 0.4 - 4), r.x + r.w - 7, r.y + 14);
 
-    ctx.fillStyle = C.textMuted;
+    // --text (not --text-muted): muted gray on the colored node fills falls
+    // below 4.5:1 in dark (e.g. 3.73:1 on the running fill). Weight (regular
+    // vs the id's bold) and position keep the name visually secondary.
+    ctx.fillStyle = C.text;
     ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, monospace";
     ctx.textAlign = "left";
     ctx.fillText(clipText(ctx, n.name || "", r.w - 14), r.x + 7, r.y + 34);
