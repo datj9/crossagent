@@ -121,8 +121,9 @@ def test_extract_claude_metrics_non_dict_event_is_unknown():
     assert metrics.usage_details == {}
 
 
-def test_extract_claude_metrics_top_level_token_totals_fallback():
-    """Older stream shapes expose totals at the top level, no ``usage`` object."""
+def test_extract_claude_metrics_ignores_phantom_top_level_totals():
+    """Claude nests tokens under ``usage``; top-level ``total_*_tokens`` are a
+    shape it never emits (S2 probe) and must not be mistaken for token counts."""
     metrics = parsers.extract_claude_metrics(
         {
             "type": "result",
@@ -130,10 +131,7 @@ def test_extract_claude_metrics_top_level_token_totals_fallback():
             "total_output_tokens": 120,
         }
     )
-    assert metrics.usage_details == {
-        "total_input_tokens": 300,
-        "total_output_tokens": 120,
-    }
+    assert metrics.usage_details == {}
 
 
 def test_extract_claude_metrics_model_from_init_fallback():
@@ -170,14 +168,33 @@ def test_extract_codex_metrics_absent_is_unknown():
     assert parsers.extract_codex_metrics({}).cost_source == "unknown"
 
 
-def test_extract_codex_metrics_reads_usage_when_present():
+def test_extract_codex_metrics_reads_turn_completed_usage():
+    """Real codex shape (S2 probe): tokens on ``turn.completed.usage``,
+    snake_case, five categories. Stored verbatim, never summed (D2)."""
     metrics = parsers.extract_codex_metrics(
         {
             "type": "turn.completed",
-            "usage": {"input_tokens": 12, "output_tokens": 8},
+            "usage": {
+                "input_tokens": 23075,
+                "cached_input_tokens": 0,
+                "cache_write_input_tokens": 0,
+                "output_tokens": 5,
+                "reasoning_output_tokens": 0,
+            },
         }
     )
-    assert metrics.usage_details == {"input_tokens": 12, "output_tokens": 8}
+    assert metrics.usage_details == {
+        "input_tokens": 23075,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 5,
+        "reasoning_output_tokens": 0,
+    }
+    # Codex emits no cost and no duration.
+    assert metrics.cost_source == "unknown"
+    assert metrics.duration_ms is None
+    # No fabricated aggregate (23080 would be the naive sum).
+    assert 23080 not in metrics.usage_details.values()
 
 
 # =========================================================================

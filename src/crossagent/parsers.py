@@ -75,8 +75,16 @@ def _coerce_duration_ms(value: object) -> Optional[int]:
 def _usage_from_mapping(usage: dict[str, Any]) -> dict[str, int]:
     """Collect the scalar int token counts from a *usage* mapping.
 
-    Non-int values (nested breakdowns like ``server_tool_use``, strings, bools)
-    are skipped rather than guessed at (D4). Nothing is summed (D2).
+    Keys are stored **verbatim** as the advisor emits them — snake_case for
+    claude/codex (``input_tokens``, ``cache_read_input_tokens``), camelCase for
+    commandcode (``inputTokens``, ``cacheReadTokens``). We deliberately do not
+    normalize case: D1 mandates open-keyed maps precisely because the token
+    categories differ per advisor, and normalizing would erase that provenance
+    and risk key collisions. Non-int values (nested breakdowns like
+    ``server_tool_use``, strings, bools) are skipped rather than guessed at
+    (D4). Nothing is summed (D2): each token stays under exactly one key, and
+    ``cache_*`` / ``reasoning_output_tokens`` are subsets of the totals, not
+    additions to them.
     """
     details: dict[str, int] = {}
     for key, value in usage.items():
@@ -112,16 +120,12 @@ def extract_claude_metrics(
     if not isinstance(event, dict):
         return AdvisorMetrics()
 
+    # Claude nests token counts under ``usage`` — ``input_tokens``,
+    # ``output_tokens``, ``cache_creation_input_tokens``,
+    # ``cache_read_input_tokens`` — and never at the top level (measured live on
+    # Claude Code 2.1.218, S2 probe). Absent ``usage`` means no tokens measured.
     usage = event.get("usage")
-    if isinstance(usage, dict):
-        usage_details = _usage_from_mapping(usage)
-    else:
-        # Older stream shapes expose the totals at the top level instead.
-        usage_details = {}
-        for key in ("total_input_tokens", "total_output_tokens"):
-            coerced = _coerce_token_count(event.get(key))
-            if coerced is not None:
-                usage_details[key] = coerced
+    usage_details = _usage_from_mapping(usage) if isinstance(usage, dict) else {}
 
     cost = _coerce_cost(event.get("total_cost_usd"))
     if cost is not None:
