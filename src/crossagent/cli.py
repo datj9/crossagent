@@ -20,6 +20,7 @@ from typing import Any
 
 from . import __version__
 from . import advisors as advisors_mod
+from . import check as check_mod
 from . import jobs as jobs_mod
 from . import parsers as parsers_mod
 from . import registry as reg
@@ -343,6 +344,23 @@ def _parse_job_args(subcommand: str, argv: list[str]) -> argparse.Namespace:
             help="Maximum seconds the advisor may run (default 1800).",
         )
         parser.add_argument("--termination-grace", type=float, default=10.0)
+        parser.add_argument(
+            "--check",
+            help=(
+                "Verification command crossagent runs itself after the delegate "
+                "finishes; its exit code is the delegation verdict (0 = verified). "
+                "Without --check the job is labelled unverified, never passing."
+            ),
+        )
+        parser.add_argument(
+            "--check-timeout",
+            type=float,
+            default=check_mod.CHECK_DEFAULT_TIMEOUT_SECONDS,
+            help=(
+                "Seconds the --check command may run before it is treated as "
+                "failed (default 600)."
+            ),
+        )
         parser.add_argument("--json", action="store_true")
         parser.set_defaults(stream=True)
     elif subcommand == "wait":
@@ -551,8 +569,13 @@ def _cmd_wait(args: argparse.Namespace) -> int:
     else:
         print(f"[crossagent] {job.job_id} status={job.status.value}", file=sys.stderr)
 
-    if args.require_complete and job.status != jobs_mod.JobState.SUCCEEDED:
-        return 1
+    if args.require_complete:
+        # Gate on the delegation VERDICT, not just process exit (D5). A delegate
+        # that exited 0 while its --check failed is a failed delegation and must
+        # not pass this gate. "unverified" (no --check requested) preserves the
+        # historical behaviour of succeeding on a clean process exit.
+        if jobs_mod.delegation_verdict(job) not in ("verified", "unverified"):
+            return 1
     return 0
 
 
@@ -598,7 +621,31 @@ def _cmd_result(args: argparse.Namespace) -> int:
     summary = _metrics_summary(job)
     if summary:
         print(f"[crossagent] {summary}", file=sys.stderr)
-    return 0
+    # The delegate finished (status SUCCEEDED), but "finished" is not "verified"
+    # (D5). Report the check verdict loudly and let it drive the exit code so a
+    # scripted caller cannot mistake a failed-check delegation for a good one.
+    verdict = jobs_mod.delegation_verdict(job)
+    _print_verdict(job, verdict, file=sys.stderr)
+    return 1 if verdict == "failed" else 0
+
+
+def _print_verdict(job: jobs_mod.Job, verdict: str, *, file: Any = sys.stderr) -> None:
+    """Print a one-line delegation verdict to *file* (stderr by default)."""
+    check = job.check_result
+    if verdict == "verified":
+        print("[crossagent] delegation verified — check passed", file=file)
+    elif verdict == "unverified":
+        print(
+            "[crossagent] delegation UNVERIFIED — no --check ran; the delegate "
+            "finished but its work was not checked",
+            file=file,
+        )
+    elif verdict == "failed":
+        exit_code = check.get("exit_code") if check else None
+        print(
+            f"[crossagent] delegation FAILED verification — check exited {exit_code}",
+            file=file,
+        )
 
 
 def _metrics_summary(job: jobs_mod.Job) -> str:
@@ -715,7 +762,7 @@ def _print_job_table(listed_jobs: list[jobs_mod.Job]) -> None:
         return
     header = (
         f"{'JOB ID':<34} {'STATUS':<10} {'ADVISOR':<12} "
-        f"{'ELAPSED':>8} {'IDLE':>6} {'COST':>9}  NAME"
+        f"{'ELAPSED':>8} {'IDLE':>6} {'COST':>9} {'CHECK':>6}  NAME"
     )
     print(header)
     for job in listed_jobs:
@@ -728,7 +775,8 @@ def _print_job_table(listed_jobs: list[jobs_mod.Job]) -> None:
         )
         print(
             f"{job.job_id:<34} {job.status.value:<10} {job.advisor:<12} "
-            f"{elapsed:>8} {idle:>6} {_format_cost(job):>9}  {job.name}"
+            f"{elapsed:>8} {idle:>6} {_format_cost(job):>9} {_format_check(job):>6}  "
+            f"{job.name}"
         )
 
 
@@ -748,6 +796,20 @@ def _format_cost(job: jobs_mod.Job) -> str:
     if job.cost_source == "unknown" or total is None:
         return "-"
     return f"${total:.4f}"
+
+
+def _format_check(job: jobs_mod.Job) -> str:
+    """Return the check cell. ``-`` means no check ran (unverified), NOT a pass.
+
+    The check outcome is shown independently of STATUS so a reader sees both
+    "did the delegate finish" (STATUS) and "did the work verify" (CHECK) — a
+    ``succeeded``/``FAIL`` row is exactly the failed delegation the product
+    exists to surface (D5).
+    """
+    check = job.check_result
+    if check is None:
+        return "-"
+    return "pass" if check.get("exit_code") == 0 else "FAIL"
 
 
 def _cmd_dashboard(args: argparse.Namespace) -> int:
@@ -803,6 +865,10 @@ def _write_command_info(
         "name": args.name,
         "model": args.model,
         "advisor": advisor.name,
+        "check": getattr(args, "check", None),
+        "check_timeout": getattr(
+            args, "check_timeout", check_mod.CHECK_DEFAULT_TIMEOUT_SECONDS
+        ),
     }
     jobs_mod.atomic_json_write(info, job_dir / "command.json")
 
