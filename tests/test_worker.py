@@ -123,10 +123,18 @@ def test_build_advisor_env_contains_state_dir():
 
 
 def _run_job_through_worker(
-    tmp_path: Path, fake_advisor_body: str, *, job_id: str = "job_e2e"
+    tmp_path: Path,
+    fake_advisor_body: str,
+    *,
+    job_id: str = "job_e2e",
+    check: str | None = None,
+    check_timeout: float = 30.0,
 ) -> Job:
     """Set up a job whose advisor is a fake claude-stream script, run the
-    worker synchronously, and return the Job reloaded from disk."""
+    worker synchronously, and return the Job reloaded from disk.
+
+    When *check* is given it is written into command.json so the worker runs
+    the S3 check-gate after the delegate finishes."""
     state_dir = tmp_path / "state"
     job_dir = jobs_mod.create_job_dir(state_dir, job_id)
 
@@ -146,24 +154,37 @@ def _run_job_through_worker(
         ),
     )
     (job_dir / "prompt").write_text("hello", encoding="utf-8")
-    jobs_mod.atomic_json_write(
-        {
-            "command": [sys.executable, str(fake_advisor)],
-            "prompt_delivery": "positional",
-            "cwd": str(tmp_path),
-            "result_parser": "claude-stream",
-            "registry_path": str(tmp_path / "sessions.json"),
-            "key": "",
-            "name": None,
-            "model": "",
-            "advisor": "claude",
-        },
-        job_dir / "command.json",
-    )
+    command_info = {
+        "command": [sys.executable, str(fake_advisor)],
+        "prompt_delivery": "positional",
+        "cwd": str(tmp_path),
+        "result_parser": "claude-stream",
+        "registry_path": str(tmp_path / "sessions.json"),
+        "key": "",
+        "name": None,
+        "model": "",
+        "advisor": "claude",
+    }
+    if check is not None:
+        command_info["check"] = check
+        command_info["check_timeout"] = check_timeout
+    jobs_mod.atomic_json_write(command_info, job_dir / "command.json")
 
     exit_code = worker_main(job_id, state_dir)
     assert exit_code == 0
     return jobs_mod.load_state(job_dir)
+
+
+_RESULT_OK = (
+    "import json\n"
+    'print(json.dumps({"type": "result", "subtype": "success", "result": "ok"}))\n'
+)
+_NO_RESULT = "pass\n"
+
+
+def _check_cmd(exit_code: int) -> str:
+    """A portable check command that exits with *exit_code*."""
+    return f'{sys.executable} -c "import sys; sys.exit({exit_code})"'
 
 
 def test_worker_persists_advisor_metrics_end_to_end(tmp_path):
@@ -233,3 +254,127 @@ def test_worker_malformed_telemetry_does_not_fail_job(tmp_path):
     assert job.cost_details == {}
     assert job.cost_source == "unknown"
     assert job.duration_ms is None
+
+
+# =========================================================================
+# End-to-end check-gate persistence (slice S3): drive a real job through
+# worker_main WITH a --check and assert the check_result landed on the
+# terminal record on disk. Like the metric tests above, this drives the whole
+# path — a test that only called transition_to(check_result=...) directly
+# could not catch the worker forgetting to forward it.
+# =========================================================================
+
+
+def test_worker_check_failure_is_a_failed_delegation(tmp_path):
+    """A delegate that exits 0 (clean success) whose check exits non-zero is a
+    FAILED delegation carrying the real check exit code — status stays
+    SUCCEEDED (the delegate DID finish) but the verdict is failed (S3
+    acceptance: no green badge)."""
+    job = _run_job_through_worker(tmp_path, _RESULT_OK, check=_check_cmd(1))
+    # The delegate process finished cleanly...
+    assert job.status == JobState.SUCCEEDED
+    # ...but the independent check failed, so the delegation failed.
+    assert job.check_result is not None
+    assert job.check_result["exit_code"] == 1
+    assert job.check_result["command"] == _check_cmd(1)
+    assert jobs_mod.delegation_verdict(job) == "failed"
+
+
+def test_worker_check_pass_yields_verified(tmp_path):
+    """A clean delegate whose check exits 0 is a verified delegation."""
+    job = _run_job_through_worker(tmp_path, _RESULT_OK, check=_check_cmd(0))
+    assert job.status == JobState.SUCCEEDED
+    assert job.check_result is not None
+    assert job.check_result["exit_code"] == 0
+    assert jobs_mod.delegation_verdict(job) == "verified"
+
+
+def test_worker_missing_check_is_unverified_not_pass(tmp_path):
+    """With no --check the job is labelled unverified, never a pass (S3
+    acceptance) — check_result stays None so it is distinguishable from a
+    check that ran and passed."""
+    job = _run_job_through_worker(tmp_path, _RESULT_OK)
+    assert job.status == JobState.SUCCEEDED
+    assert job.check_result is None
+    assert jobs_mod.delegation_verdict(job) == "unverified"
+
+
+def test_worker_check_output_captured_when_delegate_crashes(tmp_path):
+    """The check runs and its output is captured even when the delegate itself
+    crashed (no result event -> FAILED). The verdict is failed because the
+    delegate never finished, but the check ran for diagnostics (S3
+    acceptance)."""
+    job = _run_job_through_worker(
+        tmp_path,
+        _NO_RESULT,
+        check=(
+            f'{sys.executable} -c "import sys; '
+            "print('check-ran-marker'); sys.exit(0)\""
+        ),
+    )
+    assert job.status == JobState.FAILED
+    assert job.check_result is not None
+    assert "check-ran-marker" in job.check_result["stdout_tail"]
+    assert jobs_mod.delegation_verdict(job) == "failed"
+
+
+def test_worker_nonexistent_check_does_not_crash_worker(tmp_path):
+    """A check command that isn't executable is captured as a non-zero exit and
+    does NOT crash the worker or fail to persist a terminal state (S3
+    acceptance)."""
+    job = _run_job_through_worker(
+        tmp_path, _RESULT_OK, check="crossagent-no-such-check-cmd-xyz"
+    )
+    assert job.status == JobState.SUCCEEDED
+    assert job.check_result is not None
+    assert job.check_result["exit_code"] != 0
+    assert jobs_mod.delegation_verdict(job) == "failed"
+
+
+def test_worker_enormous_check_output_is_truncated_on_record(tmp_path):
+    """A check that emits huge output persists only a bounded tail — the whole
+    Job record is loaded into the dashboard, so it must not carry megabytes."""
+    from crossagent import check as check_mod
+
+    job = _run_job_through_worker(
+        tmp_path,
+        _RESULT_OK,
+        check=f"{sys.executable} -c \"print('x' * 500000)\"",
+    )
+    assert job.check_result is not None
+    assert len(job.check_result["stdout_tail"]) <= (
+        check_mod.CHECK_OUTPUT_TAIL_CHARS + len(check_mod._TRUNCATION_MARKER)
+    )
+
+
+def test_worker_check_logs_command_and_code_but_not_output(tmp_path):
+    """The audit log records the check's command and exit code but NEVER its
+    output (which may contain secrets). The output is put in a script file so
+    the secret marker lives only in the check's OUTPUT, not its command."""
+    import json
+
+    check_script = tmp_path / "leaky_check.py"
+    check_script.write_text(
+        "import sys\nprint('secret-in-output')\nsys.exit(2)\n",
+        encoding="utf-8",
+    )
+    job = _run_job_through_worker(
+        tmp_path,
+        _RESULT_OK,
+        check=f"{sys.executable} {check_script}",
+    )
+    # The secret IS captured in the private state record (0o600) for debugging.
+    assert job.check_result is not None
+    assert "secret-in-output" in job.check_result["stdout_tail"]
+
+    # ...but the audit log carries only the command + exit code, never output.
+    events_path = tmp_path / "state" / "job_e2e" / "events.jsonl"
+    lines = [
+        json.loads(line)
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    check_events = [event for event in lines if event.get("event") == "check"]
+    assert len(check_events) == 1
+    assert check_events[0]["exit_code"] == 2
+    assert "secret-in-output" not in json.dumps(check_events[0])

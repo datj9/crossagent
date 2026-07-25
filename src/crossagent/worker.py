@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from . import check as check_mod
 from . import jobs as jobs_mod
 from . import parsers as parsers_mod
 from . import registry as reg_mod
@@ -39,6 +40,8 @@ class _JobCommand:
     name: Optional[str]
     model: str
     advisor: str
+    check: Optional[str]
+    check_timeout: float
 
 
 # ---------------------------------------------------------------------------
@@ -191,11 +194,19 @@ def worker_main(job_id: str, state_dir: Path) -> int:
         final_state = jobs_mod.JobState.FAILED
         error = f"Advisor exited with code {outcome.exit_code}"
 
+    # Run the independent check-gate (S3) if one was configured. This runs
+    # regardless of the delegate's own outcome so failing-check output is
+    # captured even when the delegate crashed. ``None`` means no check ran →
+    # the delegation is *unverified*, never silently a pass (D5).
+    check_result = _run_configured_check(command, job_dir)
+
     now = datetime.now(timezone.utc).isoformat()
-    # Persist the advisor telemetry the parser extracted (S1). ``parsed`` fields
-    # already default to unknown maps / None when nothing was measured or the
-    # payload was malformed (D4/D7), so this never fails the job and never turns
-    # an unmeasured metric into a zero.
+    # Persist the advisor telemetry the parser extracted (S1) and the check-gate
+    # outcome (S3) on the SAME terminal transition — the worker is the only
+    # writer of terminal state, so any field not forwarded here never lands on
+    # disk. ``parsed`` fields and ``check_result`` already default to unknown /
+    # None when nothing was measured (D4/D7), so this never fails the job and
+    # never turns an unmeasured metric into a zero or an unrun check into a pass.
     jobs_mod.transition_to(
         job,
         final_state,
@@ -209,9 +220,39 @@ def worker_main(job_id: str, state_dir: Path) -> int:
         duration_ms=parsed.duration_ms,
         cost_source=parsed.cost_source,
         model_reported=parsed.model_reported,
+        check_result=check_result,
     )
 
     return 0
+
+
+def _run_configured_check(
+    command: _JobCommand, job_dir: Path
+) -> Optional[jobs_mod.CheckResultDict]:
+    """Run the caller's ``--check`` command, if any, and return its outcome.
+
+    Returns ``None`` when no check was configured — a missing gate is recorded
+    as *unverified*, never as a pass (D5). The check runs in the delegate's cwd
+    so it observes the delegate's edits.
+    """
+    if not command.check:
+        return None
+    outcome = check_mod.run_check(
+        command.check,
+        cwd=command.cwd,
+        timeout=command.check_timeout,
+    )
+    # Audit the verdict, but never the check's OUTPUT (which can contain
+    # secrets) — only the caller-supplied command and its deterministic exit
+    # code go to the append-only audit log.
+    jobs_mod.append_event(
+        job_dir,
+        "check",
+        actor="system:check",
+        command=command.check,
+        exit_code=outcome.exit_code,
+    )
+    return outcome.to_dict()
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +273,10 @@ def _load_command(job_dir: Path) -> _JobCommand:
         name=data.get("name"),
         model=str(data.get("model", "")),
         advisor=str(data["advisor"]),
+        check=data.get("check"),
+        check_timeout=float(
+            data.get("check_timeout", check_mod.CHECK_DEFAULT_TIMEOUT_SECONDS)
+        ),
     )
 
 
