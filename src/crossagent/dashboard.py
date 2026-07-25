@@ -398,7 +398,7 @@ _PAGE_HTML = """<!doctype html>
 
     --text: #e6edf3;
     --text-muted: #8b949e;
-    --text-faint: #6e7681;
+    --text-faint: #767e87;
 
     --accent: #58a6ff;
 
@@ -433,7 +433,7 @@ _PAGE_HTML = """<!doctype html>
       --border-strong: #afb8c1;
       --text: #1f2328;
       --text-muted: #59636e;
-      --text-faint: #818b98;
+      --text-faint: #656d76;
       --accent: #0969da;
       --run-bg: #ddf4ff; --run-fg: #0a5cc4;
       --ok-bg: #dafbe1; --ok-fg: #1a7f37;
