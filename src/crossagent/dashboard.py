@@ -410,7 +410,7 @@ _PAGE_HTML = """<!doctype html>
 
     /* Consumed by the <canvas> graph renderer (see cssVar() in the script). */
     --graph-bg: #010409;
-    --graph-edge: #30363d;
+    --graph-edge: #5c646e;
     --graph-orch-bg: #21262d;
     --graph-orch-border: #6e7681;
     --graph-orch-text: #c9d1d9;
