@@ -12,11 +12,20 @@ import os
 import re
 import sys
 import tempfile
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Literal, Optional
+
+# Where a job's cost figure came from. ``advisor`` is the vendor-declared
+# estimate, ``computed`` is derived from a local price table, and ``unknown``
+# means no cost was measured — never conflate that with a measured ``0.0``.
+CostSource = Literal["advisor", "computed", "unknown"]
+
+# Highest ``schema_version`` this build writes. Older records still load.
+CURRENT_SCHEMA_VERSION = 3
+_SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3})
 
 # Lineage parent ids arrive from CLI flags and environment variables, so they
 # are untrusted. Only the generated ``job_<...>`` shape is accepted; rejecting
@@ -115,7 +124,7 @@ class Job:
     Every JSON response includes *schema_version*, *job_id*, and *status*.
     """
 
-    schema_version: int = 2
+    schema_version: int = CURRENT_SCHEMA_VERSION
     job_id: str = ""
     status: JobState = JobState.PENDING
     advisor: str = ""
@@ -140,6 +149,16 @@ class Job:
     parent_job_id: Optional[str] = None
     orchestrator_label: Optional[str] = None
     nesting_depth: Optional[int] = None
+    # --- Advisor metrics (schema v3) -------------------------------------
+    # Two open-keyed maps (D1): per-advisor token categories and USD costs.
+    # Empty maps + ``cost_source == "unknown"`` mean *unmeasured*, which must
+    # stay distinguishable from a measured zero (D7). Token counts are NOT
+    # additive (D2): each token lives under exactly one ``usage_details`` key.
+    usage_details: dict[str, int] = field(default_factory=dict)
+    cost_details: dict[str, float] = field(default_factory=dict)
+    duration_ms: Optional[int] = None
+    cost_source: CostSource = "unknown"
+    model_reported: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +444,9 @@ def runtime_status(job: Job) -> dict[str, Any]:
     started = _parse_iso(job.started_at) if job.started_at else now
     if started.tzinfo is None:
         started = started.replace(tzinfo=timezone.utc)
-    last_activity = _parse_iso(job.last_activity_at) if job.last_activity_at else started
+    last_activity = (
+        _parse_iso(job.last_activity_at) if job.last_activity_at else started
+    )
     if last_activity.tzinfo is None:
         last_activity = last_activity.replace(tzinfo=timezone.utc)
 
@@ -461,6 +482,11 @@ def runtime_status(job: Job) -> dict[str, Any]:
         "parent_job_id": job.parent_job_id,
         "orchestrator_label": job.orchestrator_label,
         "nesting_depth": job.nesting_depth,
+        "usage_details": job.usage_details,
+        "cost_details": job.cost_details,
+        "duration_ms": job.duration_ms,
+        "cost_source": job.cost_source,
+        "model_reported": job.model_reported,
     }
 
 
@@ -610,7 +636,7 @@ def load_state(job_dir: Path) -> Job:
         raise InvalidStateError(f"Expected a mapping, got {type(data).__name__}")
 
     ver = data.get("schema_version")
-    if ver not in (1, 2):
+    if ver not in _SUPPORTED_SCHEMA_VERSIONS:
         raise InvalidStateError(f"Unsupported schema_version {ver}")
 
     raw = data.get("status")
@@ -817,7 +843,10 @@ class LineageError(JobError):
 # Audit log
 # ---------------------------------------------------------------------------
 
-def append_event(job_dir: Path, event: str, *, actor: str = "user", **payload: Any) -> None:
+
+def append_event(
+    job_dir: Path, event: str, *, actor: str = "user", **payload: Any
+) -> None:
     """Append one JSON line to <job_dir>/events.jsonl.
 
     Atomic on POSIX for lines under the pipe buffer (our payloads are ~200 bytes).
@@ -829,6 +858,7 @@ def append_event(job_dir: Path, event: str, *, actor: str = "user", **payload: A
     are never audit-relevant.
     """
     import sys
+
     line = json.dumps(
         {
             "ts": datetime.now(timezone.utc).isoformat(),

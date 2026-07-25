@@ -122,7 +122,7 @@ def test_transition_to_basic():
     updated = transition_to(job, JobState.RUNNING)
     assert updated.status == JobState.RUNNING
     assert updated.job_id == "job_test_1"
-    assert updated.schema_version == 2
+    assert updated.schema_version == 3
     assert updated.updated_at != ""
     assert updated.finished_at is None
 
@@ -448,7 +448,7 @@ def test_load_state_non_dict(tmp_path):
 def test_status_response_includes_required_fields():
     job = Job(job_id="job_sr1", status=JobState.RUNNING, advisor="claude")
     resp = status_response(job)
-    assert resp == {"schema_version": 2, "job_id": "job_sr1", "status": "running"}
+    assert resp == {"schema_version": 3, "job_id": "job_sr1", "status": "running"}
 
 
 def test_status_response_excludes_prompt_and_command():
@@ -696,7 +696,7 @@ def test_load_state_accepts_v1_and_v2(tmp_path):
 def test_load_state_rejects_unsupported_version(tmp_path):
     job_dir = create_job_dir(tmp_path, "job_badver2")
     atomic_json_write(
-        {"schema_version": 3, "job_id": "job_badver2", "status": "running"},
+        {"schema_version": 4, "job_id": "job_badver2", "status": "running"},
         job_dir / "state.json",
     )
     with pytest.raises(InvalidStateError):

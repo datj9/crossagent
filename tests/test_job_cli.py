@@ -141,7 +141,7 @@ def test_start_returns_job_id_and_worker_continues(
     captured = capsys.readouterr()
     assert code == 0, captured.err
     response = json.loads(captured.out)
-    assert response["schema_version"] == 2
+    assert response["schema_version"] == 3
     assert response["job_id"].startswith("job_")
     assert response["status"] in ("pending", "running")
     assert response["advisor"] == "codex"

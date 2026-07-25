@@ -595,7 +595,29 @@ def _cmd_result(args: argparse.Namespace) -> int:
         return 1
 
     print(result_path.read_text(encoding="utf-8"), end="")
+    summary = _metrics_summary(job)
+    if summary:
+        print(f"[crossagent] {summary}", file=sys.stderr)
     return 0
+
+
+def _metrics_summary(job: jobs_mod.Job) -> str:
+    """Return a one-line advisor-metrics summary, or ``""`` when nothing was
+    measured. Cost/token/duration go to stderr so piped stdout stays the result.
+    """
+    parts: list[str] = []
+    total_cost = job.cost_details.get("total")
+    if job.cost_source != "unknown" and total_cost is not None:
+        parts.append(f"cost=${total_cost:.4f} ({job.cost_source})")
+    input_tokens = job.usage_details.get("input_tokens")
+    output_tokens = job.usage_details.get("output_tokens")
+    if input_tokens is not None or output_tokens is not None:
+        parts.append(f"tokens={input_tokens or 0} in / {output_tokens or 0} out")
+    if job.duration_ms is not None:
+        parts.append(f"duration={job.duration_ms}ms")
+    if job.model_reported:
+        parts.append(f"model={job.model_reported}")
+    return "  ".join(parts)
 
 
 def _cmd_logs(args: argparse.Namespace) -> int:
@@ -691,7 +713,10 @@ def _print_job_table(listed_jobs: list[jobs_mod.Job]) -> None:
     if not listed_jobs:
         print("[crossagent] no jobs found", file=sys.stderr)
         return
-    header = f"{'JOB ID':<34} {'STATUS':<10} {'ADVISOR':<12} {'ELAPSED':>8} {'IDLE':>6}  NAME"
+    header = (
+        f"{'JOB ID':<34} {'STATUS':<10} {'ADVISOR':<12} "
+        f"{'ELAPSED':>8} {'IDLE':>6} {'COST':>9}  NAME"
+    )
     print(header)
     for job in listed_jobs:
         entry = _format_status(job)
@@ -703,7 +728,7 @@ def _print_job_table(listed_jobs: list[jobs_mod.Job]) -> None:
         )
         print(
             f"{job.job_id:<34} {job.status.value:<10} {job.advisor:<12} "
-            f"{elapsed:>8} {idle:>6}  {job.name}"
+            f"{elapsed:>8} {idle:>6} {_format_cost(job):>9}  {job.name}"
         )
 
 
@@ -711,6 +736,18 @@ def _format_duration(elapsed_seconds: int, job: jobs_mod.Job) -> str:
     if job.duration_seconds is not None:
         return _format_seconds(int(job.duration_seconds))
     return _format_seconds(elapsed_seconds)
+
+
+def _format_cost(job: jobs_mod.Job) -> str:
+    """Return a short cost cell. An unmeasured cost shows ``-``, never ``$0``.
+
+    A measured zero (``cost_source`` advisor/computed) still renders as an
+    amount so it stays distinguishable from *not measured* (D7).
+    """
+    total = job.cost_details.get("total")
+    if job.cost_source == "unknown" or total is None:
+        return "-"
+    return f"${total:.4f}"
 
 
 def _cmd_dashboard(args: argparse.Namespace) -> int:

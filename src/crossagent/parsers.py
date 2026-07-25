@@ -9,8 +9,185 @@ from __future__ import annotations
 
 import json
 import sys
-from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable, Literal, Optional
+
+# Where a cost figure came from. ``advisor`` is the vendor-declared estimate;
+# ``computed`` is derived from a local price table; ``unknown`` means nothing
+# was measured — never conflate that with a measured ``0.0`` (D3/D7).
+CostSource = Literal["advisor", "computed", "unknown"]
+
+
+# ---------------------------------------------------------------------------
+# Metric extraction
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AdvisorMetrics:
+    """Structured telemetry pulled from an advisor's terminal event.
+
+    ``usage_details`` and ``cost_details`` are open-keyed maps (D1). Empty maps
+    with ``cost_source == "unknown"`` mean *unmeasured* and must stay
+    distinguishable from a measured zero (D7). Token counts are NOT summed
+    (D2): each token appears under exactly one ``usage_details`` key.
+    """
+
+    usage_details: dict[str, int] = field(default_factory=dict)
+    cost_details: dict[str, float] = field(default_factory=dict)
+    duration_ms: Optional[int] = None
+    cost_source: CostSource = "unknown"
+    model_reported: Optional[str] = None
+
+
+def _coerce_token_count(value: object) -> Optional[int]:
+    """Return *value* as an int token count, or ``None`` if it is not one.
+
+    ``bool`` is rejected (it is an ``int`` subclass but never a token count).
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    return None
+
+
+def _coerce_cost(value: object) -> Optional[float]:
+    """Return *value* as a float USD amount, or ``None`` if it is not a number."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _coerce_duration_ms(value: object) -> Optional[int]:
+    """Return *value* as an int millisecond duration, or ``None``."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return None
+
+
+def _usage_from_mapping(usage: dict[str, Any]) -> dict[str, int]:
+    """Collect the scalar int token counts from a *usage* mapping.
+
+    Non-int values (nested breakdowns like ``server_tool_use``, strings, bools)
+    are skipped rather than guessed at (D4). Nothing is summed (D2).
+    """
+    details: dict[str, int] = {}
+    for key, value in usage.items():
+        coerced = _coerce_token_count(value)
+        if coerced is not None:
+            details[str(key)] = coerced
+    return details
+
+
+def _extract_model(event: dict[str, Any], fallback: Optional[str]) -> Optional[str]:
+    model = event.get("model")
+    if isinstance(model, str) and model:
+        return model
+    model_usage = event.get("modelUsage")
+    if isinstance(model_usage, dict):
+        for name in model_usage:
+            if isinstance(name, str) and name:
+                return name
+    if isinstance(fallback, str) and fallback:
+        return fallback
+    return None
+
+
+def extract_claude_metrics(
+    event: Any, *, model: Optional[str] = None
+) -> AdvisorMetrics:
+    """Extract token/cost/duration telemetry from a Claude ``result`` event.
+
+    Parses defensively (D4): a missing, renamed, or wrong-typed field degrades
+    to *unknown* and never raises. *model* is the model reported on the init
+    event, used as a fallback when the result event omits it.
+    """
+    if not isinstance(event, dict):
+        return AdvisorMetrics()
+
+    usage = event.get("usage")
+    if isinstance(usage, dict):
+        usage_details = _usage_from_mapping(usage)
+    else:
+        # Older stream shapes expose the totals at the top level instead.
+        usage_details = {}
+        for key in ("total_input_tokens", "total_output_tokens"):
+            coerced = _coerce_token_count(event.get(key))
+            if coerced is not None:
+                usage_details[key] = coerced
+
+    cost = _coerce_cost(event.get("total_cost_usd"))
+    if cost is not None:
+        # A single scalar cost is deliberately stored under a derived "total"
+        # key (D3) and labelled as the vendor's own estimate.
+        cost_details: dict[str, float] = {"total": cost}
+        cost_source: CostSource = "advisor"
+    else:
+        cost_details = {}
+        cost_source = "unknown"
+
+    return AdvisorMetrics(
+        usage_details=usage_details,
+        cost_details=cost_details,
+        duration_ms=_coerce_duration_ms(event.get("duration_ms")),
+        cost_source=cost_source,
+        model_reported=_extract_model(event, model),
+    )
+
+
+def extract_codex_metrics(event: Any) -> AdvisorMetrics:
+    """Extract telemetry from a Codex ``turn.completed`` event, if any.
+
+    Codex's telemetry shape is unverified (see slice S2), so this reads only a
+    plainly-named ``usage`` mapping and cost field when present and degrades to
+    *unknown* otherwise — it never guesses at or requires a schema (D4).
+    """
+    if not isinstance(event, dict):
+        return AdvisorMetrics()
+
+    usage_details: dict[str, int] = {}
+    for container_key in ("usage", "token_usage"):
+        container = event.get(container_key)
+        if isinstance(container, dict):
+            usage_details = _usage_from_mapping(container)
+            if usage_details:
+                break
+
+    cost_details: dict[str, float] = {}
+    cost_source: CostSource = "unknown"
+    for cost_key in ("total_cost_usd", "cost_usd"):
+        cost = _coerce_cost(event.get(cost_key))
+        if cost is not None:
+            cost_details = {"total": cost}
+            cost_source = "advisor"
+            break
+
+    return AdvisorMetrics(
+        usage_details=usage_details,
+        cost_details=cost_details,
+        duration_ms=_coerce_duration_ms(event.get("duration_ms")),
+        cost_source=cost_source,
+        model_reported=_extract_model(event, None),
+    )
+
+
+def _parsed_with_metrics(metrics: AdvisorMetrics, **fields: Any) -> "ParsedResult":
+    """Build a ``ParsedResult`` carrying *fields* plus the extracted *metrics*."""
+    return ParsedResult(
+        usage_details=metrics.usage_details,
+        cost_details=metrics.cost_details,
+        duration_ms=metrics.duration_ms,
+        cost_source=metrics.cost_source,
+        model_reported=metrics.model_reported,
+        **fields,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -26,6 +203,11 @@ class ParsedResult:
     session_id: Optional[str] = None
     failure: bool = False
     error: Optional[str] = None
+    usage_details: dict[str, int] = field(default_factory=dict)
+    cost_details: dict[str, float] = field(default_factory=dict)
+    duration_ms: Optional[int] = None
+    cost_source: CostSource = "unknown"
+    model_reported: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +275,7 @@ class ClaudeStreamParser(EventParser):
     def __init__(self, on_activity: Optional[Callable[[str], None]] = None) -> None:
         super().__init__(on_activity)
         self._final: dict[str, Any] | None = None
+        self._model: Optional[str] = None
 
     def consume_stdout(self, line: str) -> None:
         stripped = line.strip()
@@ -104,6 +287,10 @@ class ClaudeStreamParser(EventParser):
             print(stripped, file=sys.stderr)
             return
         self._summarize(event)
+        if event.get("type") == "system" and event.get("subtype") == "init":
+            model = event.get("model")
+            if isinstance(model, str) and model:
+                self._model = model
         if event.get("type") == "result":
             self._final = event
             self._activity("stdout")
@@ -114,28 +301,28 @@ class ClaudeStreamParser(EventParser):
                 failure=True,
                 error="No result event received from Claude",
             )
+        metrics = extract_claude_metrics(self._final, model=self._model)
         if self._final.get("is_error"):
             errors = (
                 self._final.get("errors")
                 or self._final.get("api_error_status")
                 or "unknown error"
             )
-            return ParsedResult(
-                failure=True,
-                error=str(errors),
-            )
+            return _parsed_with_metrics(metrics, failure=True, error=str(errors))
         result = self._final.get("result")
         if result is not None:
-            return ParsedResult(result=result, session_id=self._final.get("session_id"))
+            return _parsed_with_metrics(
+                metrics, result=result, session_id=self._final.get("session_id")
+            )
         structured = self._final.get("structured_output")
         if structured is not None:
-            return ParsedResult(
+            return _parsed_with_metrics(
+                metrics,
                 result=json.dumps(structured, indent=2, sort_keys=True),
                 session_id=self._final.get("session_id"),
             )
-        return ParsedResult(
-            failure=True,
-            error="Result event contained no answer",
+        return _parsed_with_metrics(
+            metrics, failure=True, error="Result event contained no answer"
         )
 
     def _summarize(self, event: dict[str, Any]) -> None:
@@ -190,6 +377,7 @@ class CodexJsonlParser(EventParser):
         self._thread_id: Optional[str] = None
         self._last_agent_message: Optional[str] = None
         self._failure_error: Optional[str] = None
+        self._turn_completed: Optional[dict[str, Any]] = None
 
     def consume_stdout(self, line: str) -> None:
         stripped = line.strip()
@@ -209,6 +397,8 @@ class CodexJsonlParser(EventParser):
 
         if event_type == "thread.started":
             self._thread_id = event.get("thread_id") or event.get("id")
+        elif event_type == "turn.completed":
+            self._turn_completed = event
         elif event_type == "turn.started":
             self._activity("stdout")
         elif event_type == "item.completed":
@@ -225,19 +415,23 @@ class CodexJsonlParser(EventParser):
             self._activity("stdout")
 
     def finish(self, exit_code: int) -> ParsedResult:
+        metrics = extract_codex_metrics(self._turn_completed)
         if self._failure_error is not None:
-            return ParsedResult(
+            return _parsed_with_metrics(
+                metrics,
                 failure=True,
                 error=self._failure_error,
                 session_id=self._thread_id,
             )
         if exit_code != 0:
-            return ParsedResult(
+            return _parsed_with_metrics(
+                metrics,
                 failure=True,
                 error=f"Codex exited with code {exit_code}",
                 session_id=self._thread_id,
             )
-        return ParsedResult(
+        return _parsed_with_metrics(
+            metrics,
             result=self._last_agent_message,
             session_id=self._thread_id,
         )
