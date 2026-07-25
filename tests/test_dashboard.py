@@ -242,6 +242,46 @@ def test_page_html_contains_adaptive_poll(server_url):
     assert "let hasRunningJobs = false;" in body
 
 
+def test_page_supports_light_color_scheme(server_url):
+    """The palette is tokenized so both schemes work; guard the light branch.
+
+    Asserts the capability, not the values — hex assertions would break on every
+    palette tweak, while this fails only if light theming is removed outright.
+    """
+    status, body = _get(server_url + "/")
+    assert status == 200
+    assert "prefers-color-scheme: light" in body.decode("utf-8")
+
+
+def test_page_defines_semantic_color_tokens(server_url):
+    """Colors go through tokens, so a theme override cannot miss a usage site."""
+    text = _get(server_url + "/")[1].decode("utf-8")
+    for token in ("--surface", "--text", "--text-muted", "--text-faint"):
+        assert f"{token}:" in text
+
+
+def test_job_rows_are_a_keyboard_accessible_listbox(server_url):
+    """Job selection must be reachable without a mouse.
+
+    The container carries a static ``role="listbox"``, but rows are built in JS,
+    so their ``role="option"`` is applied via ``setAttribute`` and never appears
+    as a literal attribute in the served markup — assert the call, not the tag.
+    """
+    text = _get(server_url + "/")[1].decode("utf-8")
+    assert 'role="listbox"' in text
+    assert '"role", "option"' in text
+    assert "aria-selected" in text
+
+
+def test_page_defines_visible_focus_indicator(server_url):
+    """Keyboard focus must be visible, not suppressed by the restyle."""
+    assert "focus-visible" in _get(server_url + "/")[1].decode("utf-8")
+
+
+def test_page_respects_reduced_motion(server_url):
+    assert "prefers-reduced-motion" in _get(server_url + "/")[1].decode("utf-8")
+
+
 def test_cli_wires_dashboard_subcommand():
     from crossagent.cli import _JOB_SUBCOMMANDS
 
