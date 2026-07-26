@@ -264,7 +264,7 @@ def _write_child_command(
     verify_model: Optional[str],
     escalate_to: list[str],
 ) -> None:
-    info = {
+    command_payload = {
         "command": _build_child_argv(advisor, model),
         "prompt_delivery": advisor.prompt_delivery,
         "cwd": cwd,
@@ -286,7 +286,7 @@ def _write_child_command(
         "verify_model": verify_model,
         "escalate_to": escalate_to,
     }
-    jobs_mod.atomic_json_write(info, child_dir / "command.json")
+    jobs_mod.atomic_json_write(command_payload, child_dir / "command.json")
 
 
 def _audit_skip(job_dir: Path, *, reason: str) -> None:
