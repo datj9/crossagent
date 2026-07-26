@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 
 from crossagent import __version__, advisors
@@ -136,6 +138,88 @@ def test_missing_advisor_cli_exits_cleanly_without_logging_prompt(monkeypatch, c
     assert "advisor CLI not found on PATH" in captured.err
     assert "sensitive prompt" not in captured.err
     assert captured.out == ""
+
+
+# ---------------------------------------------------------------------------
+# HIGH 3: the foreground (default) dispatch path scrubs credentials from the
+# advisor env too — not only the durable-job path — with the same --pass-env
+# escape hatch, so both dispatch modes share one policy.
+# ---------------------------------------------------------------------------
+
+_FG_SECRET_NAME = "AWS_SECRET_ACCESS_KEY"
+_FG_SECRET_VALUE = "fg-super-secret-value"
+
+
+def _env_probe_advisor(tmp_path, probe_name):
+    """A fake claude-stream advisor that records one env var it was given."""
+    script = tmp_path / "fake_fg_advisor.py"
+    script.write_text(
+        "import json, os\n"
+        f"open('fg_env_probe.txt', 'w').write("
+        f"os.environ.get({probe_name!r}, 'ABSENT'))\n"
+        "print(json.dumps({'type': 'result', 'subtype': 'success', "
+        "'result': 'ok'}))\n",
+        encoding="utf-8",
+    )
+    return Advisor(
+        name="fakefg",
+        executable=sys.executable,
+        base_args=(str(script),),
+        prompt_delivery="positional",
+        result_parser="claude-stream",
+    )
+
+
+def test_foreground_advisor_env_is_scrubbed(tmp_path, monkeypatch):
+    """The default `crossagent --agent ... --prompt ...` invocation must withhold
+    the caller's ambient credentials from the advisor, matching the durable-job
+    path (HIGH 3)."""
+    monkeypatch.setenv(_FG_SECRET_NAME, _FG_SECRET_VALUE)
+    advisor = _env_probe_advisor(tmp_path, _FG_SECRET_NAME)
+    monkeypatch.setattr(advisors, "resolve", lambda _name: advisor)
+
+    code = main(["--agent", "fakefg", "--prompt", "hi", "--cwd", str(tmp_path)])
+
+    assert code == 0
+    assert (tmp_path / "fg_env_probe.txt").read_text() == "ABSENT"
+
+
+def test_foreground_pass_env_opts_a_named_var_back_in(tmp_path, monkeypatch):
+    """--pass-env NAME is the foreground escape hatch: the named credential var
+    reaches the advisor despite matching a credential pattern (HIGH 3)."""
+    monkeypatch.setenv(_FG_SECRET_NAME, _FG_SECRET_VALUE)
+    advisor = _env_probe_advisor(tmp_path, _FG_SECRET_NAME)
+    monkeypatch.setattr(advisors, "resolve", lambda _name: advisor)
+
+    code = main(
+        [
+            "--agent",
+            "fakefg",
+            "--prompt",
+            "hi",
+            "--cwd",
+            str(tmp_path),
+            "--pass-env",
+            _FG_SECRET_NAME,
+        ]
+    )
+
+    assert code == 0
+    assert (tmp_path / "fg_env_probe.txt").read_text() == _FG_SECRET_VALUE
+
+
+def test_foreground_secret_value_absent_from_output(tmp_path, monkeypatch, capsys):
+    """No credential VALUE appears in the foreground path's stdout/stderr — its
+    only output surface (the session registry stores no env) (HIGH 3)."""
+    monkeypatch.setenv(_FG_SECRET_NAME, _FG_SECRET_VALUE)
+    advisor = _env_probe_advisor(tmp_path, _FG_SECRET_NAME)
+    monkeypatch.setattr(advisors, "resolve", lambda _name: advisor)
+
+    main(["--agent", "fakefg", "--prompt", "hi", "--cwd", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert _FG_SECRET_VALUE not in captured.out
+    assert _FG_SECRET_VALUE not in captured.err
 
 
 def test_version_flag_prints_version_and_exits(capsys):
