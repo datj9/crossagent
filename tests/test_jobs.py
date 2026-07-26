@@ -1746,3 +1746,96 @@ def test_v2_record_loads_with_check_result_none(tmp_path):
     loaded = load_state(job_dir)
     assert loaded.check_result is None
     assert delegation_verdict(loaded) == "unverified"
+
+
+# =========================================================================
+# Delegation verdict interaction with the diff-scope assertion (slice S4).
+# A declared scope that was violated OR could not be determined fails the
+# delegation (fail closed) without adding a fifth verdict state.
+# =========================================================================
+
+
+def _scope(status, violating=()):
+    return {
+        "declared": ["src"],
+        "status": status,
+        "violating_paths": list(violating),
+        "detail": "",
+    }
+
+
+def _succeeded_scope(scope_status, *, check_exit=None):
+    check = (
+        None
+        if check_exit is None
+        else {
+            "command": "pytest",
+            "exit_code": check_exit,
+            "stdout_tail": "",
+            "stderr_tail": "",
+        }
+    )
+    return Job(
+        job_id="job_v",
+        status=JobState.SUCCEEDED,
+        scope_result=_scope(scope_status),
+        check_result=check,
+    )
+
+
+def test_delegation_verdict_scope_violation_fails_even_with_passing_check():
+    """A scope violation dominates: a passing check cannot green a delegation
+    that wrote outside its declared allowlist."""
+    job = _succeeded_scope("violated", check_exit=0)
+    assert delegation_verdict(job) == "failed"
+
+
+def test_delegation_verdict_undetermined_scope_is_failed_not_pass():
+    """Fail closed: an undetermined scope (couldn't tell what changed) is never
+    verified, even with a passing check."""
+    job = _succeeded_scope("undetermined", check_exit=0)
+    assert delegation_verdict(job) == "failed"
+
+
+def test_delegation_verdict_scope_ok_defers_to_check_gate():
+    """An in-bounds scope does not by itself verify: the check gate still runs.
+    Scope ok + passing check -> verified; scope ok + no check -> unverified."""
+    assert delegation_verdict(_succeeded_scope("ok", check_exit=0)) == "verified"
+    assert delegation_verdict(_succeeded_scope("ok", check_exit=None)) == "unverified"
+
+
+def test_delegation_verdict_scope_ok_but_check_fails_is_failed():
+    assert delegation_verdict(_succeeded_scope("ok", check_exit=1)) == "failed"
+
+
+def test_delegation_verdict_absent_scope_preserves_pre_s4_behaviour():
+    """No scope declared (scope_result None) skips the gate entirely."""
+    job = Job(job_id="job_v", status=JobState.SUCCEEDED, scope_result=None)
+    assert delegation_verdict(job) == "unverified"
+
+
+def test_runtime_status_surfaces_scope_and_withheld_env():
+    job = Job(
+        job_id="job_v",
+        status=JobState.SUCCEEDED,
+        scope_result=_scope("violated", violating=["evil.py"]),
+        withheld_env=["AWS_SECRET_ACCESS_KEY"],
+    )
+    result = runtime_status(job)
+    assert result["scope_result"]["status"] == "violated"
+    assert result["withheld_env"] == ["AWS_SECRET_ACCESS_KEY"]
+    assert result["delegation_verdict"] == "failed"
+
+
+def test_v3_scope_result_round_trips_on_disk(tmp_path):
+    job_dir = create_job_dir(tmp_path, "job_scope_rt")
+    job = Job(
+        job_id="job_scope_rt",
+        status=JobState.SUCCEEDED,
+        scope_result=_scope("violated", violating=["evil.py"]),
+        withheld_env=["GITHUB_TOKEN"],
+    )
+    save_state(job_dir, job)
+    loaded = load_state(job_dir)
+    assert loaded.scope_result == _scope("violated", violating=["evil.py"])
+    assert loaded.withheld_env == ["GITHUB_TOKEN"]

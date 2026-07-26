@@ -44,6 +44,33 @@ class CheckResultDict(TypedDict):
     stderr_tail: str
 
 
+# Outcome of the diff-scope assertion (slice S4). ``ok`` — every path the
+# delegate modified was inside the declared allowlist; ``violated`` — it wrote
+# outside its declared scope; ``undetermined`` — crossagent could not establish
+# what changed (e.g. the cwd is not a git repo). ``undetermined`` is FAIL-CLOSED,
+# never a pass: a scope check that silently passes when it cannot see the changes
+# grants false assurance.
+ScopeStatus = Literal["ok", "violated", "undetermined"]
+
+
+class ScopeResultDict(TypedDict):
+    """Persisted outcome of the diff-scope assertion (slice S4).
+
+    ``declared`` is the caller-supplied allowlist; ``violating_paths`` lists the
+    repo-relative paths the delegate modified outside it (empty unless
+    ``status == "violated"``); ``detail`` is a human-readable summary.
+
+    A ``Job.scope_result`` of ``None`` means *no scope was declared* — scope
+    enforcement was off — which stays structurally distinct from a scope that
+    was declared and satisfied (D7: absent is never the same as ``ok``).
+    """
+
+    declared: list[str]
+    status: ScopeStatus
+    violating_paths: list[str]
+    detail: str
+
+
 # The delegation verdict keeps "the delegate finished" separate from "the work
 # was verified" (D5). See :func:`delegation_verdict`.
 DelegationVerdict = Literal["verified", "failed", "unverified", "incomplete"]
@@ -191,6 +218,16 @@ class Job:
     # verification (this field) are deliberately separate fields so "finished"
     # can never be read as "verified" (D5).
     check_result: Optional[CheckResultDict] = None
+    # --- Delegation security posture (schema v3, slice S4) ---------------
+    # ``scope_result`` is the diff-scope assertion outcome. ``None`` means no
+    # allowlist was declared (enforcement off) — distinct from a declared scope
+    # that passed (D7). A declared scope that was violated OR could not be
+    # determined fails the delegation (fail closed); see delegation_verdict.
+    scope_result: Optional[ScopeResultDict] = None
+    # Names — never values — of credential-bearing env vars withheld from the
+    # advisor child. ``None`` means the scrub did not run (a pre-S4 record); an
+    # empty list means it ran and withheld nothing (D7: absent != empty).
+    withheld_env: Optional[list[str]] = None
 
 
 def delegation_verdict(job: Job) -> DelegationVerdict:
@@ -206,10 +243,21 @@ def delegation_verdict(job: Job) -> DelegationVerdict:
     - ``unverified`` — the delegate finished cleanly but no check was run. This
       is NOT a pass: a missing gate is never green.
     - ``verified`` — the delegate finished cleanly and the check exited 0.
+
+    Slice S4 folds the diff-scope assertion into this same verdict rather than
+    adding a fifth state: a delegate that wrote outside its declared allowlist,
+    or whose adherence to that allowlist could not be determined, has not
+    produced trustworthy work — that is semantically a *failed* delegation, so
+    ``scope_result.status`` other than ``ok`` yields ``failed`` (fail closed).
+    When no scope was declared (``scope_result is None``) this gate is skipped,
+    preserving the pre-S4 four-state behaviour and its tests unchanged.
     """
     if not is_terminal(job.status):
         return "incomplete"
     if job.status != JobState.SUCCEEDED:
+        return "failed"
+    scope = job.scope_result
+    if scope is not None and scope.get("status") != "ok":
         return "failed"
     check = job.check_result
     if check is None:
@@ -544,6 +592,8 @@ def runtime_status(job: Job) -> dict[str, Any]:
         "cost_source": job.cost_source,
         "model_reported": job.model_reported,
         "check_result": job.check_result,
+        "scope_result": job.scope_result,
+        "withheld_env": job.withheld_env,
         "delegation_verdict": delegation_verdict(job),
     }
 
