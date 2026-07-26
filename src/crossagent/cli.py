@@ -21,6 +21,7 @@ from typing import Any
 from . import __version__
 from . import advisors as advisors_mod
 from . import check as check_mod
+from . import credentials as credentials_mod
 from . import jobs as jobs_mod
 from . import parsers as parsers_mod
 from . import registry as reg
@@ -109,10 +110,16 @@ def build_command(
 
 
 def _run_advisor(
-    cmd: list[str], cwd: str | None, parser_name: str
+    cmd: list[str],
+    cwd: str | None,
+    parser_name: str,
+    *,
+    env: dict[str, str] | None = None,
 ) -> tuple[int, parsers_mod.ParsedResult]:
     parser = parsers_mod.get_parser(parser_name)
-    outcome = runner_mod.run(cmd, cwd=cwd, consumer=parser, max_runtime_seconds=None)
+    outcome = runner_mod.run(
+        cmd, cwd=cwd, env=env, consumer=parser, max_runtime_seconds=None
+    )
     parsed = (
         outcome.result
         if isinstance(outcome.result, parsers_mod.ParsedResult)
@@ -200,6 +207,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--registry", default=str(reg.DEFAULT_REGISTRY), help="Session registry path."
     )
     parser.add_argument(
+        "--pass-env",
+        action="append",
+        default=[],
+        dest="pass_env",
+        help=(
+            "Name of an environment variable to pass through to the advisor even "
+            "though it matches a credential pattern (e.g. the advisor's own API "
+            "key). Repeatable. By default all credential-bearing env vars are "
+            "withheld from the advisor, matching the durable-job path."
+        ),
+    )
+    parser.add_argument(
         "--list-advisors", action="store_true", help="Print known advisors and exit."
     )
     parser.set_defaults(stream=True)
@@ -278,7 +297,14 @@ def _dispatch(
     registry: dict[str, Any],
     registry_path: Path,
 ) -> int:
-    code, parsed = _run_advisor(cmd, args.cwd, advisor.result_parser)
+    # A foreground advisor is a delegate too: withhold the caller's ambient
+    # credentials (S4 policy), sharing the exact scrub the durable-job path uses
+    # (worker.build_advisor_env delegates to the same helper) so the two dispatch
+    # modes can never drift. ``--pass-env NAME`` is the caller's opt-out.
+    advisor_env = credentials_mod.scrub_env(
+        os.environ, pass_through=getattr(args, "pass_env", [])
+    )
+    code, parsed = _run_advisor(cmd, args.cwd, advisor.result_parser, env=advisor_env)
 
     if parsed.failure:
         error = parsed.error or f"{advisor.name} exited with code {code}"
