@@ -244,10 +244,10 @@ def _json_candidates(text: str) -> list[str]:
     return candidates
 
 
-def _verdict_from_object(obj: dict[str, Any]) -> tuple[VerifyVerdict, str]:
+def _verdict_from_object(verdict_object: dict[str, Any]) -> tuple[VerifyVerdict, str]:
     """Map a parsed verdict object to a ``(verdict, detail)`` pair."""
-    raw = obj.get("verdict")
-    reason = obj.get("reason")
+    raw = verdict_object.get("verdict")
+    reason = verdict_object.get("reason")
     detail = str(reason) if isinstance(reason, str) and reason else ""
     if isinstance(raw, bool):
         return ("pass" if raw else "fail"), detail
@@ -380,8 +380,8 @@ def run_verification(
             parsed.error or "verifier produced no answer",
         )
 
-    obj = _parse_verdict_object(parsed.result)
-    if obj is None:
+    verdict_object = _parse_verdict_object(parsed.result)
+    if verdict_object is None:
         # Free prose with no machine-checkable verdict: inconclusive, not a pass.
         return VerifyOutcome(
             advisor.name,
@@ -390,5 +390,5 @@ def run_verification(
             structured,
             "verifier returned no machine-checkable verdict (free prose)",
         )
-    verdict, detail = _verdict_from_object(obj)
+    verdict, detail = _verdict_from_object(verdict_object)
     return VerifyOutcome(advisor.name, model, verdict, structured, detail)
