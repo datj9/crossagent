@@ -361,6 +361,32 @@ def _parse_job_args(subcommand: str, argv: list[str]) -> argparse.Namespace:
                 "failed (default 600)."
             ),
         )
+        parser.add_argument(
+            "--allow-path",
+            action="append",
+            default=None,
+            dest="allow_path",
+            help=(
+                "Declare a path (file or directory subtree) the delegate is "
+                "allowed to modify. Repeatable. When given, crossagent asserts "
+                "after the run that the delegate touched nothing outside the "
+                "declared set (compared by resolved real location, so symlink/.. "
+                "escapes cannot defeat it) and fails the delegation otherwise. "
+                "Omit to leave scope enforcement off."
+            ),
+        )
+        parser.add_argument(
+            "--pass-env",
+            action="append",
+            default=[],
+            dest="pass_env",
+            help=(
+                "Name of an environment variable to pass through to the delegate "
+                "even though it matches a credential pattern (e.g. the advisor's "
+                "own API key). Repeatable. By default all credential-bearing env "
+                "vars are withheld from the delegate."
+            ),
+        )
         parser.add_argument("--json", action="store_true")
         parser.set_defaults(stream=True)
     elif subcommand == "wait":
@@ -869,6 +895,10 @@ def _write_command_info(
         "check_timeout": getattr(
             args, "check_timeout", check_mod.CHECK_DEFAULT_TIMEOUT_SECONDS
         ),
+        # Delegation security posture (S4). ``scope_paths`` is ``None`` when no
+        # --allow-path was given (enforcement off), distinct from an empty list.
+        "scope_paths": getattr(args, "allow_path", None),
+        "pass_env": getattr(args, "pass_env", []),
     }
     jobs_mod.atomic_json_write(info, job_dir / "command.json")
 

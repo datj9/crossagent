@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import textwrap
 from datetime import datetime, timezone
@@ -129,6 +130,7 @@ def _run_job_through_worker(
     job_id: str = "job_e2e",
     check: str | None = None,
     check_timeout: float = 30.0,
+    pass_env: list[str] | None = None,
 ) -> Job:
     """Set up a job whose advisor is a fake claude-stream script, run the
     worker synchronously, and return the Job reloaded from disk.
@@ -168,6 +170,8 @@ def _run_job_through_worker(
     if check is not None:
         command_info["check"] = check
         command_info["check_timeout"] = check_timeout
+    if pass_env is not None:
+        command_info["pass_env"] = pass_env
     jobs_mod.atomic_json_write(command_info, job_dir / "command.json")
 
     exit_code = worker_main(job_id, state_dir)
@@ -378,3 +382,256 @@ def test_worker_check_logs_command_and_code_but_not_output(tmp_path):
     assert len(check_events) == 1
     assert check_events[0]["exit_code"] == 2
     assert "secret-in-output" not in json.dumps(check_events[0])
+
+
+# =========================================================================
+# End-to-end delegation security posture (slice S4): drive a real job through
+# worker_main and reload from disk. Unit-green is not working — these prove the
+# worker actually forwards scope_result/withheld_env onto the terminal record
+# and that credential env never reaches the child or any persisted artifact.
+# =========================================================================
+
+import subprocess  # noqa: E402
+
+import pytest  # noqa: E402
+
+from crossagent import scope as scope_mod  # noqa: E402
+
+
+def _git(args, cwd):
+    subprocess.run(
+        ["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True
+    )
+
+
+def _run_scope_job(
+    tmp_path: Path,
+    advisor_body: str,
+    scope_paths,
+    *,
+    git_init: bool = True,
+    pre_commit=None,
+    job_id: str = "job_scope",
+) -> Job:
+    """Run a real job whose cwd is a git repo SEPARATE from the state dir, so
+    crossagent's own state files are never seen as delegate edits."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    if git_init:
+        _git(["init"], repo)
+        _git(["config", "user.email", "t@e.com"], repo)
+        _git(["config", "user.name", "T"], repo)
+    for rel, content in pre_commit or []:
+        target = repo / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        _git(["add", rel], repo)
+        _git(["commit", "-m", f"add {rel}"], repo)
+
+    state_dir = tmp_path / "state"
+    job_dir = jobs_mod.create_job_dir(state_dir, job_id)
+    fake_advisor = tmp_path / "fake_advisor.py"  # OUTSIDE the repo
+    fake_advisor.write_text(textwrap.dedent(advisor_body), encoding="utf-8")
+
+    now = datetime.now(timezone.utc).isoformat()
+    jobs_mod.save_state(
+        job_dir,
+        Job(
+            job_id=job_id,
+            status=JobState.PENDING,
+            advisor="claude",
+            cwd=str(repo),
+            started_at=now,
+            updated_at=now,
+        ),
+    )
+    (job_dir / "prompt").write_text("hello", encoding="utf-8")
+    command_info = {
+        "command": [sys.executable, str(fake_advisor)],
+        "prompt_delivery": "positional",
+        "cwd": str(repo),
+        "result_parser": "claude-stream",
+        "registry_path": str(tmp_path / "sessions.json"),
+        "key": "",
+        "name": None,
+        "model": "",
+        "advisor": "claude",
+        "scope_paths": scope_paths,
+    }
+    jobs_mod.atomic_json_write(command_info, job_dir / "command.json")
+
+    assert worker_main(job_id, state_dir) == 0
+    return jobs_mod.load_state(job_dir)
+
+
+# A fake advisor that writes *rel* under its cwd, then emits a clean result.
+def _writer_advisor(rel: str) -> str:
+    return f"""
+    import json, os
+    os.makedirs(os.path.dirname({rel!r}) or '.', exist_ok=True)
+    with open({rel!r}, 'w') as handle:
+        handle.write('delegate wrote this\\n')
+    print(json.dumps({{"type": "result", "subtype": "success", "result": "ok"}}))
+    """
+
+
+def test_worker_scope_violation_is_failed_delegation_end_to_end(tmp_path):
+    """A delegate that writes outside the declared allowlist yields a violated
+    scope_result — persisted on disk — and a failed verdict, no green badge."""
+    job = _run_scope_job(
+        tmp_path,
+        _writer_advisor("evil.py"),
+        scope_paths=["src"],
+    )
+    assert job.status == JobState.SUCCEEDED  # the delegate DID finish
+    assert job.scope_result is not None
+    assert job.scope_result["status"] == "violated"
+    assert "evil.py" in job.scope_result["violating_paths"]
+    assert jobs_mod.delegation_verdict(job) == "failed"
+
+
+def test_worker_scope_in_bounds_passes_end_to_end(tmp_path):
+    """A delegate that edits only a declared path yields scope ok, persisted."""
+    job = _run_scope_job(
+        tmp_path,
+        _writer_advisor("src/app.py"),
+        scope_paths=["src"],
+        pre_commit=[("src/app.py", "clean\n")],
+    )
+    assert job.status == JobState.SUCCEEDED
+    assert job.scope_result is not None
+    assert job.scope_result["status"] == "ok"
+    assert job.scope_result["violating_paths"] == []
+    # No check declared -> unverified (scope ok does not make it verified).
+    assert jobs_mod.delegation_verdict(job) == "unverified"
+
+
+def test_worker_non_git_cwd_scope_is_undetermined_not_pass(tmp_path):
+    """A declared scope in a non-git cwd is undetermined (fail closed) and fails
+    the delegation, never silently passes."""
+    job = _run_scope_job(
+        tmp_path,
+        _writer_advisor("evil.py"),
+        scope_paths=["src"],
+        git_init=False,
+    )
+    assert job.scope_result is not None
+    assert job.scope_result["status"] == "undetermined"
+    assert jobs_mod.delegation_verdict(job) == "failed"
+
+
+def test_worker_no_scope_declared_leaves_scope_result_none(tmp_path):
+    """With no allowlist declared, scope enforcement is off: scope_result stays
+    None (distinct from a satisfied scope) and the pre-S4 verdict is unchanged."""
+    job = _run_scope_job(
+        tmp_path,
+        _writer_advisor("anything.py"),
+        scope_paths=None,
+    )
+    assert job.scope_result is None
+    assert jobs_mod.delegation_verdict(job) == "unverified"
+
+
+def test_worker_scope_audit_event_records_status_and_paths(tmp_path):
+    _run_scope_job(
+        tmp_path,
+        _writer_advisor("evil.py"),
+        scope_paths=["src"],
+    )
+    events_path = tmp_path / "state" / "job_scope" / "events.jsonl"
+    lines = [
+        json.loads(line)
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    scope_events = [event for event in lines if event.get("event") == "scope"]
+    assert len(scope_events) == 1
+    assert scope_events[0]["status"] == "violated"
+    assert "evil.py" in scope_events[0]["violating_paths"]
+
+
+# --- No secret propagation -----------------------------------------------
+
+_SECRET_NAME = "AWS_SECRET_ACCESS_KEY"
+_SECRET_VALUE = "crossagent-super-secret-value-xyz"
+
+# A fake advisor that records whether it received the secret env var.
+_ENV_PROBE_ADVISOR = f"""
+    import json, os
+    with open('env_probe.txt', 'w') as handle:
+        handle.write(os.environ.get({_SECRET_NAME!r}, 'ABSENT'))
+    print(json.dumps({{"type": "result", "subtype": "success", "result": "ok"}}))
+"""
+
+
+def test_worker_secret_env_does_not_reach_child(tmp_path, monkeypatch):
+    """A credential-bearing env var is withheld from the delegate child."""
+    monkeypatch.setenv(_SECRET_NAME, _SECRET_VALUE)
+    _run_job_through_worker(tmp_path, _ENV_PROBE_ADVISOR)
+    probe = (tmp_path / "env_probe.txt").read_text(encoding="utf-8")
+    assert probe == "ABSENT"
+
+
+def test_worker_pass_env_opt_in_reaches_child(tmp_path, monkeypatch):
+    """An explicitly passed-through credential var DOES reach the delegate."""
+    monkeypatch.setenv(_SECRET_NAME, _SECRET_VALUE)
+    job = _run_job_through_worker(tmp_path, _ENV_PROBE_ADVISOR, pass_env=[_SECRET_NAME])
+    probe = (tmp_path / "env_probe.txt").read_text(encoding="utf-8")
+    assert probe == _SECRET_VALUE
+    assert job.withheld_env is not None
+    assert _SECRET_NAME not in job.withheld_env
+
+
+def test_worker_secret_value_absent_from_all_persisted_artifacts(tmp_path, monkeypatch):
+    """The secret VALUE must not appear in state.json, command.json, events.jsonl
+    or the redacted command; only the NAME is recorded (names are not secrets)."""
+    monkeypatch.setenv(_SECRET_NAME, _SECRET_VALUE)
+    job = _run_job_through_worker(tmp_path, _ENV_PROBE_ADVISOR)
+
+    assert job.withheld_env is not None
+    assert _SECRET_NAME in job.withheld_env  # name recorded...
+    job_dir = tmp_path / "state" / "job_e2e"
+    for artifact in ("state.json", "command.json", "events.jsonl"):
+        text = (job_dir / artifact).read_text(encoding="utf-8")
+        assert _SECRET_VALUE not in text, artifact  # ...but never the value
+    assert _SECRET_VALUE not in job.redacted_command
+
+
+def test_worker_env_scrub_event_records_name_not_value(tmp_path, monkeypatch):
+    monkeypatch.setenv(_SECRET_NAME, _SECRET_VALUE)
+    _run_job_through_worker(tmp_path, _ENV_PROBE_ADVISOR)
+    events_path = tmp_path / "state" / "job_e2e" / "events.jsonl"
+    lines = [
+        json.loads(line)
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    scrub_events = [event for event in lines if event.get("event") == "env_scrub"]
+    assert len(scrub_events) == 1
+    assert _SECRET_NAME in scrub_events[0]["withheld"]
+    assert _SECRET_VALUE not in json.dumps(scrub_events[0])
+
+
+def test_worker_v2_record_without_s4_fields_still_loads(tmp_path):
+    """A pre-S4 record on disk (no scope_result / withheld_env) loads with those
+    fields absent, not crashing (D7: absent stays distinguishable)."""
+    job_dir = jobs_mod.create_job_dir(tmp_path / "state", "job_v2")
+    jobs_mod.atomic_json_write(
+        {
+            "schema_version": 2,
+            "job_id": "job_v2",
+            "status": "succeeded",
+            "advisor": "claude",
+        },
+        job_dir / "state.json",
+    )
+    loaded = jobs_mod.load_state(job_dir)
+    assert loaded.scope_result is None
+    assert loaded.withheld_env is None
+    assert jobs_mod.delegation_verdict(loaded) == "unverified"
+
+
+def test_scope_module_importable_without_error():
+    # Guard: the module and its git timeout constant are wired.
+    assert scope_mod._GIT_TIMEOUT_SECONDS > 0
+    assert pytest is not None
