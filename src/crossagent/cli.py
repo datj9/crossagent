@@ -387,6 +387,37 @@ def _parse_job_args(subcommand: str, argv: list[str]) -> argparse.Namespace:
                 "vars are withheld from the delegate."
             ),
         )
+        parser.add_argument(
+            "--verify-with",
+            dest="verify_with",
+            help=(
+                "Advisor that independently verifies the delegate's work in a "
+                "FRESH peer session, with the diff/answer supplied as user-turn "
+                "input (removes the implicit-authorship channel that weakens "
+                "self-grading). A failing verdict blocks the green path; a "
+                "prose-only or errored verifier degrades to unverified, never a "
+                "pass. Omit to leave verification off."
+            ),
+        )
+        parser.add_argument(
+            "--verify-model",
+            dest="verify_model",
+            help="Model/alias for the --verify-with advisor (advisor default if omitted).",
+        )
+        parser.add_argument(
+            "--escalate-to",
+            action="append",
+            default=None,
+            dest="escalate_to",
+            metavar="ADVISOR[:MODEL]",
+            help=(
+                "Re-dispatch a FAILED delegation (failing check, scope violation, "
+                "or failing verification) to this larger peer as a same-trace "
+                "child job. Repeatable to form an escalation ladder; each rung is "
+                "tried in turn as the previous fails. Bounded by the nesting-depth "
+                "cap. Omit to leave escalation off."
+            ),
+        )
         parser.add_argument("--json", action="store_true")
         parser.set_defaults(stream=True)
     elif subcommand == "wait":
@@ -657,21 +688,36 @@ def _cmd_result(args: argparse.Namespace) -> int:
 
 def _print_verdict(job: jobs_mod.Job, verdict: str, *, file: Any = sys.stderr) -> None:
     """Print a one-line delegation verdict to *file* (stderr by default)."""
-    check = job.check_result
     if verdict == "verified":
-        print("[crossagent] delegation verified — check passed", file=file)
+        print("[crossagent] delegation verified — all declared gates passed", file=file)
     elif verdict == "unverified":
         print(
-            "[crossagent] delegation UNVERIFIED — no --check ran; the delegate "
-            "finished but its work was not checked",
+            "[crossagent] delegation UNVERIFIED — the delegate finished but no "
+            "gate confirmed its work (no --check/--verify-with, or an "
+            "inconclusive verifier)",
             file=file,
         )
     elif verdict == "failed":
-        exit_code = check.get("exit_code") if check else None
         print(
-            f"[crossagent] delegation FAILED verification — check exited {exit_code}",
+            f"[crossagent] delegation FAILED verification — {_failed_reason(job)}",
             file=file,
         )
+
+
+def _failed_reason(job: jobs_mod.Job) -> str:
+    """Describe why a delegation failed, naming the actual failing gate."""
+    if job.status != jobs_mod.JobState.SUCCEEDED:
+        return f"delegate did not finish cleanly (status {job.status.value})"
+    scope = job.scope_result
+    if scope is not None and scope.get("status") != "ok":
+        return f"scope {scope.get('status')} ({len(scope.get('violating_paths') or [])} path(s))"
+    check = job.check_result
+    if check is not None and check.get("exit_code") != 0:
+        return f"check exited {check.get('exit_code')}"
+    verify = job.verify_result
+    if verify is not None and verify.get("verdict") == "fail":
+        return f"independent verification by {verify.get('advisor')} returned fail"
+    return "a declared gate did not pass"
 
 
 def _metrics_summary(job: jobs_mod.Job) -> str:
@@ -899,6 +945,11 @@ def _write_command_info(
         # --allow-path was given (enforcement off), distinct from an empty list.
         "scope_paths": getattr(args, "allow_path", None),
         "pass_env": getattr(args, "pass_env", []),
+        # Independent verification + escalation ladder (S5). ``verify_with`` is
+        # ``None`` when off; ``escalate_to`` is the (possibly empty) rung list.
+        "verify_with": getattr(args, "verify_with", None),
+        "verify_model": getattr(args, "verify_model", None),
+        "escalate_to": getattr(args, "escalate_to", None) or [],
     }
     jobs_mod.atomic_json_write(info, job_dir / "command.json")
 
