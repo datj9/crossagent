@@ -34,6 +34,7 @@ from crossagent.jobs import (
     create_cancel_request,
     create_job_dir,
     default_state_root,
+    delegation_verdict,
     generate_job_id,
     generate_trace_id,
     is_terminal,
@@ -122,7 +123,7 @@ def test_transition_to_basic():
     updated = transition_to(job, JobState.RUNNING)
     assert updated.status == JobState.RUNNING
     assert updated.job_id == "job_test_1"
-    assert updated.schema_version == 2
+    assert updated.schema_version == 3
     assert updated.updated_at != ""
     assert updated.finished_at is None
 
@@ -177,10 +178,12 @@ def test_transition_to_persists_when_job_dir_given(tmp_path):
 
 def test_append_event_writes_jsonl_line(tmp_path):
     from crossagent.jobs import append_event
+
     append_event(tmp_path, "transition", from_state="pending", to_state="running")
     log_path = tmp_path / "events.jsonl"
     assert log_path.exists()
     import json as _json
+
     line = log_path.read_text(encoding="utf-8").strip()
     parsed = _json.loads(line)
     assert parsed["event"] == "transition"
@@ -190,12 +193,17 @@ def test_append_event_writes_jsonl_line(tmp_path):
 
 
 def test_transition_to_appends_audit_event(tmp_path):
-    job = Job(job_id="job_audit", status=JobState.RUNNING, started_at="2026-07-19T10:00:00+00:00")
+    job = Job(
+        job_id="job_audit",
+        status=JobState.RUNNING,
+        started_at="2026-07-19T10:00:00+00:00",
+    )
     transition_to(job, JobState.SUCCEEDED, job_dir=tmp_path)
     log_path = tmp_path / "events.jsonl"
     assert log_path.exists()
     import json as _json
-    lines = [l for l in log_path.read_text().splitlines() if l.strip()]
+
+    lines = [line for line in log_path.read_text().splitlines() if line.strip()]
     assert len(lines) == 1
     parsed = _json.loads(lines[0])
     assert parsed["from_state"] == "running"
@@ -205,16 +213,25 @@ def test_transition_to_appends_audit_event(tmp_path):
 
 def test_append_event_does_not_raise_on_unwritable_dir(tmp_path):
     from crossagent.jobs import append_event
+
     bad_dir = tmp_path / "does-not-exist"
     append_event(bad_dir, "transition", from_state="x", to_state="y")
 
 
 def test_append_event_records_actor(tmp_path):
     from crossagent.jobs import append_event
+
     append_event(tmp_path, "transition", actor="user", from_state="x", to_state="y")
-    append_event(tmp_path, "transition", actor="system:reconcile", from_state="y", to_state="z")
+    append_event(
+        tmp_path, "transition", actor="system:reconcile", from_state="y", to_state="z"
+    )
     import json as _json
-    lines = [l for l in (tmp_path / "events.jsonl").read_text().splitlines() if l.strip()]
+
+    lines = [
+        line
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
     assert len(lines) == 2
     assert _json.loads(lines[0])["actor"] == "user"
     assert _json.loads(lines[1])["actor"] == "system:reconcile"
@@ -222,8 +239,10 @@ def test_append_event_records_actor(tmp_path):
 
 def test_append_event_default_actor_is_user(tmp_path):
     from crossagent.jobs import append_event
+
     append_event(tmp_path, "transition", from_state="x", to_state="y")
     import json as _json
+
     parsed = _json.loads((tmp_path / "events.jsonl").read_text().strip())
     assert parsed["actor"] == "user"
 
@@ -232,10 +251,14 @@ def test_reconcile_stale_tags_actor_system(tmp_path):
     """When reconcile_stale abandons a dead worker, the audit event must
     carry actor='system:reconcile' so it can be filtered from user-initiated
     transitions in the dashboard."""
-    import os
     from crossagent.jobs import (
-        Job, JobState, save_state, job_dir_path, reconcile_stale,
+        Job,
+        JobState,
+        save_state,
+        job_dir_path,
+        reconcile_stale,
     )
+
     fake_pid = 2_000_000
     job = Job(
         job_id="job_reconcile_actor",
@@ -249,7 +272,12 @@ def test_reconcile_stale_tags_actor_system(tmp_path):
     save_state(job_dir, job)
     reconcile_stale(job, job_dir)
     import json as _json
-    lines = [l for l in (job_dir / "events.jsonl").read_text().splitlines() if l.strip()]
+
+    lines = [
+        line
+        for line in (job_dir / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
     assert len(lines) == 1
     parsed = _json.loads(lines[0])
     assert parsed["actor"] == "system:reconcile"
@@ -448,7 +476,7 @@ def test_load_state_non_dict(tmp_path):
 def test_status_response_includes_required_fields():
     job = Job(job_id="job_sr1", status=JobState.RUNNING, advisor="claude")
     resp = status_response(job)
-    assert resp == {"schema_version": 2, "job_id": "job_sr1", "status": "running"}
+    assert resp == {"schema_version": 3, "job_id": "job_sr1", "status": "running"}
 
 
 def test_status_response_excludes_prompt_and_command():
@@ -696,7 +724,7 @@ def test_load_state_accepts_v1_and_v2(tmp_path):
 def test_load_state_rejects_unsupported_version(tmp_path):
     job_dir = create_job_dir(tmp_path, "job_badver2")
     atomic_json_write(
-        {"schema_version": 3, "job_id": "job_badver2", "status": "running"},
+        {"schema_version": 4, "job_id": "job_badver2", "status": "running"},
         job_dir / "state.json",
     )
     with pytest.raises(InvalidStateError):
@@ -1636,3 +1664,85 @@ def test_transition_to_handles_z_suffix_started_at(tmp_path):
     assert updated.finished_at is not None
     assert updated.duration_seconds is not None
     assert updated.duration_seconds >= 0
+
+
+# =========================================================================
+# Delegation verdict (slice S3): "delegate finished" vs "work verified"
+# =========================================================================
+
+
+def _succeeded(check_exit=None):
+    check = (
+        None
+        if check_exit is None
+        else {
+            "command": "pytest",
+            "exit_code": check_exit,
+            "stdout_tail": "",
+            "stderr_tail": "",
+        }
+    )
+    return Job(job_id="job_v", status=JobState.SUCCEEDED, check_result=check)
+
+
+def test_delegation_verdict_incomplete_while_running():
+    job = Job(job_id="job_v", status=JobState.RUNNING)
+    assert delegation_verdict(job) == "incomplete"
+
+
+def test_delegation_verdict_failed_when_delegate_did_not_finish():
+    job = Job(job_id="job_v", status=JobState.FAILED)
+    assert delegation_verdict(job) == "failed"
+
+
+def test_delegation_verdict_failed_delegate_ignores_a_passing_check():
+    """A crashed delegate is a failed delegation even if a pre-existing check
+    still passes — status not SUCCEEDED dominates."""
+    job = Job(
+        job_id="job_v",
+        status=JobState.FAILED,
+        check_result={
+            "command": "pytest",
+            "exit_code": 0,
+            "stdout_tail": "",
+            "stderr_tail": "",
+        },
+    )
+    assert delegation_verdict(job) == "failed"
+
+
+def test_delegation_verdict_unverified_when_no_check():
+    assert delegation_verdict(_succeeded(check_exit=None)) == "unverified"
+
+
+def test_delegation_verdict_verified_when_check_passes():
+    assert delegation_verdict(_succeeded(check_exit=0)) == "verified"
+
+
+def test_delegation_verdict_failed_when_check_fails_despite_clean_exit():
+    """The load-bearing case: delegate exits 0 but the check fails -> failed."""
+    assert delegation_verdict(_succeeded(check_exit=1)) == "failed"
+
+
+def test_runtime_status_includes_check_fields():
+    job = _succeeded(check_exit=2)
+    result = runtime_status(job)
+    assert result["delegation_verdict"] == "failed"
+    assert result["check_result"]["exit_code"] == 2
+
+
+def test_v2_record_loads_with_check_result_none(tmp_path):
+    """A pre-S3 record on disk (no check_result key) loads as unverified, never
+    as a failed or passing check (D7: absent != false)."""
+    job_dir = create_job_dir(tmp_path, "job_v2")
+    atomic_json_write(
+        {
+            "schema_version": 2,
+            "job_id": "job_v2",
+            "status": "succeeded",
+        },
+        job_dir / "state.json",
+    )
+    loaded = load_state(job_dir)
+    assert loaded.check_result is None
+    assert delegation_verdict(loaded) == "unverified"

@@ -12,11 +12,45 @@ import os
 import re
 import sys
 import tempfile
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Literal, Optional, TypedDict
+
+# Where a job's cost figure came from. ``advisor`` is the vendor-declared
+# estimate, ``computed`` is derived from a local price table, and ``unknown``
+# means no cost was measured — never conflate that with a measured ``0.0``.
+CostSource = Literal["advisor", "computed", "unknown"]
+
+
+class CheckResultDict(TypedDict):
+    """Persisted outcome of the independent check-gate (slice S3).
+
+    ``command`` is the caller-supplied check string; ``exit_code`` is the
+    deterministic delegation verdict (D5) — ``0`` means the work verified, any
+    non-zero value means the delegation *failed* regardless of whether the
+    delegate process itself exited 0. ``stdout_tail``/``stderr_tail`` are
+    bounded tails of the check's output.
+
+    A ``Job.check_result`` of ``None`` means *no check ran* (unverified) — that
+    stays structurally distinct from a check that ran and failed (D7): absent is
+    never the same as false.
+    """
+
+    command: str
+    exit_code: int
+    stdout_tail: str
+    stderr_tail: str
+
+
+# The delegation verdict keeps "the delegate finished" separate from "the work
+# was verified" (D5). See :func:`delegation_verdict`.
+DelegationVerdict = Literal["verified", "failed", "unverified", "incomplete"]
+
+# Highest ``schema_version`` this build writes. Older records still load.
+CURRENT_SCHEMA_VERSION = 3
+_SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3})
 
 # Lineage parent ids arrive from CLI flags and environment variables, so they
 # are untrusted. Only the generated ``job_<...>`` shape is accepted; rejecting
@@ -115,7 +149,7 @@ class Job:
     Every JSON response includes *schema_version*, *job_id*, and *status*.
     """
 
-    schema_version: int = 2
+    schema_version: int = CURRENT_SCHEMA_VERSION
     job_id: str = ""
     status: JobState = JobState.PENDING
     advisor: str = ""
@@ -140,6 +174,47 @@ class Job:
     parent_job_id: Optional[str] = None
     orchestrator_label: Optional[str] = None
     nesting_depth: Optional[int] = None
+    # --- Advisor metrics (schema v3) -------------------------------------
+    # Two open-keyed maps (D1): per-advisor token categories and USD costs.
+    # Empty maps + ``cost_source == "unknown"`` mean *unmeasured*, which must
+    # stay distinguishable from a measured zero (D7). Token counts are NOT
+    # additive (D2): each token lives under exactly one ``usage_details`` key.
+    usage_details: dict[str, int] = field(default_factory=dict)
+    cost_details: dict[str, float] = field(default_factory=dict)
+    duration_ms: Optional[int] = None
+    cost_source: CostSource = "unknown"
+    model_reported: Optional[str] = None
+    # --- Independent check-gate (schema v3, slice S3) --------------------
+    # ``None`` means no check ran → *unverified*; a present dict with a
+    # non-zero ``exit_code`` is a failed delegation even when ``status`` is
+    # SUCCEEDED. The delegate's process outcome (``status``) and the work's
+    # verification (this field) are deliberately separate fields so "finished"
+    # can never be read as "verified" (D5).
+    check_result: Optional[CheckResultDict] = None
+
+
+def delegation_verdict(job: Job) -> DelegationVerdict:
+    """Return the delegation's verdict, distinguishing *finished* from *verified*.
+
+    D5: the verdict is the deterministic check exit code, never the delegate's
+    self-report and never its mere process exit.
+
+    - ``incomplete`` — the job has not reached a terminal state yet.
+    - ``failed`` — the delegate did not finish cleanly, OR it finished but the
+      independent check exited non-zero. A delegate that exits 0 while its check
+      fails is a *failed delegation*.
+    - ``unverified`` — the delegate finished cleanly but no check was run. This
+      is NOT a pass: a missing gate is never green.
+    - ``verified`` — the delegate finished cleanly and the check exited 0.
+    """
+    if not is_terminal(job.status):
+        return "incomplete"
+    if job.status != JobState.SUCCEEDED:
+        return "failed"
+    check = job.check_result
+    if check is None:
+        return "unverified"
+    return "verified" if check.get("exit_code") == 0 else "failed"
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +500,9 @@ def runtime_status(job: Job) -> dict[str, Any]:
     started = _parse_iso(job.started_at) if job.started_at else now
     if started.tzinfo is None:
         started = started.replace(tzinfo=timezone.utc)
-    last_activity = _parse_iso(job.last_activity_at) if job.last_activity_at else started
+    last_activity = (
+        _parse_iso(job.last_activity_at) if job.last_activity_at else started
+    )
     if last_activity.tzinfo is None:
         last_activity = last_activity.replace(tzinfo=timezone.utc)
 
@@ -461,6 +538,13 @@ def runtime_status(job: Job) -> dict[str, Any]:
         "parent_job_id": job.parent_job_id,
         "orchestrator_label": job.orchestrator_label,
         "nesting_depth": job.nesting_depth,
+        "usage_details": job.usage_details,
+        "cost_details": job.cost_details,
+        "duration_ms": job.duration_ms,
+        "cost_source": job.cost_source,
+        "model_reported": job.model_reported,
+        "check_result": job.check_result,
+        "delegation_verdict": delegation_verdict(job),
     }
 
 
@@ -610,7 +694,7 @@ def load_state(job_dir: Path) -> Job:
         raise InvalidStateError(f"Expected a mapping, got {type(data).__name__}")
 
     ver = data.get("schema_version")
-    if ver not in (1, 2):
+    if ver not in _SUPPORTED_SCHEMA_VERSIONS:
         raise InvalidStateError(f"Unsupported schema_version {ver}")
 
     raw = data.get("status")
@@ -817,7 +901,10 @@ class LineageError(JobError):
 # Audit log
 # ---------------------------------------------------------------------------
 
-def append_event(job_dir: Path, event: str, *, actor: str = "user", **payload: Any) -> None:
+
+def append_event(
+    job_dir: Path, event: str, *, actor: str = "user", **payload: Any
+) -> None:
     """Append one JSON line to <job_dir>/events.jsonl.
 
     Atomic on POSIX for lines under the pipe buffer (our payloads are ~200 bytes).
@@ -829,6 +916,7 @@ def append_event(job_dir: Path, event: str, *, actor: str = "user", **payload: A
     are never audit-relevant.
     """
     import sys
+
     line = json.dumps(
         {
             "ts": datetime.now(timezone.utc).isoformat(),

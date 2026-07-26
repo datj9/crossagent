@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from .parsers import extract_claude_metrics, extract_codex_metrics
+
 
 def normalize_stream_line(event_format: str, raw_line: str) -> list[dict[str, Any]]:
     """Convert one raw stdout line into zero or more feed-event dicts.
@@ -280,16 +282,17 @@ def _claude_result(event: dict[str, Any], raw_line: str) -> list[dict[str, Any]]
             }
         ]
     meta = {}
-    for key in (
-        "session_id",
-        "total_input_tokens",
-        "total_output_tokens",
-        "total_cost_usd",
-        "duration_ms",
-    ):
+    for key in ("session_id", "total_cost_usd", "duration_ms"):
         val = event.get(key)
         if val is not None:
             meta[key] = val
+    # Claude nests token counts under ``usage`` and never at the top level, so
+    # the previous ``total_input_tokens``/``total_output_tokens`` reads always
+    # missed (S2 probe). Surface the real nested counts via the same extractor
+    # the durable path uses, so display and persistence agree.
+    usage_details = extract_claude_metrics(event).usage_details
+    if usage_details:
+        meta["usage"] = usage_details
     parts = []
     if subtype:
         parts.append(str(subtype))
@@ -342,12 +345,18 @@ def _normalize_codex_jsonl(raw_line: str, stripped: str) -> list[dict[str, Any]]
         ]
 
     if event_type == "turn.completed":
+        # Codex reports its token counts ONLY here, under ``usage`` — the old
+        # empty-meta handler dropped 100% of codex tokens (S2 probe).
+        meta: dict[str, Any] = {}
+        usage_details = extract_codex_metrics(event).usage_details
+        if usage_details:
+            meta["usage"] = usage_details
         return [
             {
                 "kind": "result",
                 "title": "turn completed",
                 "body": "turn completed",
-                "meta": {},
+                "meta": meta,
                 "raw_type": "codex/turn.completed",
             }
         ]

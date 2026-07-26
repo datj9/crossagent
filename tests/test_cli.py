@@ -83,6 +83,24 @@ def test_codex_resumes_stored_thread():
     assert "--json" in cmd
 
 
+def test_codex_command_includes_skip_git_repo_check():
+    cmd, _ = build_command(
+        advisors.resolve("codex"), _args(agent="codex"), {"sessions": {}}
+    )
+    # Flag rides in base_args, right after the exec subcommand.
+    assert cmd[:3] == ["codex", "exec", "--skip-git-repo-check"]
+    assert cmd[-1] == "hello?"
+
+
+def test_commandcode_command_includes_json_output_format():
+    cmd, _ = build_command(
+        advisors.resolve("commandcode"), _args(agent="commandcode"), {"sessions": {}}
+    )
+    assert cmd[:2] == ["commandcode", "-p"]
+    assert "--output-format" in cmd and "json" in cmd
+    assert cmd[-1] == "hello?"
+
+
 def test_gemini_uses_flag_delivery():
     cmd, _ = build_command(
         advisors.resolve("gemini"), _args(agent="gemini"), {"sessions": {}}
