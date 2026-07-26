@@ -116,26 +116,7 @@ def maybe_escalate(
     raises: an escalation that cannot be launched is recorded and skipped, never
     allowed to crash the worker.
     """
-    # Escalation re-dispatches a delegate that FINISHED but whose work FAILED a
-    # declared gate — a failing check, a scope violation, or a failing
-    # verification (this module's stated scope). A job that did not finish
-    # cleanly is deliberately out of scope, so gate on SUCCEEDED first rather
-    # than on ``delegation_verdict != "failed"`` alone (which also returns
-    # "failed" for CANCELLED / TIMED_OUT / a crashed delegate):
-    #   * CANCELLED is explicit user intent to stop; re-dispatching to a larger,
-    #     costlier peer is the opposite of cancelling and spends real money.
-    #   * TIMED_OUT (and any other non-success terminal status) produced no
-    #     graded artifact — there is no gate failure to escalate, and a bigger
-    #     model is generally slower, so it is at least as likely to time out
-    #     again under the same budget. A hard task that needs a bigger model is a
-    #     fresh dispatch decision, not an automatic ladder climb that silently
-    #     burns budget. So TIMED_OUT does NOT escalate.
-    # Gating on SUCCEEDED means ``delegation_verdict == "failed"`` below can only
-    # be a declared-gate failure — mirroring cli._failed_reason's "did not finish
-    # cleanly" vs. gate-failure distinction.
-    if failed_job.status != jobs_mod.JobState.SUCCEEDED:
-        return None
-    if delegation_verdict(failed_job) != "failed":
+    if not _is_escalatable_failure(failed_job):
         return None
 
     rungs = parse_rungs(escalate_to)
@@ -154,7 +135,7 @@ def maybe_escalate(
 
     child_id = jobs_mod.generate_job_id()
     try:
-        parent_id, trace_id, label, depth = jobs_mod.resolve_lineage(
+        lineage = jobs_mod.resolve_lineage(
             parent_flag=failed_job.job_id,
             state_root=state_root,
             new_job_id=child_id,
@@ -165,50 +146,28 @@ def maybe_escalate(
         _audit_skip(job_dir, reason=f"escalation halted: {exc}")
         return None
 
-    # Staging the child on disk touches the filesystem (mkdir, two file writes,
-    # a state save). A read-only or full disk raises OSError; catch it here so
-    # the "never raises" contract holds — a child that cannot be staged is
-    # recorded and skipped, exactly like a launch failure below.
-    try:
-        child_dir = jobs_mod.create_job_dir(state_root, child_id)
-        _write_child_prompt(child_dir, prompt)
-        _write_child_command(
-            child_dir,
-            advisor=advisor,
-            model=model,
-            cwd=cwd,
-            registry_path=registry_path,
-            check=check,
-            check_timeout=check_timeout,
-            scope_paths=scope_paths,
-            pass_env=pass_env,
-            verify_with=verify_with,
-            verify_model=verify_model,
-            escalate_to=remaining,
-        )
-        child = Job(
-            job_id=child_id,
-            status=jobs_mod.JobState.PENDING,
-            advisor=advisor.name,
-            name="",
-            cwd=cwd,
-            redacted_command="",
-            started_at=_now(),
-            updated_at=_now(),
-            last_activity_at=_now(),
-            last_event="escalation.created",
-            max_runtime_seconds=failed_job.max_runtime_seconds,
-            termination_grace_seconds=failed_job.termination_grace_seconds,
-            parent_job_id=parent_id,
-            trace_id=trace_id,
-            orchestrator_label=label,
-            nesting_depth=depth,
-        )
-        jobs_mod.save_state(child_dir, child)
-    except OSError as exc:
-        _audit_skip(job_dir, reason=f"escalation could not be staged: {exc}")
+    if not _create_and_save_child(
+        state_root=state_root,
+        job_dir=job_dir,
+        child_id=child_id,
+        prompt=prompt,
+        advisor=advisor,
+        model=model,
+        cwd=cwd,
+        registry_path=registry_path,
+        check=check,
+        check_timeout=check_timeout,
+        scope_paths=scope_paths,
+        pass_env=pass_env,
+        verify_with=verify_with,
+        verify_model=verify_model,
+        escalate_to=remaining,
+        lineage=lineage,
+        failed_job=failed_job,
+    ):
         return None
 
+    _, trace_id, _, depth = lineage
     jobs_mod.append_event(
         job_dir,
         "escalation",
@@ -232,6 +191,33 @@ def maybe_escalate(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _is_escalatable_failure(failed_job: Job) -> bool:
+    """Return True only for a delegate that FINISHED but FAILED a declared gate.
+
+    Escalation re-dispatches work that failed a check, a scope violation, or a
+    failing verification (this module's stated scope). A job that did not finish
+    cleanly is deliberately out of scope, so gate on SUCCEEDED first rather than
+    on ``delegation_verdict != "failed"`` alone (which also returns "failed" for
+    CANCELLED / TIMED_OUT / a crashed delegate):
+
+    * CANCELLED is explicit user intent to stop; re-dispatching to a larger,
+      costlier peer is the opposite of cancelling and spends real money.
+    * TIMED_OUT (and any other non-success terminal status) produced no graded
+      artifact — there is no gate failure to escalate, and a bigger model is
+      generally slower, so it is at least as likely to time out again under the
+      same budget. A hard task that needs a bigger model is a fresh dispatch
+      decision, not an automatic ladder climb that silently burns budget. So
+      TIMED_OUT does NOT escalate.
+
+    Gating on SUCCEEDED means ``delegation_verdict == "failed"`` can only be a
+    declared-gate failure — mirroring cli._failed_reason's "did not finish
+    cleanly" vs. gate-failure distinction.
+    """
+    if failed_job.status != jobs_mod.JobState.SUCCEEDED:
+        return False
+    return delegation_verdict(failed_job) == "failed"
 
 
 def _drop_first_nonblank(rungs: Optional[list[str]]) -> list[str]:
@@ -287,6 +273,93 @@ def _write_child_command(
         "escalate_to": escalate_to,
     }
     jobs_mod.atomic_json_write(command_payload, child_dir / "command.json")
+
+
+def _build_child_job(
+    child_id: str,
+    advisor: Advisor,
+    cwd: str,
+    lineage: tuple[Optional[str], str, Optional[str], Optional[int]],
+    failed_job: Job,
+) -> Job:
+    """Assemble the PENDING child ``Job`` record for an escalation re-dispatch.
+
+    *lineage* is the ``(parent_id, trace_id, label, depth)`` tuple returned by
+    :func:`~crossagent.jobs.resolve_lineage`; runtime bounds are inherited from
+    *failed_job* so the larger peer runs under the same limits.
+    """
+    parent_id, trace_id, label, depth = lineage
+    return Job(
+        job_id=child_id,
+        status=jobs_mod.JobState.PENDING,
+        advisor=advisor.name,
+        name="",
+        cwd=cwd,
+        redacted_command="",
+        started_at=_now(),
+        updated_at=_now(),
+        last_activity_at=_now(),
+        last_event="escalation.created",
+        max_runtime_seconds=failed_job.max_runtime_seconds,
+        termination_grace_seconds=failed_job.termination_grace_seconds,
+        parent_job_id=parent_id,
+        trace_id=trace_id,
+        orchestrator_label=label,
+        nesting_depth=depth,
+    )
+
+
+def _create_and_save_child(
+    *,
+    state_root: Path,
+    job_dir: Path,
+    child_id: str,
+    prompt: str,
+    advisor: Advisor,
+    model: Optional[str],
+    cwd: str,
+    registry_path: str,
+    check: Optional[str],
+    check_timeout: float,
+    scope_paths: Optional[list[str]],
+    pass_env: list[str],
+    verify_with: Optional[str],
+    verify_model: Optional[str],
+    escalate_to: list[str],
+    lineage: tuple[Optional[str], str, Optional[str], Optional[int]],
+    failed_job: Job,
+) -> bool:
+    """Stage the escalated child on disk: prompt, command, and state record.
+
+    Staging touches the filesystem (mkdir, two file writes, a state save). A
+    read-only or full disk raises OSError; it is caught here so the caller's
+    "never raises" contract holds — a child that cannot be staged is recorded on
+    *job_dir* and skipped, exactly like a launch failure. Returns True on
+    success, False when staging was skipped.
+    """
+    try:
+        child_dir = jobs_mod.create_job_dir(state_root, child_id)
+        _write_child_prompt(child_dir, prompt)
+        _write_child_command(
+            child_dir,
+            advisor=advisor,
+            model=model,
+            cwd=cwd,
+            registry_path=registry_path,
+            check=check,
+            check_timeout=check_timeout,
+            scope_paths=scope_paths,
+            pass_env=pass_env,
+            verify_with=verify_with,
+            verify_model=verify_model,
+            escalate_to=escalate_to,
+        )
+        child = _build_child_job(child_id, advisor, cwd, lineage, failed_job)
+        jobs_mod.save_state(child_dir, child)
+    except OSError as exc:
+        _audit_skip(job_dir, reason=f"escalation could not be staged: {exc}")
+        return False
+    return True
 
 
 def _audit_skip(job_dir: Path, *, reason: str) -> None:
