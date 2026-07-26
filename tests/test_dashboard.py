@@ -199,6 +199,7 @@ def test_prompt_never_exposed(state_dir, server_url):
     for path in (
         "/",
         "/api/jobs",
+        "/api/analytics",
         "/api/jobs/job_dash_secret",
         "/api/jobs/job_dash_secret/logs?stream=stdout",
     ):
