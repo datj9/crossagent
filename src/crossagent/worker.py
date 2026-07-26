@@ -17,13 +17,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from . import advisors as advisors_mod
 from . import check as check_mod
 from . import credentials as credentials_mod
+from . import escalate as escalate_mod
 from . import jobs as jobs_mod
 from . import parsers as parsers_mod
 from . import registry as reg_mod
 from . import runner as runner_mod
 from . import scope as scope_mod
+from . import verify as verify_mod
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +53,13 @@ class _JobCommand:
     # credential env vars the caller opted to pass through to the delegate.
     scope_paths: Optional[list[str]]
     pass_env: list[str]
+    # Independent verification + escalation (slice S5). ``verify_with`` names the
+    # advisor that grades the delegate's artifact in a fresh session (``None`` =
+    # off). ``escalate_to`` is the ordered ladder of ``advisor[:model]`` rungs a
+    # failed delegation is re-dispatched up ([] = off).
+    verify_with: Optional[str]
+    verify_model: Optional[str]
+    escalate_to: list[str]
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +244,12 @@ def worker_main(job_id: str, state_dir: Path) -> int:
     # distinctly and drives the delegation verdict to failed, never a pass.
     scope_result = _run_scope_assertion(command, scope_baseline, job_dir)
 
+    # Run the independent verification pass (S5) if a verifier was declared. A
+    # FRESH peer session grades the delegate's artifact supplied as user-turn
+    # input (D6). A structured ``fail`` verdict blocks the green path; a
+    # prose-only or errored verifier degrades to inconclusive, never a pass.
+    verify_result = _run_verification(command, prompt, parsed.result, job_dir)
+
     now = datetime.now(timezone.utc).isoformat()
     # Persist the advisor telemetry the parser extracted (S1) and the check-gate
     # outcome (S3) on the SAME terminal transition — the worker is the only
@@ -241,7 +257,7 @@ def worker_main(job_id: str, state_dir: Path) -> int:
     # disk. ``parsed`` fields and ``check_result`` already default to unknown /
     # None when nothing was measured (D4/D7), so this never fails the job and
     # never turns an unmeasured metric into a zero or an unrun check into a pass.
-    jobs_mod.transition_to(
+    job = jobs_mod.transition_to(
         job,
         final_state,
         job_dir=job_dir,
@@ -257,6 +273,27 @@ def worker_main(job_id: str, state_dir: Path) -> int:
         check_result=check_result,
         scope_result=scope_result,
         withheld_env=withheld,
+        verify_result=verify_result,
+    )
+
+    # Escalate-on-failure (S5). Runs AFTER the terminal state is persisted, so
+    # the failed parent is complete on disk before its same-trace child is
+    # spawned. maybe_escalate is a no-op unless the delegation FAILED and an
+    # escalation ladder remains; it never raises and respects MAX_NESTING_DEPTH.
+    escalate_mod.maybe_escalate(
+        job,
+        prompt=prompt,
+        state_root=state_dir,
+        job_dir=job_dir,
+        cwd=command.cwd,
+        registry_path=command.registry_path,
+        escalate_to=command.escalate_to,
+        check=command.check,
+        check_timeout=command.check_timeout,
+        scope_paths=command.scope_paths,
+        pass_env=command.pass_env,
+        verify_with=command.verify_with,
+        verify_model=command.verify_model,
     )
 
     return 0
@@ -318,6 +355,66 @@ def _run_scope_assertion(
     return outcome.to_dict()
 
 
+def _run_verification(
+    command: _JobCommand,
+    prompt: str,
+    result_text: Optional[str],
+    job_dir: Path,
+) -> Optional[jobs_mod.VerifyResultDict]:
+    """Run the independent verification pass (S5), if a verifier was declared.
+
+    Returns ``None`` when no verifier was requested — distinct from a
+    verification that ran and failed (D7). The verifier is a FRESH peer session
+    grading the delegate's artifact as user-turn input (D6); it is a delegate
+    too, so it runs with credentials scrubbed. An unknown verifier advisor or a
+    delegate that produced no artifact is recorded as an ``error`` outcome
+    (inconclusive), never a crash and never a silent pass.
+    """
+    if not command.verify_with:
+        return None
+    try:
+        advisor = advisors_mod.resolve(command.verify_with)
+    except KeyError as exc:
+        outcome = verify_mod.VerifyOutcome(
+            command.verify_with,
+            command.verify_model,
+            "error",
+            False,
+            f"unknown verifier advisor: {exc}",
+        )
+    else:
+        structured = advisor.json_schema_flag is not None
+        if result_text is None:
+            outcome = verify_mod.VerifyOutcome(
+                advisor.name,
+                command.verify_model,
+                "error",
+                structured,
+                "delegate produced no artifact to verify",
+            )
+        else:
+            artifact = verify_mod.build_artifact(prompt, result_text, command.cwd)
+            outcome = verify_mod.run_verification(
+                advisor,
+                command.verify_model,
+                artifact,
+                cwd=command.cwd,
+                pass_env=command.pass_env,
+                timeout=verify_mod.VERIFY_DEFAULT_TIMEOUT_SECONDS,
+            )
+    # Audit the verdict, never the artifact (which can contain repo content).
+    jobs_mod.append_event(
+        job_dir,
+        "verify",
+        actor="system:verify",
+        advisor=outcome.advisor,
+        model=outcome.model,
+        verdict=outcome.verdict,
+        structured=outcome.structured,
+    )
+    return outcome.to_dict()
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -342,6 +439,9 @@ def _load_command(job_dir: Path) -> _JobCommand:
         ),
         scope_paths=_load_scope_paths(data.get("scope_paths")),
         pass_env=[str(name) for name in data.get("pass_env", [])],
+        verify_with=data.get("verify_with"),
+        verify_model=data.get("verify_model"),
+        escalate_to=[str(rung) for rung in data.get("escalate_to", [])],
     )
 
 
