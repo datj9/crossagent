@@ -23,7 +23,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Optional
 
-from .jobs import CheckResultDict
+from .types import CheckResultDict
 
 # Keep only a bounded tail of the check's output — a full test run can emit
 # megabytes, and the whole Job record is loaded into memory (and the dashboard).

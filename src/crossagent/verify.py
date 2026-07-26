@@ -56,7 +56,7 @@ from . import credentials as credentials_mod
 from . import parsers as parsers_mod
 from . import runner as runner_mod
 from .advisors import Advisor
-from .jobs import VerifyResultDict, VerifyVerdict
+from .types import VerifyResultDict, VerifyVerdict
 
 # A verification that never terminates must not hang the worker forever.
 VERIFY_DEFAULT_TIMEOUT_SECONDS = 600.0
