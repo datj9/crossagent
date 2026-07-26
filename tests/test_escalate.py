@@ -255,6 +255,77 @@ def test_escalation_audit_event_on_parent(tmp_path):
     assert escalations[0]["trace_id"] == "trace_x"
 
 
+# ---------------------------------------------------------------------------
+# HIGH 1: escalation is scoped to a FINISHED delegate whose declared gate
+# failed — never to a job that did not finish cleanly (CANCELLED / TIMED_OUT).
+# ---------------------------------------------------------------------------
+
+
+def _terminal_parent(
+    state_root: Path, *, status: JobState, job_id: str = "job_term"
+) -> Job:
+    """Persist a parent in a non-success terminal state.
+
+    Carries a *failing* check_result, mirroring a real cancel/timeout that
+    interrupts the delegate mid-run: under the old ``delegation_verdict !=
+    "failed"`` gate (which returns "failed" for ANY non-success terminal status)
+    this would have been re-dispatched.
+    """
+    job_dir = jobs_mod.create_job_dir(state_root, job_id)
+    now = datetime.now(timezone.utc).isoformat()
+    job = Job(
+        job_id=job_id,
+        status=status,
+        advisor="codex",
+        cwd=str(state_root),
+        started_at=now,
+        updated_at=now,
+        trace_id="trace_term",
+        nesting_depth=1,
+        check_result={
+            "command": "pytest",
+            "exit_code": 1,
+            "stdout_tail": "",
+            "stderr_tail": "",
+        },
+    )
+    save_state(job_dir, job)
+    return job
+
+
+def test_cancelled_parent_is_never_escalated(tmp_path):
+    """A user who cancels a job must not have it silently re-dispatched to a
+    larger, costlier peer — that is the opposite of cancelling (HIGH 1)."""
+    state_root = tmp_path / "state"
+    parent = _terminal_parent(state_root, status=JobState.CANCELLED)
+    spawned, launcher = _spawns()
+    assert _escalate(parent, state_root, ["claude:opus"], launcher) is None
+    assert spawned == []
+
+
+def test_timed_out_parent_is_never_escalated(tmp_path):
+    """Decision: a TIMED_OUT delegate produced no graded artifact, and a bigger,
+    slower peer is at least as likely to time out again under the same budget, so
+    it is NOT auto-escalated — the ladder is for gate failures on completed work,
+    not for work that never finished (HIGH 1)."""
+    state_root = tmp_path / "state"
+    parent = _terminal_parent(state_root, status=JobState.TIMED_OUT)
+    spawned, launcher = _spawns()
+    assert _escalate(parent, state_root, ["claude:opus"], launcher) is None
+    assert spawned == []
+
+
+def test_gate_failure_parent_still_escalates(tmp_path):
+    """The working path is not regressed: a SUCCEEDED delegate whose declared
+    gate (here, the check) failed is still escalated (HIGH 1)."""
+    state_root = tmp_path / "state"
+    parent = _failed_parent(state_root)  # SUCCEEDED + failing check
+    spawned, launcher = _spawns()
+    child_id = _escalate(parent, state_root, ["claude:opus"], launcher)
+    assert child_id is not None
+    assert spawned == [(child_id, state_root)]
+
+
 def _events(job_dir: Path) -> list[dict]:
     path = job_dir / "events.jsonl"
     if not path.exists():
