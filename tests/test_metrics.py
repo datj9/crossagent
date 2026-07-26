@@ -198,6 +198,112 @@ def test_extract_codex_metrics_reads_turn_completed_usage():
 
 
 # =========================================================================
+# CommandCode metric extraction (camelCase; no cost per S2)
+# =========================================================================
+
+
+def _commandcode_result_event() -> dict[str, object]:
+    """Real CommandCode 1.4.1 ``result`` event (captured live, S2 re-probe)."""
+    return {
+        "type": "result",
+        "subtype": "success",
+        "sessionId": "6c5226d4-a072-47c6-b35b-da35b012ec18",
+        "stopReason": "end_turn",
+        "usage": {
+            "inputTokens": 28019,
+            "outputTokens": 16,
+            "cacheReadTokens": 9856,
+            "cacheWriteTokens": 0,
+        },
+        "durationMs": 6326,
+        "finalText": "ok",
+    }
+
+
+def test_extract_commandcode_metrics_reads_camelcase_usage_and_duration():
+    """CommandCode nests camelCase token counts under ``usage`` and carries a
+    top-level ``durationMs``. Keys stay verbatim (D1); nothing summed (D2)."""
+    metrics = parsers.extract_commandcode_metrics(
+        _commandcode_result_event(), model="deepseek/deepseek-v4-pro"
+    )
+    assert metrics.usage_details == {
+        "inputTokens": 28019,
+        "outputTokens": 16,
+        "cacheReadTokens": 9856,
+        "cacheWriteTokens": 0,
+    }
+    assert metrics.duration_ms == 6326
+    assert metrics.model_reported == "deepseek/deepseek-v4-pro"
+    # CommandCode emits no cost — must stay unknown, never a fabricated 0.0 (D3/D7).
+    assert metrics.cost_source == "unknown"
+    assert metrics.cost_details == {}
+    # No naive aggregate (37891 would be the sum of the four categories).
+    assert 37891 not in metrics.usage_details.values()
+
+
+def test_extract_commandcode_metrics_absent_is_unknown():
+    assert parsers.extract_commandcode_metrics(None).cost_source == "unknown"
+    assert parsers.extract_commandcode_metrics({}).usage_details == {}
+    assert parsers.extract_commandcode_metrics({}).duration_ms is None
+
+
+def test_extract_commandcode_metrics_malformed_does_not_raise():
+    """A renamed/wrong-typed payload degrades to unknown, never raises (D4)."""
+    metrics = parsers.extract_commandcode_metrics(
+        {"usage": "not-a-dict", "durationMs": "soon"}
+    )
+    assert metrics.usage_details == {}
+    assert metrics.duration_ms is None
+    assert metrics.cost_source == "unknown"
+
+
+def test_commandcode_parser_finish_carries_metrics():
+    import json
+
+    parser = parsers.CommandCodeJsonParser()
+    # A 1.4.1 model event is wrapped under "event"; the result line is top level.
+    for event in (
+        {
+            "type": "event",
+            "event": {
+                "type": "model_request_start",
+                "model": "deepseek/deepseek-v4-pro",
+            },
+        },
+        _commandcode_result_event(),
+    ):
+        parser.consume_stdout(json.dumps(event) + "\n")
+    result = parser.finish(0)
+    assert result.result == "ok"
+    assert result.session_id == "6c5226d4-a072-47c6-b35b-da35b012ec18"
+    assert result.usage_details["inputTokens"] == 28019
+    assert result.duration_ms == 6326
+    assert result.model_reported == "deepseek/deepseek-v4-pro"
+    assert result.cost_source == "unknown"
+
+
+def test_commandcode_parser_tolerates_non_json_and_missing_result():
+    parser = parsers.CommandCodeJsonParser()
+    parser.consume_stdout("[update-notice] update available: v1.4.1\n")
+    result = parser.finish(0)
+    assert result.failure is True
+    assert result.usage_details == {}
+    assert result.cost_source == "unknown"
+
+
+def test_commandcode_parser_nonzero_exit_is_failure_with_metrics():
+    import json
+
+    parser = parsers.CommandCodeJsonParser()
+    parser.consume_stdout(json.dumps(_commandcode_result_event()) + "\n")
+    result = parser.finish(1)
+    assert result.failure is True
+    assert "exited with code 1" in (result.error or "")
+    # Metrics measured before the failure are still preserved.
+    assert result.usage_details["inputTokens"] == 28019
+
+
+# =========================================================================
 # Parser finish() carries metrics into ParsedResult
 # =========================================================================
 

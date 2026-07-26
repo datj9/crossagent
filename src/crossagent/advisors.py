@@ -23,7 +23,7 @@ PROMPT_DELIVERIES = frozenset({"dashdash", "positional"})
 # How to read the advisor's answer back out of its stdout.
 #   "claude-stream" -> parse newline-delimited stream-json events, take the result event
 #   "text"          -> capture raw stdout as the answer
-RESULT_PARSERS = frozenset({"claude-stream", "codex-jsonl", "text"})
+RESULT_PARSERS = frozenset({"claude-stream", "codex-jsonl", "commandcode-json", "text"})
 
 USER_CONFIG = Path.home() / ".config" / "crossagent" / "advisors.json"
 
@@ -59,7 +59,11 @@ class Advisor:
 
     @property
     def supports_stream(self) -> bool:
-        return self.result_parser in ("claude-stream", "codex-jsonl")
+        return self.result_parser in (
+            "claude-stream",
+            "codex-jsonl",
+            "commandcode-json",
+        )
 
 
 # --- Built-in advisors -------------------------------------------------------
@@ -84,7 +88,13 @@ _BUILTINS: dict[str, Advisor] = {
     "codex": Advisor(
         name="codex",
         executable="codex",
-        base_args=("exec",),
+        # --skip-git-repo-check: `codex exec` refuses to run (exit 1, empty
+        # stdout) with "Not inside a trusted directory" whenever the cwd is not
+        # a trusted git repo (S2 probe). crossagent runs from arbitrary --cwd
+        # paths, so without this a delegation from a non-repo directory fails
+        # confusingly with no JSON to parse. Skipping the check only bypasses
+        # codex's own trust gate; it grants no extra capability.
+        base_args=("exec", "--skip-git-repo-check"),
         prompt_delivery="positional",
         model_flag="--model",
         json_args=("--json",),
@@ -93,8 +103,13 @@ _BUILTINS: dict[str, Advisor] = {
         resume_command=("resume",),
         session_event_field="thread_id",
         experimental=True,
-        notes="Uses `codex exec --json <prompt>` with JSONL event streaming and resume.",
+        notes="Uses `codex exec --skip-git-repo-check --json <prompt>` with JSONL event streaming and resume.",
     ),
+    # opencode stays on the text parser: its SUCCESS telemetry shape is
+    # unmeasured (every probe run failed on provider creds, S2). `run --format
+    # json` exists, but wiring it without a verified success event shape would
+    # risk dropping the answer or inventing field names (D4). Re-probe with
+    # working creds before wiring. Telemetry degrades to unknown via text.
     "opencode": Advisor(
         name="opencode",
         executable="opencode",
@@ -103,7 +118,7 @@ _BUILTINS: dict[str, Advisor] = {
         model_flag="--model",
         result_parser="text",
         experimental=True,
-        notes="Uses `opencode run <prompt>` (headless).",
+        notes="Uses `opencode run <prompt>` (headless). Telemetry unmeasured; stays text-only.",
     ),
     "commandcode": Advisor(
         name="commandcode",
@@ -111,10 +126,18 @@ _BUILTINS: dict[str, Advisor] = {
         invoke_args=("-p",),
         prompt_delivery="positional",
         model_flag="--model",
-        result_parser="text",
+        # `-p --output-format json` emits an NDJSON event stream ending in a
+        # type:"result" line with camelCase usage, durationMs, and finalText
+        # (verified live on CommandCode 1.4.1, S2 probe). Plain `-p` text mode
+        # emits zero telemetry, so the JSON flag is required to reach analytics.
+        json_args=("--output-format", "json"),
+        stream_args=("--output-format", "json"),
+        result_parser="commandcode-json",
         experimental=True,
-        notes="Uses `commandcode -p <prompt>` (non-interactive). Resume not wired by default.",
+        notes="Uses `commandcode -p --output-format json <prompt>` (non-interactive). Resume not wired by default.",
     ),
+    # gemini is not installed on this machine, so its telemetry shape is
+    # unverifiable; it stays text-only until it can be probed live.
     "gemini": Advisor(
         name="gemini",
         executable="gemini",
@@ -122,7 +145,7 @@ _BUILTINS: dict[str, Advisor] = {
         model_flag="--model",
         result_parser="text",
         experimental=True,
-        notes="Uses `gemini -p <prompt>` (non-interactive).",
+        notes="Uses `gemini -p <prompt>` (non-interactive). Not installed here; telemetry unverified.",
     ),
 }
 
