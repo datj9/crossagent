@@ -1839,3 +1839,124 @@ def test_v3_scope_result_round_trips_on_disk(tmp_path):
     loaded = load_state(job_dir)
     assert loaded.scope_result == _scope("violated", violating=["evil.py"])
     assert loaded.withheld_env == ["GITHUB_TOKEN"]
+
+
+# =========================================================================
+# Delegation verdict interaction with the independent verification pass
+# (slice S5). A fresh-session verifier grades the delegate's artifact; a
+# structured "fail" blocks green even when the shell check passed (D6),
+# while a prose-only "unverified" degrades gracefully and never greens.
+# =========================================================================
+
+
+def _verify(verdict, *, structured=True):
+    return {
+        "advisor": "codex",
+        "model": "gpt-5.6-sol",
+        "verdict": verdict,
+        "structured": structured,
+        "detail": "",
+    }
+
+
+def _succeeded_verify(verify_verdict=None, *, check_exit=None, scope_status=None):
+    check = (
+        None
+        if check_exit is None
+        else {
+            "command": "pytest",
+            "exit_code": check_exit,
+            "stdout_tail": "",
+            "stderr_tail": "",
+        }
+    )
+    return Job(
+        job_id="job_v",
+        status=JobState.SUCCEEDED,
+        check_result=check,
+        scope_result=None if scope_status is None else _scope(scope_status),
+        verify_result=None if verify_verdict is None else _verify(verify_verdict),
+    )
+
+
+def test_delegation_verdict_verified_when_verification_passes():
+    """A structured pass from the fresh verifier greens the delegation even with
+    no shell check declared."""
+    assert delegation_verdict(_succeeded_verify("pass")) == "verified"
+
+
+def test_delegation_verdict_failed_when_verification_fails():
+    assert delegation_verdict(_succeeded_verify("fail")) == "failed"
+
+
+def test_delegation_verdict_verify_fail_blocks_green_despite_passing_check():
+    """The load-bearing D6 case: the shell check passed, but the independent
+    verifier says the work is wrong -> failed. A failing verification blocks the
+    green path a same-context self-grade might have waved through."""
+    job = _succeeded_verify("fail", check_exit=0)
+    assert delegation_verdict(job) == "failed"
+
+
+def test_delegation_verdict_prose_verification_is_unverified_not_pass():
+    """An advisor that produced no machine-checkable verdict (prose) degrades to
+    'unverified' and never greens: inconclusive is not a pass (D4)."""
+    job = _succeeded_verify("unverified", check_exit=None)
+    assert delegation_verdict(job) == "unverified"
+
+
+def test_delegation_verdict_errored_verification_is_inconclusive():
+    """A verifier that could not run leaves the delegation unverified, never a
+    hard fail (the verifier broke, not the work)."""
+    assert delegation_verdict(_succeeded_verify("error")) == "unverified"
+
+
+def test_delegation_verdict_prose_verify_does_not_downgrade_passing_check():
+    """A passing shell check greens the delegation; an inconclusive verify does
+    not drag it back to unverified."""
+    job = _succeeded_verify("unverified", check_exit=0)
+    assert delegation_verdict(job) == "verified"
+
+
+def test_delegation_verdict_scope_violation_dominates_passing_verification():
+    """Fail closed still wins: a scope violation fails the delegation even when
+    the independent verifier passed."""
+    job = _succeeded_verify("pass", scope_status="violated")
+    assert delegation_verdict(job) == "failed"
+
+
+def test_delegation_verdict_absent_verify_preserves_pre_s5_behaviour():
+    job = Job(job_id="job_v", status=JobState.SUCCEEDED, verify_result=None)
+    assert delegation_verdict(job) == "unverified"
+
+
+def test_runtime_status_surfaces_verify_result():
+    job = _succeeded_verify("fail", check_exit=0)
+    result = runtime_status(job)
+    assert result["verify_result"]["verdict"] == "fail"
+    assert result["delegation_verdict"] == "failed"
+
+
+def test_v3_verify_result_round_trips_on_disk(tmp_path):
+    job_dir = create_job_dir(tmp_path, "job_verify_rt")
+    job = Job(
+        job_id="job_verify_rt",
+        status=JobState.SUCCEEDED,
+        verify_result=_verify("pass", structured=True),
+    )
+    save_state(job_dir, job)
+    loaded = load_state(job_dir)
+    assert loaded.verify_result == _verify("pass", structured=True)
+    assert delegation_verdict(loaded) == "verified"
+
+
+def test_v2_record_without_verify_result_still_loads(tmp_path):
+    """A pre-S5 record on disk (no verify_result key) loads with it absent, not
+    crashing — absent (not requested) stays distinct from failed (D7)."""
+    job_dir = create_job_dir(tmp_path, "job_v2_verify")
+    atomic_json_write(
+        {"schema_version": 2, "job_id": "job_v2_verify", "status": "succeeded"},
+        job_dir / "state.json",
+    )
+    loaded = load_state(job_dir)
+    assert loaded.verify_result is None
+    assert delegation_verdict(loaded) == "unverified"
