@@ -24,6 +24,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from . import advisors as advisors_mod
+from . import analytics as analytics_mod
 from . import graph as graph_mod
 from . import jobs as jobs_mod
 from .feed import normalize_stream_line, resolve_event_format
@@ -61,6 +62,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/graph":
             self._send_json(200, self._graph_payload())
             return
+        if path == "/api/analytics":
+            self._send_json(200, self._analytics_payload())
+            return
         match = re.match(r"^/api/jobs/([^/]+)$", path)
         if match:
             self._handle_job_detail(match.group(1))
@@ -92,6 +96,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _graph_payload(self) -> dict[str, Any]:
         jobs = jobs_mod.collect_jobs(self.server.state_root)
         return graph_mod.build_graph(jobs)
+
+    def _analytics_payload(self) -> dict[str, Any]:
+        jobs = jobs_mod.collect_jobs(self.server.state_root)
+        return analytics_mod.build_analytics(jobs)
 
     def _handle_job_detail(self, job_id: str) -> None:
         job = self._load_job(job_id)
@@ -414,6 +422,11 @@ _PAGE_HTML = """<!doctype html>
     --graph-orch-bg: #21262d;
     --graph-orch-border: #6e7681;
     --graph-orch-text: #c9d1d9;
+    /* Lineage trace_mismatch cue — a distinct violet, deliberately NOT the red
+       missing_parent uses, so the two inconsistencies are told apart by hue as
+       well as dash. 8.15:1 on --graph-bg, 6.86:1 on --surface-raised (both
+       clear the 3:1 graphical / 4.5:1 text floors). */
+    --graph-mismatch: #bc8cff;
 
     --radius: 6px;
     --pill: 999px;
@@ -445,6 +458,8 @@ _PAGE_HTML = """<!doctype html>
       --graph-orch-bg: #eaeef2;
       --graph-orch-border: #7d8690;
       --graph-orch-text: #1f2328;
+      /* 4.74:1 on --graph-bg, 5.05:1 on --surface — clears text + graphical. */
+      --graph-mismatch: #8250df;
     }
   }
 
@@ -576,6 +591,67 @@ _PAGE_HTML = """<!doctype html>
                   font-size: var(--fs-sm); pointer-events: none; text-align: center;
                   white-space: nowrap; }
 
+  /* ---- Analytics view ----------------------------------------------------
+     A full-width surface (spans all grid columns) shown in place of the
+     split-pane list/graph. Every table lives inside its own .table-scroll so a
+     wide rollup scrolls sideways within the card instead of widening the page
+     body at 390px. Secondary text is --text-muted on --surface (>=6:1 both
+     themes); "not measured" is deliberately text, not a blank or a zero. */
+  #analytics-view { display: none; grid-column: 1 / -1; overflow: auto;
+                    min-height: 0; padding: 16px 20px 40px; }
+  .an-section { margin: 0 0 24px; max-width: 1100px; }
+  .an-section h2 { font-size: var(--fs-lg); margin: 0 0 6px;
+                   font-family: var(--font-mono); }
+  .an-section h3 { font-size: var(--fs-md); margin: 0 0 10px;
+                   color: var(--text); font-weight: 600; }
+  .an-caveat { color: var(--text-muted); font-size: var(--fs-base);
+               margin: 0; max-width: 70ch; }
+  .an-caveat code { color: var(--text); }
+  .table-scroll { overflow-x: auto; border: 1px solid var(--border);
+                  border-radius: var(--radius); }
+  .an-table { width: 100%; border-collapse: collapse; background: var(--surface);
+              font-size: var(--fs-base); }
+  .an-table th { position: static; text-align: left; padding: 8px 12px;
+                 background: var(--surface); color: var(--text-muted);
+                 font-weight: 600; font-size: var(--fs-xs); text-transform: uppercase;
+                 letter-spacing: 0.04em; white-space: nowrap;
+                 border-bottom: 1px solid var(--border); }
+  .an-table td { padding: 8px 12px; border-bottom: 1px solid var(--border-subtle);
+                 white-space: nowrap; vertical-align: top; }
+  .an-table tr:last-child td { border-bottom: none; }
+  .an-table .an-key { font-family: var(--font-mono); color: var(--text);
+                      font-weight: 600; }
+  .an-table .metric-main { font-variant-numeric: tabular-nums; color: var(--text); }
+  .an-table .metric-sub { font-size: var(--fs-xs); color: var(--text-muted);
+                          font-variant-numeric: tabular-nums; margin-top: 1px; }
+  .an-table .num { font-variant-numeric: tabular-nums; color: var(--text); }
+  /* Unmeasured is a first-class state, never a 0 or a blank — muted italic so
+     it reads as "no data", visually distinct from a real measured number. */
+  .unmeasured { color: var(--text-muted); font-style: italic; font-size: var(--fs-sm); }
+  .cost-src { display: inline-block; margin-inline-start: 4px; font-size: 10px;
+              color: var(--text-muted); text-transform: uppercase;
+              letter-spacing: 0.03em; }
+  .verdict { font-weight: 600; }
+  .verdict-verified { color: var(--ok-fg); }
+  .verdict-failed { color: var(--bad-fg); }
+  .verdict-unverified { color: var(--warn-fg); }
+  .verdict-incomplete { color: var(--neutral-fg); }
+  .an-filters { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+  .an-filters input, .an-filters select {
+    background: var(--surface-raised); color: var(--text);
+    border: 1px solid var(--border-strong); border-radius: var(--radius);
+    padding: 6px 10px; font: var(--fs-base) var(--font-ui); }
+  .an-filters input { flex: 1 1 220px; min-width: 0; font-family: var(--font-mono); }
+  .an-filters input:focus-visible, .an-filters select:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 1px; border-color: var(--accent); }
+  .link-btn { background: none; border: none; padding: 0; margin: 0;
+              color: var(--accent); font: var(--fs-base) var(--font-mono);
+              cursor: pointer; text-align: left; }
+  .link-btn:hover { text-decoration: underline; }
+  .link-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px;
+                            border-radius: 2px; }
+  .an-empty { color: var(--text-muted); padding: 16px 4px; font-size: var(--fs-base); }
+
   /* Stack the two panes below a narrow breakpoint so nothing overflows
      horizontally on phones. The `!important` overrides the inline
      grid-template-columns the drag splitter may have written on desktop. */
@@ -592,6 +668,8 @@ _PAGE_HTML = """<!doctype html>
   @media (hover: none) and (pointer: coarse) {
     th, td { padding: 12px; }
     .tabs button, .view-toggle button, #fit-btn { padding: 11px 16px; }
+    .an-filters input, .an-filters select { min-height: 44px; }
+    .link-btn { min-height: 44px; }
     #pane-splitter { display: none; }
   }
 
@@ -607,6 +685,7 @@ _PAGE_HTML = """<!doctype html>
   <div class="view-toggle">
     <button id="view-list" class="active">List</button>
     <button id="view-graph">Graph</button>
+    <button id="view-analytics">Analytics</button>
   </div>
 </header>
 <main>
@@ -629,6 +708,73 @@ _PAGE_HTML = """<!doctype html>
   <div id="pane-splitter" title="Drag to resize"></div>
   <div id="detail-pane">
     <div class="empty">Select a job to see its detail and live logs.</div>
+  </div>
+  <div id="analytics-view">
+    <section class="an-section">
+      <h2>Delegation analytics</h2>
+      <p class="an-caveat">
+        Rollups are computed only from persisted job records. Averages exclude jobs
+        with no measurement — <strong>&ldquo;not measured&rdquo; is never counted as
+        zero</strong>. Telemetry coverage differs by advisor: only <code>claude</code>
+        reports cost (a vendor estimate, not billing truth); <code>codex</code> and
+        <code>commandcode</code> report tokens; <code>opencode</code> and
+        <code>gemini</code> report nothing measurable here.
+      </p>
+    </section>
+    <section class="an-section">
+      <h3>Check-pass rate by model</h3>
+      <div class="table-scroll">
+        <table class="an-table">
+          <thead><tr>
+            <th>Model</th><th>Jobs</th><th>Pass rate</th><th>Cost</th>
+            <th>Tokens</th><th>Duration</th><th>Escalation</th>
+          </tr></thead>
+          <tbody id="an-model-body"></tbody>
+        </table>
+      </div>
+      <p id="an-model-empty" class="an-empty" hidden>No jobs yet.</p>
+    </section>
+    <section class="an-section">
+      <h3>By advisor</h3>
+      <div class="table-scroll">
+        <table class="an-table">
+          <thead><tr>
+            <th>Advisor</th><th>Jobs</th><th>Pass rate</th><th>Cost</th>
+            <th>Tokens</th><th>Duration</th><th>Escalation</th>
+          </tr></thead>
+          <tbody id="an-advisor-body"></tbody>
+        </table>
+      </div>
+      <p id="an-advisor-empty" class="an-empty" hidden>No jobs yet.</p>
+    </section>
+    <section class="an-section">
+      <h3>History</h3>
+      <div class="an-filters">
+        <input id="an-search" type="text" autocomplete="off" spellcheck="false"
+               aria-label="Search delegations by job id, name, advisor, or model"
+               placeholder="Search job, name, advisor, model…">
+        <select id="an-filter-advisor" aria-label="Filter history by advisor">
+          <option value="">All advisors</option>
+        </select>
+        <select id="an-filter-verdict" aria-label="Filter history by verdict">
+          <option value="">All verdicts</option>
+          <option value="verified">verified</option>
+          <option value="failed">failed</option>
+          <option value="unverified">unverified</option>
+          <option value="incomplete">incomplete</option>
+        </select>
+      </div>
+      <div class="table-scroll">
+        <table class="an-table">
+          <thead><tr>
+            <th>Job</th><th>Advisor</th><th>Model</th><th>Status</th><th>Verdict</th>
+            <th>Cost</th><th>Tokens</th><th>Duration</th><th>Started</th>
+          </tr></thead>
+          <tbody id="an-history-body"></tbody>
+        </table>
+      </div>
+      <p id="an-history-empty" class="an-empty" hidden>No delegations match.</p>
+    </section>
   </div>
 </main>
 <script>
@@ -657,6 +803,7 @@ function refreshGraphColors() {
     edge: token("--graph-edge"),
     accent: token("--accent"),
     bad: token("--bad-fg"),
+    mismatch: token("--graph-mismatch"),
     runBg: token("--run-bg"), runFg: token("--run-fg"),
     okBg: token("--ok-bg"), okFg: token("--ok-fg"),
     badBg: token("--bad-bg"),
@@ -1120,10 +1267,14 @@ async function poll() {
   try {
     if (currentView === "graph") {
       await refreshGraph();
+    } else if (currentView === "analytics") {
+      await refreshAnalytics();
     } else {
       await refreshJobs();
     }
-    if (selectedJobId) {
+    // The analytics view has no detail pane, so skip the detail fetch there
+    // rather than mutate hidden DOM against the last-selected job.
+    if (selectedJobId && currentView !== "analytics") {
       await refreshDetail();
     }
   } catch (_e) {
@@ -1139,11 +1290,23 @@ async function poll() {
 
 let currentView = "list";
 
+// Show/hide the split-pane surface (list/graph + detail) as a unit; the
+// analytics view replaces it entirely rather than sitting inside a pane.
+function setSplitPaneVisible(visible) {
+  var display = visible ? "" : "none";
+  document.getElementById("jobs-pane").style.display = display;
+  document.getElementById("pane-splitter").style.display = display;
+  document.getElementById("detail-pane").style.display = display;
+}
+
 document.getElementById("view-list").onclick = function () {
   currentView = "list";
   if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
   document.getElementById("view-list").classList.add("active");
   document.getElementById("view-graph").classList.remove("active");
+  document.getElementById("view-analytics").classList.remove("active");
+  document.getElementById("analytics-view").style.display = "none";
+  setSplitPaneVisible(true);
   document.getElementById("list-view").style.display = "";
   document.getElementById("graph-container").style.display = "none";
 };
@@ -1152,6 +1315,9 @@ document.getElementById("view-graph").onclick = function () {
   currentView = "graph";
   document.getElementById("view-graph").classList.add("active");
   document.getElementById("view-list").classList.remove("active");
+  document.getElementById("view-analytics").classList.remove("active");
+  document.getElementById("analytics-view").style.display = "none";
+  setSplitPaneVisible(true);
   document.getElementById("list-view").style.display = "none";
   document.getElementById("graph-container").style.display = "block";
   if (graphFirstShown) {
@@ -1161,6 +1327,17 @@ document.getElementById("view-graph").onclick = function () {
     paintGraph();
   }
   maybeStartAnimation();
+};
+
+document.getElementById("view-analytics").onclick = function () {
+  currentView = "analytics";
+  if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+  document.getElementById("view-analytics").classList.add("active");
+  document.getElementById("view-list").classList.remove("active");
+  document.getElementById("view-graph").classList.remove("active");
+  setSplitPaneVisible(false);
+  document.getElementById("analytics-view").style.display = "block";
+  refreshAnalytics();
 };
 
 let graphData = null;
@@ -1350,10 +1527,15 @@ function paintGraph() {
   for (var i = 0; i < graphRects.length; i++) rectById[graphRects[i].id] = graphRects[i];
 
   var orphanIds = new Set();
+  var mismatchIds = new Set();
   if (graphData && graphData.diagnostics) {
     for (var di = 0; di < graphData.diagnostics.length; di++) {
       var d = graphData.diagnostics[di];
       if (d.type === "missing_parent") orphanIds.add(d.job_id);
+      // trace_mismatch: the parent exists but lives in a different trace, so the
+      // child is re-rooted to its own orchestrator. Without a cue it draws as a
+      // normal edge and the operator can't see lineage is inconsistent.
+      else if (d.type === "trace_mismatch") mismatchIds.add(d.job_id);
     }
   }
 
@@ -1367,8 +1549,19 @@ function paintGraph() {
     var x2 = tgtR.x, y2 = tgtR.y + tgtR.h / 2;
     var cp = Math.min(Math.abs(x2 - x1) * 0.4, 60);
     var orphanEdge = orphanIds.has(e["to"]);
-    ctx.strokeStyle = orphanEdge ? C.bad : C.edge;
-    ctx.setLineDash(orphanEdge ? [4, 3] : []);
+    var mismatchEdge = mismatchIds.has(e["to"]);
+    // Mismatch wins the styling and uses a tighter dot pattern than the orphan's
+    // dash, so hue AND rhythm distinguish the two (colour-blind safe).
+    if (mismatchEdge) {
+      ctx.strokeStyle = C.mismatch;
+      ctx.setLineDash([2, 3]);
+    } else if (orphanEdge) {
+      ctx.strokeStyle = C.bad;
+      ctx.setLineDash([4, 3]);
+    } else {
+      ctx.strokeStyle = C.edge;
+      ctx.setLineDash([]);
+    }
     ctx.beginPath();
     ctx.moveTo(x1, y1);
     ctx.bezierCurveTo(x1 + cp, y1, x2 - cp, y2, x2, y2);
@@ -1409,6 +1602,18 @@ function paintGraph() {
       ctx.strokeStyle = C.bad;
       ctx.lineWidth = 1.5;
       ctxRoundRect(ctx, r.x, r.y, r.w, r.h, 8);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    // Violet dotted ring for a trace-mismatched node. Because the hue differs
+    // from every status border (and from the red orphan ring), it stays legible
+    // even on a red failed node where a same-coloured ring would vanish.
+    if (mismatchIds.has(n.id)) {
+      ctx.setLineDash([2, 3]);
+      ctx.strokeStyle = C.mismatch;
+      ctx.lineWidth = 2;
+      ctxRoundRect(ctx, r.x - 1, r.y - 1, r.w + 2, r.h + 2, 10);
       ctx.stroke();
       ctx.setLineDash([]);
     }
@@ -1671,6 +1876,287 @@ window.addEventListener("resize", function () {
     document.body.style.userSelect = "";
     document.body.style.cursor = "";
     if (currentView === "graph") paintGraph();
+  });
+})();
+
+// ---------------------------------------------------------------------------
+// Analytics view
+// ---------------------------------------------------------------------------
+
+let analyticsJobs = [];
+let analyticsSearch = "";
+let analyticsAdvisor = "";
+let analyticsVerdict = "";
+
+function fmtPct(rate) {
+  return Math.round(rate * 100) + "%";
+}
+
+function fmtCost(value) {
+  // Small vendor-estimate figures need more precision than 2dp; larger ones
+  // read better rounded. Either way it is an estimate, labelled at the source.
+  return "$" + (value >= 1 ? value.toFixed(2) : value.toFixed(4));
+}
+
+function fmtTokens(count) {
+  return Number(count).toLocaleString();
+}
+
+function fmtDurationMs(ms) {
+  if (ms < 1000) return Math.round(ms) + "ms";
+  return fmtSeconds(ms / 1000);
+}
+
+// A job's token total, mirroring analytics._token_totals in Python: only the
+// primary input/output buckets are summed; cache/reasoning keys are subsets and
+// are skipped so they never double-count. Returns null when nothing was
+// measured (empty map) so the cell can render "not measured", never 0.
+function jobTokenTotal(usage) {
+  if (!usage) return null;
+  const keys = Object.keys(usage);
+  if (keys.length === 0) return null;
+  let total = 0;
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i];
+    const lowered = key.toLowerCase();
+    if (lowered.indexOf("cache") >= 0 || lowered.indexOf("reasoning") >= 0) continue;
+    if (lowered.indexOf("input") >= 0 || lowered.indexOf("output") >= 0) {
+      total += usage[key] || 0;
+    }
+  }
+  return total;
+}
+
+function jobCost(job) {
+  if (job.cost_source === "unknown" || !job.cost_details) return null;
+  const details = job.cost_details;
+  if (Object.keys(details).length === 0) return null;
+  if (Object.prototype.hasOwnProperty.call(details, "total")) return details.total;
+  let sum = 0;
+  for (const key in details) sum += details[key];
+  return sum;
+}
+
+// A td whose text is set via textContent — never innerHTML — so disk-sourced
+// advisor names and model ids can never inject markup.
+function textCell(text, className) {
+  const td = document.createElement("td");
+  if (className) td.className = className;
+  td.textContent = text == null ? "" : String(text);
+  return td;
+}
+
+function unmeasuredCell() {
+  const td = document.createElement("td");
+  const span = document.createElement("span");
+  span.className = "unmeasured";
+  span.textContent = "not measured";
+  td.appendChild(span);
+  return td;
+}
+
+function metricCell(mainText, subText) {
+  const td = document.createElement("td");
+  const main = document.createElement("div");
+  main.className = "metric-main";
+  main.textContent = mainText;
+  td.appendChild(main);
+  if (subText) {
+    const sub = document.createElement("div");
+    sub.className = "metric-sub";
+    sub.textContent = subText;
+    td.appendChild(sub);
+  }
+  return td;
+}
+
+function verdictSpan(verdict) {
+  const span = document.createElement("span");
+  span.className = "verdict verdict-" + verdict;
+  span.textContent = verdict;
+  return span;
+}
+
+function passRateCell(check) {
+  if (check.pass_rate == null) return unmeasuredCell();
+  return metricCell(fmtPct(check.pass_rate), check.passed + "/" + check.measured + " checked");
+}
+
+function costRollupCell(cost) {
+  if (cost.total == null) return unmeasuredCell();
+  const sub = "avg " + fmtCost(cost.mean) + (cost.source ? " · " + cost.source : "");
+  return metricCell(fmtCost(cost.total), sub);
+}
+
+function tokensRollupCell(tokens) {
+  if (tokens.total == null) return unmeasuredCell();
+  return metricCell(fmtTokens(tokens.total), fmtTokens(tokens.input) + " in / " + fmtTokens(tokens.output) + " out");
+}
+
+function durationRollupCell(duration) {
+  if (duration.mean_ms == null) return unmeasuredCell();
+  return metricCell(fmtDurationMs(duration.mean_ms), "avg of " + duration.measured_count);
+}
+
+function escalationCell(escalation) {
+  if (escalation.rate == null) return unmeasuredCell();
+  return metricCell(fmtPct(escalation.rate), escalation.escalated + "/" + escalation.failed + " failed");
+}
+
+function renderRollup(tbody, rollups, isModel) {
+  while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
+  for (let i = 0; i < rollups.length; i++) {
+    const rollup = rollups[i];
+    const tr = document.createElement("tr");
+    const label = rollup.key == null
+      ? (isModel ? "(model not reported)" : "(no advisor)")
+      : rollup.key;
+    tr.appendChild(textCell(label, "an-key"));
+    tr.appendChild(textCell(rollup.job_count, "num"));
+    tr.appendChild(passRateCell(rollup.check));
+    tr.appendChild(costRollupCell(rollup.cost));
+    tr.appendChild(tokensRollupCell(rollup.tokens));
+    tr.appendChild(durationRollupCell(rollup.duration));
+    tr.appendChild(escalationCell(rollup.escalation));
+    tbody.appendChild(tr);
+  }
+}
+
+function updateAdvisorFilter(jobs) {
+  const select = document.getElementById("an-filter-advisor");
+  const advisors = [];
+  const seen = {};
+  for (let i = 0; i < jobs.length; i++) {
+    const advisor = jobs[i].advisor;
+    if (advisor && !seen[advisor]) { seen[advisor] = true; advisors.push(advisor); }
+  }
+  advisors.sort();
+  // Rebuild only when the option set changed, so the current selection sticks.
+  const wanted = "|" + advisors.join("|");
+  if (select.getAttribute("data-advisors") === wanted) return;
+  select.setAttribute("data-advisors", wanted);
+  const current = select.value;
+  while (select.options.length > 1) select.remove(1);
+  for (let i = 0; i < advisors.length; i++) {
+    const option = document.createElement("option");
+    option.value = advisors[i];
+    option.textContent = advisors[i];
+    select.appendChild(option);
+  }
+  select.value = current;
+  if (select.value !== current) { select.value = ""; analyticsAdvisor = ""; }
+}
+
+function historyMatches(job) {
+  if (analyticsAdvisor && job.advisor !== analyticsAdvisor) return false;
+  if (analyticsVerdict && job.delegation_verdict !== analyticsVerdict) return false;
+  if (analyticsSearch) {
+    const haystack = [job.job_id, job.name, job.advisor, job.model_reported].join(" ").toLowerCase();
+    if (haystack.indexOf(analyticsSearch.toLowerCase()) < 0) return false;
+  }
+  return true;
+}
+
+function historyRow(job) {
+  const tr = document.createElement("tr");
+
+  const jobTd = document.createElement("td");
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "link-btn";
+  btn.textContent = job.job_id.length > 14 ? "…" + job.job_id.slice(-13) : job.job_id;
+  btn.title = job.job_id;
+  const targetId = job.job_id;
+  btn.onclick = function () {
+    document.getElementById("view-list").click();
+    selectJob(targetId);
+  };
+  jobTd.appendChild(btn);
+  tr.appendChild(jobTd);
+
+  tr.appendChild(textCell(job.advisor));
+  const modelTd = textCell(job.model_reported || "(not reported)");
+  if (!job.model_reported) modelTd.className = "metric-sub";
+  tr.appendChild(modelTd);
+
+  const statusTd = document.createElement("td");
+  statusTd.innerHTML = badge(job.status);
+  tr.appendChild(statusTd);
+
+  const verdictTd = document.createElement("td");
+  verdictTd.appendChild(verdictSpan(job.delegation_verdict));
+  tr.appendChild(verdictTd);
+
+  const cost = jobCost(job);
+  tr.appendChild(cost == null ? unmeasuredCell() : textCell(fmtCost(cost), "num"));
+
+  const tokens = jobTokenTotal(job.usage_details);
+  tr.appendChild(tokens == null ? unmeasuredCell() : textCell(fmtTokens(tokens), "num"));
+
+  tr.appendChild(
+    job.duration_ms == null ? unmeasuredCell() : textCell(fmtDurationMs(job.duration_ms), "num")
+  );
+
+  const started = job.started_at ? new Date(job.started_at).toLocaleString() : "-";
+  tr.appendChild(textCell(started, "metric-sub"));
+  return tr;
+}
+
+function renderHistory() {
+  const tbody = document.getElementById("an-history-body");
+  while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
+  let shown = 0;
+  for (let i = 0; i < analyticsJobs.length; i++) {
+    const job = analyticsJobs[i];
+    if (!historyMatches(job)) continue;
+    tbody.appendChild(historyRow(job));
+    shown++;
+  }
+  document.getElementById("an-history-empty").hidden = shown > 0;
+}
+
+async function refreshAnalytics() {
+  const [analyticsResponse, jobsResponse] = await Promise.all([
+    fetch("/api/analytics"),
+    fetch("/api/jobs"),
+  ]);
+  const analytics = await analyticsResponse.json();
+  const jobsPayload = await jobsResponse.json();
+  analyticsJobs = jobsPayload.jobs || [];
+
+  // Keep the adaptive poll honest even though refreshJobs did not run.
+  hasRunningJobs = false;
+  for (let i = 0; i < analyticsJobs.length; i++) {
+    if (analyticsJobs[i].status === "running" || analyticsJobs[i].status === "pending") {
+      hasRunningJobs = true;
+      break;
+    }
+  }
+
+  renderRollup(document.getElementById("an-model-body"), analytics.by_model, true);
+  document.getElementById("an-model-empty").hidden = analytics.by_model.length > 0;
+  renderRollup(document.getElementById("an-advisor-body"), analytics.by_advisor, false);
+  document.getElementById("an-advisor-empty").hidden = analytics.by_advisor.length > 0;
+
+  updateAdvisorFilter(analyticsJobs);
+  renderHistory();
+
+  document.getElementById("refreshed").textContent =
+    "refreshed " + new Date().toLocaleTimeString();
+}
+
+(function initAnalyticsFilters() {
+  document.getElementById("an-search").addEventListener("input", function () {
+    analyticsSearch = this.value;
+    renderHistory();
+  });
+  document.getElementById("an-filter-advisor").addEventListener("change", function () {
+    analyticsAdvisor = this.value;
+    renderHistory();
+  });
+  document.getElementById("an-filter-verdict").addEventListener("change", function () {
+    analyticsVerdict = this.value;
+    renderHistory();
   });
 })();
 
