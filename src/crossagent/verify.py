@@ -47,6 +47,8 @@ import json
 import os
 import subprocess
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -279,6 +281,45 @@ def verifier_env(pass_env: Optional[list[str]] = None) -> dict[str, str]:
     }
 
 
+@contextmanager
+def _schema_file(structured: bool) -> Iterator[Optional[str]]:
+    """Yield a path to a temp file holding the verdict schema, or ``None``.
+
+    Exception-safe by contract (the verifier "never raises", see
+    :func:`run_verification`): if the schema file cannot be created or written —
+    a read-only ``/tmp``, a full disk, a restricted ``TMPDIR`` in a sandbox/CI
+    container — this yields ``None`` so verification degrades to non-structured
+    mode instead of raising ``OSError`` out into the worker. The file is always
+    unlinked on exit. When *structured* is False no file is created.
+
+    The mkstemp/write is in its own try/except (setup), separate from the
+    try/finally around the yield (cleanup), so an exception the caller raises
+    while the file is in use propagates untouched and is never mistaken for a
+    setup failure.
+    """
+    if not structured:
+        yield None
+        return
+    schema_path: Optional[str] = None
+    try:
+        schema_fd, created_path = tempfile.mkstemp(
+            prefix="crossagent-verify-", suffix=".json"
+        )
+        with os.fdopen(schema_fd, "w", encoding="utf-8") as handle:
+            json.dump(_VERDICT_SCHEMA, handle)
+        schema_path = created_path
+    except OSError:
+        schema_path = None
+    try:
+        yield schema_path
+    finally:
+        if schema_path is not None:
+            try:
+                os.unlink(schema_path)
+            except OSError:
+                pass
+
+
 def run_verification(
     advisor: Advisor,
     model: Optional[str],
@@ -291,19 +332,12 @@ def run_verification(
     """Run one fresh, independent verification pass and return its outcome.
 
     Never raises: any launch or parse failure degrades to an ``error``/
-    ``unverified`` verdict — a broken verifier must never crash the worker nor
-    silently green a delegation.
+    ``unverified`` verdict, and an inability to create the temp schema file
+    degrades to non-structured mode — a broken verifier must never crash the
+    worker nor silently green a delegation.
     """
     structured = advisor.json_schema_flag is not None
-    schema_fd, schema_path = (-1, None)
-    if structured:
-        schema_fd, schema_path = tempfile.mkstemp(
-            prefix="crossagent-verify-", suffix=".json"
-        )
-    try:
-        if schema_path is not None:
-            with os.fdopen(schema_fd, "w", encoding="utf-8") as handle:
-                json.dump(_VERDICT_SCHEMA, handle)
+    with _schema_file(structured) as schema_path:
         cmd = build_verifier_command(advisor, model, schema_path=schema_path)
         _append_prompt(cmd, advisor, artifact)
         parser = parsers_mod.get_parser(advisor.result_parser)
@@ -323,12 +357,6 @@ def run_verification(
                 structured,
                 f"verifier failed to launch: {exc}",
             )
-    finally:
-        if schema_path is not None:
-            try:
-                os.unlink(schema_path)
-            except OSError:
-                pass
 
     parsed = (
         outcome.result
