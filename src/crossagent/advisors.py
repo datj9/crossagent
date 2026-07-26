@@ -46,6 +46,13 @@ class Advisor:
     result_parser: str = "text"
     resume_command: tuple[str, ...] | None = None
     session_event_field: str | None = None
+    # Flag that requests a machine-checkable JSON output contract for the
+    # independent verification pass (slice S5). ``None`` means the advisor has no
+    # such contract, so a verifier built on it degrades to parsing a JSON verdict
+    # out of the answer text (D4 graceful degradation — never a hard failure).
+    # Claude exposes ``--json-schema`` (research finding [6]: the payload lands in
+    # ``structured_output``); no other built-in advisor has a verified equivalent.
+    json_schema_flag: str | None = None
     experimental: bool = False
     notes: str = ""
 
@@ -84,6 +91,7 @@ _BUILTINS: dict[str, Advisor] = {
         session_name_flag="--name",
         fork_flag="--fork-session",
         result_parser="claude-stream",
+        json_schema_flag="--json-schema",
     ),
     "codex": Advisor(
         name="codex",
