@@ -357,7 +357,22 @@ def run_verification(
                 structured,
                 f"verifier failed to launch: {exc}",
             )
+    return _interpret_run_outcome(advisor.name, model, structured, outcome, timeout)
 
+
+def _interpret_run_outcome(
+    advisor_name: str,
+    model: Optional[str],
+    structured: bool,
+    outcome: runner_mod.RunOutcome,
+    timeout: float,
+) -> VerifyOutcome:
+    """Map a completed runner outcome to a ``VerifyOutcome``.
+
+    A timeout or a launch/parse failure degrades to ``error``; free prose with no
+    parseable verdict is ``unverified`` (inconclusive, never a pass); only a
+    machine-checkable object yields the graded ``pass``/``fail`` verdict.
+    """
     parsed = (
         outcome.result
         if isinstance(outcome.result, parsers_mod.ParsedResult)
@@ -365,7 +380,7 @@ def run_verification(
     )
     if outcome.timed_out:
         return VerifyOutcome(
-            advisor.name,
+            advisor_name,
             model,
             "error",
             structured,
@@ -373,7 +388,7 @@ def run_verification(
         )
     if parsed.failure or parsed.result is None:
         return VerifyOutcome(
-            advisor.name,
+            advisor_name,
             model,
             "error",
             structured,
@@ -384,11 +399,11 @@ def run_verification(
     if verdict_object is None:
         # Free prose with no machine-checkable verdict: inconclusive, not a pass.
         return VerifyOutcome(
-            advisor.name,
+            advisor_name,
             model,
             "unverified",
             structured,
             "verifier returned no machine-checkable verdict (free prose)",
         )
     verdict, detail = _verdict_from_object(verdict_object)
-    return VerifyOutcome(advisor.name, model, verdict, structured, detail)
+    return VerifyOutcome(advisor_name, model, verdict, structured, detail)
