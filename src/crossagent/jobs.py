@@ -71,6 +71,42 @@ class ScopeResultDict(TypedDict):
     detail: str
 
 
+# Outcome of the independent verification pass (slice S5). A FRESH peer session
+# grades the delegate's artifact supplied as user-turn input (D6), which removes
+# the implicit-authorship channel that weakens self-grading — it does NOT claim
+# to eliminate self-preference bias, which is a separate documented effect.
+#   ``pass``       — the verifier returned a machine-checkable verdict of correct.
+#   ``fail``       — the verifier returned a machine-checkable verdict of wrong.
+#   ``unverified`` — the verifier ran but produced no machine-checkable verdict
+#                    (free prose, or the advisor lacks a structured-output
+#                    contract). Treated as inconclusive, never as a pass (D4).
+#   ``error``      — the verifier could not run (no artifact, launch failure).
+# ``unverified``/``error`` are inconclusive: they never green a delegation and
+# never hard-fail it. Only ``fail`` blocks the green path.
+VerifyVerdict = Literal["pass", "fail", "unverified", "error"]
+
+
+class VerifyResultDict(TypedDict):
+    """Persisted outcome of the independent verification pass (slice S5).
+
+    ``advisor``/``model`` identify the FRESH peer session that graded the work.
+    ``verdict`` is the deterministic pass/fail/inconclusive outcome; ``structured``
+    records whether a machine-checkable contract (e.g. Claude ``--json-schema`` →
+    ``structured_output``) produced it, versus a JSON object parsed out of a prose
+    answer. ``detail`` is a human-readable summary (never the raw artifact).
+
+    A ``Job.verify_result`` of ``None`` means *no verification was requested* —
+    structurally distinct from a verification that ran and failed, or ran and
+    could not decide (D7: absent is never the same as ``fail`` or ``unverified``).
+    """
+
+    advisor: str
+    model: Optional[str]
+    verdict: VerifyVerdict
+    structured: bool
+    detail: str
+
+
 # The delegation verdict keeps "the delegate finished" separate from "the work
 # was verified" (D5). See :func:`delegation_verdict`.
 DelegationVerdict = Literal["verified", "failed", "unverified", "incomplete"]
@@ -228,6 +264,13 @@ class Job:
     # advisor child. ``None`` means the scrub did not run (a pre-S4 record); an
     # empty list means it ran and withheld nothing (D7: absent != empty).
     withheld_env: Optional[list[str]] = None
+    # --- Independent verification pass (schema v3, slice S5) -------------
+    # ``verify_result`` is the outcome of grading the delegate's artifact in a
+    # FRESH peer session (D6). ``None`` means no verification was requested —
+    # distinct from a verification that ran and failed or could not decide (D7).
+    # A ``verdict`` of ``fail`` blocks the green path; ``pass`` can green it;
+    # ``unverified``/``error`` are inconclusive. See :func:`delegation_verdict`.
+    verify_result: Optional[VerifyResultDict] = None
 
 
 def delegation_verdict(job: Job) -> DelegationVerdict:
@@ -244,25 +287,57 @@ def delegation_verdict(job: Job) -> DelegationVerdict:
       is NOT a pass: a missing gate is never green.
     - ``verified`` — the delegate finished cleanly and the check exited 0.
 
-    Slice S4 folds the diff-scope assertion into this same verdict rather than
-    adding a fifth state: a delegate that wrote outside its declared allowlist,
-    or whose adherence to that allowlist could not be determined, has not
-    produced trustworthy work — that is semantically a *failed* delegation, so
-    ``scope_result.status`` other than ``ok`` yields ``failed`` (fail closed).
-    When no scope was declared (``scope_result is None``) this gate is skipped,
-    preserving the pre-S4 four-state behaviour and its tests unchanged.
+    Slices S4 and S5 fold their gates into this same verdict rather than adding
+    new states. Every gate is combined the same way: **any failed gate blocks
+    the green path** (fail closed), at least one *passed* gate with no failures
+    greens the delegation, and a delegation with no decisive gate is
+    ``unverified`` — a missing gate is never a pass.
+
+    Per-gate mapping (a gate that was not requested contributes nothing):
+
+    - **Scope (S4, security gate):** ``violated``/``undetermined`` → fail (a
+      write outside the allowlist, or an inability to tell what changed, is never
+      trustworthy). ``ok`` is neutral — an in-bounds scope does not by itself
+      verify the *work*, so scope alone never greens a delegation.
+    - **Check (S3):** exit ``0`` → pass; any non-zero → fail.
+    - **Verify (S5):** ``pass`` → pass; ``fail`` → fail; ``unverified``/``error``
+      → neutral (inconclusive; graceful degradation per D4 — a verifier that
+      could only produce prose, or could not run, never greens and never
+      hard-fails).
+
+    A failing independent verification therefore blocks green even when the
+    shell check passed — which is the entire point of the fresh-session verifier
+    (D6). When no gate was declared this reduces to the pre-S3 behaviour and its
+    tests are unchanged.
     """
     if not is_terminal(job.status):
         return "incomplete"
     if job.status != JobState.SUCCEEDED:
         return "failed"
+
+    any_pass = False
+
     scope = job.scope_result
     if scope is not None and scope.get("status") != "ok":
         return "failed"
+
     check = job.check_result
-    if check is None:
-        return "unverified"
-    return "verified" if check.get("exit_code") == 0 else "failed"
+    if check is not None:
+        if check.get("exit_code") == 0:
+            any_pass = True
+        else:
+            return "failed"
+
+    verify = job.verify_result
+    if verify is not None:
+        verdict = verify.get("verdict")
+        if verdict == "pass":
+            any_pass = True
+        elif verdict == "fail":
+            return "failed"
+        # "unverified"/"error" are inconclusive: neither green nor a hard fail.
+
+    return "verified" if any_pass else "unverified"
 
 
 # ---------------------------------------------------------------------------
@@ -594,6 +669,7 @@ def runtime_status(job: Job) -> dict[str, Any]:
         "check_result": job.check_result,
         "scope_result": job.scope_result,
         "withheld_env": job.withheld_env,
+        "verify_result": job.verify_result,
         "delegation_verdict": delegation_verdict(job),
     }
 
