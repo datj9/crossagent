@@ -182,6 +182,36 @@ def extract_codex_metrics(event: Any) -> AdvisorMetrics:
     )
 
 
+def extract_commandcode_metrics(
+    event: Any, *, model: Optional[str] = None
+) -> AdvisorMetrics:
+    """Extract telemetry from a CommandCode ``result`` event.
+
+    CommandCode's JSON mode (``-p --output-format json``) ends with a final
+    ``type:"result"`` line whose ``usage`` object carries **camelCase** token
+    counts (``inputTokens``, ``outputTokens``, ``cacheReadTokens``,
+    ``cacheWriteTokens``), plus a top-level ``durationMs``. It emits **no cost**
+    at all — verified live on CommandCode 1.4.1 (S2 probe / re-measured here) —
+    so cost stays *unknown* (a later slice may compute it from a price table).
+    The resolved model id rides on separate ``model_request_*`` events, so it is
+    passed in as *model*. Parses defensively (D4): a missing, renamed, or
+    wrong-typed field degrades to *unknown* and never raises.
+    """
+    if not isinstance(event, dict):
+        return AdvisorMetrics()
+
+    usage = event.get("usage")
+    usage_details = _usage_from_mapping(usage) if isinstance(usage, dict) else {}
+
+    return AdvisorMetrics(
+        usage_details=usage_details,
+        cost_details={},
+        duration_ms=_coerce_duration_ms(event.get("durationMs")),
+        cost_source="unknown",
+        model_reported=_extract_model(event, model),
+    )
+
+
 def _parsed_with_metrics(metrics: AdvisorMetrics, **fields: Any) -> "ParsedResult":
     """Build a ``ParsedResult`` carrying *fields* plus the extracted *metrics*."""
     return ParsedResult(
@@ -480,10 +510,99 @@ class CodexJsonlParser(EventParser):
 
 
 # ---------------------------------------------------------------------------
+# CommandCode JSON parser
+# ---------------------------------------------------------------------------
+
+
+class CommandCodeJsonParser(EventParser):
+    """Parse CommandCode's ``-p --output-format json`` NDJSON event stream.
+
+    The stream is a run of ``{"type":"event","event":{...}}`` progress lines
+    followed by a single top-level ``{"type":"result",...}`` line that carries
+    the answer (``finalText``), ``usage`` (camelCase token counts), a
+    ``durationMs``, and the ``sessionId``. The resolved model id appears on
+    ``model_request_start`` / ``model_request_end`` events — top level on
+    CommandCode 1.3.1, wrapped under ``event`` on 1.4.1; both envelopes are
+    read. Non-JSON stdout lines (e.g. a ``[update-notice]`` banner) are echoed
+    to stderr and skipped, never dropped silently or allowed to crash the run.
+    """
+
+    def __init__(self, on_activity: Optional[Callable[[str], None]] = None) -> None:
+        super().__init__(on_activity)
+        self._final: dict[str, Any] | None = None
+        self._model: Optional[str] = None
+
+    def consume_stdout(self, line: str) -> None:
+        stripped = line.strip()
+        if not stripped:
+            return
+        try:
+            event = json.loads(stripped)
+        except json.JSONDecodeError:
+            print(
+                f"[crossagent] commandcode non-json: {stripped[:240]}",
+                file=sys.stderr,
+            )
+            return
+        if not isinstance(event, dict):
+            return
+        self._track_model(event)
+        if event.get("type") == "result":
+            self._final = event
+            self._summarize(event)
+        self._activity("stdout")
+
+    def finish(self, exit_code: int) -> ParsedResult:
+        if self._final is None:
+            return ParsedResult(
+                failure=True,
+                error="No result event received from CommandCode",
+            )
+        metrics = extract_commandcode_metrics(self._final, model=self._model)
+        session_id = self._final.get("sessionId")
+        if exit_code != 0:
+            return _parsed_with_metrics(
+                metrics,
+                failure=True,
+                error=f"CommandCode exited with code {exit_code}",
+                session_id=session_id,
+            )
+        final_text = self._final.get("finalText")
+        if isinstance(final_text, str):
+            return _parsed_with_metrics(
+                metrics, result=final_text, session_id=session_id
+            )
+        return _parsed_with_metrics(
+            metrics,
+            failure=True,
+            error="Result event contained no answer",
+            session_id=session_id,
+        )
+
+    def _track_model(self, event: dict[str, Any]) -> None:
+        # The resolved model rides on model_request_* events. In 1.4.1 those are
+        # wrapped as {"type":"event","event":{...}}; in 1.3.1 they were top
+        # level. Read the model from whichever envelope carries it.
+        inner = event.get("event")
+        payload = inner if isinstance(inner, dict) else event
+        if payload.get("type") in ("model_request_start", "model_request_end"):
+            model = payload.get("model")
+            if isinstance(model, str) and model:
+                self._model = model
+
+    def _summarize(self, event: dict[str, Any]) -> None:
+        print(
+            f"[crossagent] commandcode result subtype={event.get('subtype')} "
+            f"session={event.get('sessionId')} durationMs={event.get('durationMs')}",
+            file=sys.stderr,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
-PARSER_NAMES = {"text", "claude-stream", "codex-jsonl"}
+PARSER_NAMES = {"text", "claude-stream", "codex-jsonl", "commandcode-json"}
 
 
 def get_parser(
@@ -498,6 +617,8 @@ def get_parser(
         return ClaudeStreamParser(on_activity=on_activity)
     if name == "codex-jsonl":
         return CodexJsonlParser(on_activity=on_activity)
+    if name == "commandcode-json":
+        return CommandCodeJsonParser(on_activity=on_activity)
     raise ValueError(
         f"Unknown parser '{name}'. Known parsers: {', '.join(sorted(PARSER_NAMES))}"
     )
