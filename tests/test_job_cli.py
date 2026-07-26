@@ -949,6 +949,56 @@ def test_start_without_check_records_none(state_dir, fake_codex_in_path, capsys)
     assert jobs_mod.delegation_verdict(job) == "unverified"
 
 
+def test_start_writes_scope_paths_and_pass_env_into_command_json(
+    state_dir, fake_codex_in_path, capsys
+):
+    code = main(
+        [
+            "start",
+            "--agent",
+            "codex",
+            "--prompt",
+            "hi",
+            "--allow-path",
+            "src",
+            "--allow-path",
+            "tests",
+            "--pass-env",
+            "ANTHROPIC_API_KEY",
+            "--json",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    job_id = json.loads(captured.out)["job_id"]
+    _wait_for_terminal(job_id)
+
+    command_path = (
+        jobs_mod.job_dir_path(jobs_mod.default_state_root(), job_id) / "command.json"
+    )
+    info = json.loads(command_path.read_text(encoding="utf-8"))
+    assert info["scope_paths"] == ["src", "tests"]
+    assert info["pass_env"] == ["ANTHROPIC_API_KEY"]
+
+
+def test_start_without_allow_path_records_none_scope(
+    state_dir, fake_codex_in_path, capsys
+):
+    """No --allow-path -> scope_paths null (enforcement off), distinct from []."""
+    code = main(["start", "--agent", "codex", "--prompt", "hi", "--json"])
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    job_id = json.loads(captured.out)["job_id"]
+    _wait_for_terminal(job_id)
+
+    command_path = (
+        jobs_mod.job_dir_path(jobs_mod.default_state_root(), job_id) / "command.json"
+    )
+    info = json.loads(command_path.read_text(encoding="utf-8"))
+    assert info["scope_paths"] is None
+    assert info["pass_env"] == []
+
+
 def test_require_complete_fails_on_failed_check(state_dir, fake_codex_in_path, capsys):
     """A delegate that exits 0 but whose check fails must NOT pass the
     --require-complete gate (D5)."""
