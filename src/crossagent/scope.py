@@ -47,7 +47,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from .jobs import ScopeResultDict, ScopeStatus
+from .types import ScopeResultDict, ScopeStatus
 
 _GIT_TIMEOUT_SECONDS = 30.0
 # porcelain -z entries are "XY <path>": two status chars, a space, then the path.
