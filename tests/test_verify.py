@@ -187,6 +187,27 @@ def test_run_verification_no_result_is_error(tmp_path):
     assert outcome.verdict == "error"
 
 
+def test_run_verification_survives_schema_temp_file_failure(tmp_path, monkeypatch):
+    """HIGH 2: a read-only /tmp, a full disk, or a restricted TMPDIR makes
+    ``tempfile.mkstemp`` raise OSError. That must degrade to non-structured mode,
+    never propagate out of ``run_verification`` (which promises never to raise)
+    and crash the worker after the delegate already did its work."""
+
+    def _boom(*args, **kwargs):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(verify_mod.tempfile, "mkstemp", _boom)
+    advisor = _structured_advisor(tmp_path, "pass")
+
+    # Must not raise despite mkstemp failing:
+    outcome = run_verification(advisor, None, "ARTIFACT", cwd=str(tmp_path))
+
+    assert isinstance(outcome, VerifyOutcome)
+    # Degraded gracefully: without the schema flag the fake advisor still emitted
+    # a JSON verdict, which is parsed out of the answer.
+    assert outcome.verdict == "pass"
+
+
 def test_run_verification_never_raises_on_missing_executable(tmp_path):
     advisor = Advisor(
         name="ghost",

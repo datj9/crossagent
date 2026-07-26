@@ -780,6 +780,46 @@ def test_worker_verify_audit_event_records_verdict_not_artifact(tmp_path, monkey
     assert verify_events[0]["advisor"] == "myverifier"
 
 
+def test_worker_persists_terminal_record_when_verify_schema_temp_file_fails(
+    tmp_path, monkeypatch
+):
+    """HIGH 2: if the verifier's schema temp file cannot be created — read-only
+    /tmp, full disk, restricted TMPDIR — the OSError must NOT propagate out of
+    run_verification into the worker after the check + scope gates already ran.
+    Otherwise the terminal transition never persists and the job is wedged
+    non-terminal forever with the delegate's real work destroyed. The worker must
+    still reach and persist a terminal record."""
+    import tempfile
+
+    from crossagent import verify as verify_mod
+
+    verifier = _fake_verifier(tmp_path, "pass")  # structured -> mkstemp attempted
+    monkeypatch.setattr(
+        "crossagent.advisors.resolve", lambda name, config_path=None: verifier
+    )
+
+    # Fail ONLY the verifier's schema temp file; leave the state-persistence
+    # temp files (a different prefix) working, so this isolates the verify path.
+    real_mkstemp = tempfile.mkstemp
+
+    def _selective_mkstemp(*args, **kwargs):
+        if kwargs.get("prefix", "").startswith("crossagent-verify-"):
+            raise OSError("read-only file system")
+        return real_mkstemp(*args, **kwargs)
+
+    monkeypatch.setattr(verify_mod.tempfile, "mkstemp", _selective_mkstemp)
+
+    job = _run_job_through_worker(tmp_path, _RESULT_OK, verify_with="myverifier")
+
+    # The worker reached a terminal state and recorded the verification, rather
+    # than crashing after the delegate's work with the job left non-terminal.
+    assert jobs_mod.is_terminal(job.status)
+    assert job.status == JobState.SUCCEEDED
+    assert job.verify_result is not None
+    # Degraded to non-structured mode: the verdict still parsed from the answer.
+    assert job.verify_result["verdict"] == "pass"
+
+
 def test_worker_escalates_failed_delegation_end_to_end(tmp_path, monkeypatch):
     """A failed delegation (failing check) with an escalation ladder spawns a
     same-trace child with parent_job_id set — the exact shape analytics counts."""
