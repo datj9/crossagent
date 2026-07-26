@@ -111,10 +111,30 @@ def maybe_escalate(
     """Re-dispatch a *failed* delegation to the next ladder rung, if any.
 
     Returns the spawned child's job id, or ``None`` when nothing was escalated
-    (the delegation did not fail, no rungs remain, the rung advisor is unknown,
-    or the depth cap was reached). Never raises: an escalation that cannot be
-    launched is recorded and skipped, never allowed to crash the worker.
+    (the delegate did not finish cleanly, no declared gate failed, no rungs
+    remain, the rung advisor is unknown, or the depth cap was reached). Never
+    raises: an escalation that cannot be launched is recorded and skipped, never
+    allowed to crash the worker.
     """
+    # Escalation re-dispatches a delegate that FINISHED but whose work FAILED a
+    # declared gate — a failing check, a scope violation, or a failing
+    # verification (this module's stated scope). A job that did not finish
+    # cleanly is deliberately out of scope, so gate on SUCCEEDED first rather
+    # than on ``delegation_verdict != "failed"`` alone (which also returns
+    # "failed" for CANCELLED / TIMED_OUT / a crashed delegate):
+    #   * CANCELLED is explicit user intent to stop; re-dispatching to a larger,
+    #     costlier peer is the opposite of cancelling and spends real money.
+    #   * TIMED_OUT (and any other non-success terminal status) produced no
+    #     graded artifact — there is no gate failure to escalate, and a bigger
+    #     model is generally slower, so it is at least as likely to time out
+    #     again under the same budget. A hard task that needs a bigger model is a
+    #     fresh dispatch decision, not an automatic ladder climb that silently
+    #     burns budget. So TIMED_OUT does NOT escalate.
+    # Gating on SUCCEEDED means ``delegation_verdict == "failed"`` below can only
+    # be a declared-gate failure — mirroring cli._failed_reason's "did not finish
+    # cleanly" vs. gate-failure distinction.
+    if failed_job.status != jobs_mod.JobState.SUCCEEDED:
+        return None
     if delegation_verdict(failed_job) != "failed":
         return None
 
@@ -145,41 +165,49 @@ def maybe_escalate(
         _audit_skip(job_dir, reason=f"escalation halted: {exc}")
         return None
 
-    child_dir = jobs_mod.create_job_dir(state_root, child_id)
-    _write_child_prompt(child_dir, prompt)
-    _write_child_command(
-        child_dir,
-        advisor=advisor,
-        model=model,
-        cwd=cwd,
-        registry_path=registry_path,
-        check=check,
-        check_timeout=check_timeout,
-        scope_paths=scope_paths,
-        pass_env=pass_env,
-        verify_with=verify_with,
-        verify_model=verify_model,
-        escalate_to=remaining,
-    )
-    child = Job(
-        job_id=child_id,
-        status=jobs_mod.JobState.PENDING,
-        advisor=advisor.name,
-        name="",
-        cwd=cwd,
-        redacted_command="",
-        started_at=_now(),
-        updated_at=_now(),
-        last_activity_at=_now(),
-        last_event="escalation.created",
-        max_runtime_seconds=failed_job.max_runtime_seconds,
-        termination_grace_seconds=failed_job.termination_grace_seconds,
-        parent_job_id=parent_id,
-        trace_id=trace_id,
-        orchestrator_label=label,
-        nesting_depth=depth,
-    )
-    jobs_mod.save_state(child_dir, child)
+    # Staging the child on disk touches the filesystem (mkdir, two file writes,
+    # a state save). A read-only or full disk raises OSError; catch it here so
+    # the "never raises" contract holds — a child that cannot be staged is
+    # recorded and skipped, exactly like a launch failure below.
+    try:
+        child_dir = jobs_mod.create_job_dir(state_root, child_id)
+        _write_child_prompt(child_dir, prompt)
+        _write_child_command(
+            child_dir,
+            advisor=advisor,
+            model=model,
+            cwd=cwd,
+            registry_path=registry_path,
+            check=check,
+            check_timeout=check_timeout,
+            scope_paths=scope_paths,
+            pass_env=pass_env,
+            verify_with=verify_with,
+            verify_model=verify_model,
+            escalate_to=remaining,
+        )
+        child = Job(
+            job_id=child_id,
+            status=jobs_mod.JobState.PENDING,
+            advisor=advisor.name,
+            name="",
+            cwd=cwd,
+            redacted_command="",
+            started_at=_now(),
+            updated_at=_now(),
+            last_activity_at=_now(),
+            last_event="escalation.created",
+            max_runtime_seconds=failed_job.max_runtime_seconds,
+            termination_grace_seconds=failed_job.termination_grace_seconds,
+            parent_job_id=parent_id,
+            trace_id=trace_id,
+            orchestrator_label=label,
+            nesting_depth=depth,
+        )
+        jobs_mod.save_state(child_dir, child)
+    except OSError as exc:
+        _audit_skip(job_dir, reason=f"escalation could not be staged: {exc}")
+        return None
 
     jobs_mod.append_event(
         job_dir,
