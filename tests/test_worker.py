@@ -131,12 +131,16 @@ def _run_job_through_worker(
     check: str | None = None,
     check_timeout: float = 30.0,
     pass_env: list[str] | None = None,
+    verify_with: str | None = None,
+    verify_model: str | None = None,
+    escalate_to: list[str] | None = None,
 ) -> Job:
     """Set up a job whose advisor is a fake claude-stream script, run the
     worker synchronously, and return the Job reloaded from disk.
 
     When *check* is given it is written into command.json so the worker runs
-    the S3 check-gate after the delegate finishes."""
+    the S3 check-gate after the delegate finishes. ``verify_with`` /
+    ``escalate_to`` drive the S5 verification pass and escalation ladder."""
     state_dir = tmp_path / "state"
     job_dir = jobs_mod.create_job_dir(state_dir, job_id)
 
@@ -153,6 +157,8 @@ def _run_job_through_worker(
             cwd=str(tmp_path),
             started_at=now,
             updated_at=now,
+            trace_id=f"trace_{job_id}",
+            nesting_depth=1,
         ),
     )
     (job_dir / "prompt").write_text("hello", encoding="utf-8")
@@ -172,6 +178,11 @@ def _run_job_through_worker(
         command_info["check_timeout"] = check_timeout
     if pass_env is not None:
         command_info["pass_env"] = pass_env
+    if verify_with is not None:
+        command_info["verify_with"] = verify_with
+        command_info["verify_model"] = verify_model
+    if escalate_to is not None:
+        command_info["escalate_to"] = escalate_to
     jobs_mod.atomic_json_write(command_info, job_dir / "command.json")
 
     exit_code = worker_main(job_id, state_dir)
@@ -635,3 +646,173 @@ def test_scope_module_importable_without_error():
     # Guard: the module and its git timeout constant are wired.
     assert scope_mod._GIT_TIMEOUT_SECONDS > 0
     assert pytest is not None
+
+
+# =========================================================================
+# End-to-end independent verification + escalation (slice S5): drive a real
+# job through worker_main and reload state from disk. A unit test over the
+# combiner alone would not catch the worker forgetting to forward the verify
+# result or to spawn the escalation child — this drives the whole path.
+# =========================================================================
+
+from crossagent.advisors import Advisor  # noqa: E402
+
+
+def _fake_verifier(
+    tmp_path: Path, verdict: str, *, record_argv: bool = False
+) -> Advisor:
+    """A fake claude-style verifier advisor emitting a structured verdict."""
+    record = (
+        "import sys\n"
+        "open('verifier_argv.json','w').write(__import__('json').dumps(sys.argv))\n"
+        if record_argv
+        else ""
+    )
+    script = tmp_path / "fake_verifier.py"
+    script.write_text(
+        record
+        + "import json\n"
+        + "print(json.dumps({'type':'result','subtype':'success',"
+        + f"'structured_output': {{'verdict': {verdict!r}, 'reason': 'because'}}}}))\n",
+        encoding="utf-8",
+    )
+    return Advisor(
+        name="myverifier",
+        executable=sys.executable,
+        base_args=(str(script),),
+        prompt_delivery="positional",
+        result_parser="claude-stream",
+        json_args=(),
+        json_schema_flag="--json-schema",
+    )
+
+
+def test_worker_verification_fail_blocks_green_end_to_end(tmp_path, monkeypatch):
+    """A structured 'fail' from the fresh verifier is persisted and drives the
+    delegation verdict to failed even though the delegate exited 0 (D6)."""
+    verifier = _fake_verifier(tmp_path, "fail")
+    monkeypatch.setattr(
+        "crossagent.advisors.resolve", lambda name, config_path=None: verifier
+    )
+
+    job = _run_job_through_worker(tmp_path, _RESULT_OK, verify_with="myverifier")
+
+    assert job.status == JobState.SUCCEEDED  # the delegate DID finish
+    assert job.verify_result is not None
+    assert job.verify_result["verdict"] == "fail"
+    assert job.verify_result["advisor"] == "myverifier"
+    assert jobs_mod.delegation_verdict(job) == "failed"
+
+
+def test_worker_verification_pass_yields_verified_end_to_end(tmp_path, monkeypatch):
+    verifier = _fake_verifier(tmp_path, "pass")
+    monkeypatch.setattr(
+        "crossagent.advisors.resolve", lambda name, config_path=None: verifier
+    )
+
+    job = _run_job_through_worker(tmp_path, _RESULT_OK, verify_with="myverifier")
+
+    assert job.verify_result["verdict"] == "pass"
+    assert job.verify_result["structured"] is True
+    assert jobs_mod.delegation_verdict(job) == "verified"
+
+
+def test_worker_verifier_session_is_fresh_and_artifact_is_user_turn(
+    tmp_path, monkeypatch
+):
+    """The verifier subprocess receives NO session-attachment flag (fresh
+    session) and the artifact as its final positional argument (user turn)."""
+    verifier = _fake_verifier(tmp_path, "pass", record_argv=True)
+    monkeypatch.setattr(
+        "crossagent.advisors.resolve", lambda name, config_path=None: verifier
+    )
+
+    _run_job_through_worker(tmp_path, _RESULT_OK, verify_with="myverifier")
+
+    argv = json.loads((tmp_path / "verifier_argv.json").read_text())
+    for flag in ("--resume", "--fork-session", "--name"):
+        assert flag not in argv, flag
+    # The artifact is the LAST argument (user-turn input), and it embeds the
+    # delegate's answer rather than arriving as prior assistant context.
+    assert "DELEGATE'S ANSWER" in argv[-1]
+    assert "ok" in argv[-1]
+
+
+def test_worker_unverified_verifier_does_not_green_end_to_end(tmp_path, monkeypatch):
+    """A prose-only verifier (no structured verdict) degrades to unverified: it
+    neither greens nor hard-fails the delegation."""
+    prose = tmp_path / "fake_prose_verifier.py"
+    prose.write_text("print('looks fine to me')\n", encoding="utf-8")
+    verifier = Advisor(
+        name="prosever",
+        executable=sys.executable,
+        base_args=(str(prose),),
+        prompt_delivery="positional",
+        result_parser="text",
+        json_schema_flag=None,
+    )
+    monkeypatch.setattr(
+        "crossagent.advisors.resolve", lambda name, config_path=None: verifier
+    )
+
+    job = _run_job_through_worker(tmp_path, _RESULT_OK, verify_with="prosever")
+
+    assert job.verify_result["verdict"] == "unverified"
+    assert jobs_mod.delegation_verdict(job) == "unverified"
+
+
+def test_worker_verify_audit_event_records_verdict_not_artifact(tmp_path, monkeypatch):
+    verifier = _fake_verifier(tmp_path, "fail")
+    monkeypatch.setattr(
+        "crossagent.advisors.resolve", lambda name, config_path=None: verifier
+    )
+    _run_job_through_worker(tmp_path, _RESULT_OK, verify_with="myverifier")
+
+    events_path = tmp_path / "state" / "job_e2e" / "events.jsonl"
+    lines = [
+        json.loads(line)
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    verify_events = [event for event in lines if event.get("event") == "verify"]
+    assert len(verify_events) == 1
+    assert verify_events[0]["verdict"] == "fail"
+    assert verify_events[0]["advisor"] == "myverifier"
+
+
+def test_worker_escalates_failed_delegation_end_to_end(tmp_path, monkeypatch):
+    """A failed delegation (failing check) with an escalation ladder spawns a
+    same-trace child with parent_job_id set — the exact shape analytics counts."""
+    spawned: list[tuple[str, Path]] = []
+    monkeypatch.setattr(
+        "crossagent.escalate._default_launcher",
+        lambda child_id, state_root: spawned.append((child_id, state_root)),
+    )
+
+    job = _run_job_through_worker(
+        tmp_path, _RESULT_OK, check=_check_cmd(1), escalate_to=["codex:gpt-5.6-sol"]
+    )
+
+    assert jobs_mod.delegation_verdict(job) == "failed"
+    assert len(spawned) == 1
+    child_id, _ = spawned[0]
+    child = jobs_mod.load_state(tmp_path / "state" / child_id)
+    assert child.parent_job_id == job.job_id
+    assert child.trace_id == job.trace_id  # SAME trace (option a)
+    assert child.nesting_depth == 2
+    assert child.advisor == "codex"
+
+
+def test_worker_does_not_escalate_a_passing_delegation(tmp_path, monkeypatch):
+    spawned: list[tuple[str, Path]] = []
+    monkeypatch.setattr(
+        "crossagent.escalate._default_launcher",
+        lambda child_id, state_root: spawned.append((child_id, state_root)),
+    )
+
+    job = _run_job_through_worker(
+        tmp_path, _RESULT_OK, check=_check_cmd(0), escalate_to=["codex"]
+    )
+
+    assert jobs_mod.delegation_verdict(job) == "verified"
+    assert spawned == []
