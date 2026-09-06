@@ -60,6 +60,10 @@ class _JobCommand:
     verify_with: Optional[str]
     verify_model: Optional[str]
     escalate_to: list[str]
+    # Semantic delegation mode ("write"/"plan"/None). The original job's command
+    # already has the expanded permission flags baked into ``command``; ``mode`` is
+    # carried so an escalation can re-expand the intent against the child advisor.
+    mode: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +298,7 @@ def worker_main(job_id: str, state_dir: Path) -> int:
         pass_env=command.pass_env,
         verify_with=command.verify_with,
         verify_model=command.verify_model,
+        mode=command.mode,
     )
 
     return 0
@@ -442,6 +447,7 @@ def _load_command(job_dir: Path) -> _JobCommand:
         verify_with=data.get("verify_with"),
         verify_model=data.get("verify_model"),
         escalate_to=[str(rung) for rung in data.get("escalate_to", [])],
+        mode=data.get("mode"),
     )
 
 
