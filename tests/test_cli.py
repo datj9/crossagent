@@ -236,3 +236,92 @@ def test_short_version_flag_prints_version_and_exits(capsys):
 
     assert excinfo.value.code == 0
     assert capsys.readouterr().out.strip() == f"crossagent {__version__}"
+
+
+# ---------------------------------------------------------------------------
+# Delegation permission mode (--write / --plan) expansion
+# ---------------------------------------------------------------------------
+
+from crossagent.cli import ModeError  # noqa: E402
+
+
+def _reg():
+    return {"sessions": {}}
+
+
+def test_no_mode_adds_no_permission_flags():
+    cmd, _ = build_command(advisors.resolve("commandcode"), _args(), _reg())
+    assert "--permission-mode" not in cmd
+    assert "--plan" not in cmd
+
+
+def test_write_mode_expands_commandcode_to_bypass():
+    # auto-accept is NOT enough in commandcode -p mode (write tools stay blocked);
+    # the write contract is the full permission bypass.
+    cmd, _ = build_command(advisors.resolve("commandcode"), _args(write=True), _reg())
+    assert "--yolo" in cmd
+
+
+def test_plan_mode_expands_commandcode():
+    cmd, _ = build_command(advisors.resolve("commandcode"), _args(plan=True), _reg())
+    assert "--plan" in cmd
+
+
+def test_write_mode_expands_opencode_to_auto():
+    cmd, _ = build_command(advisors.resolve("opencode"), _args(write=True), _reg())
+    assert "--auto" in cmd
+
+
+def test_plan_mode_expands_opencode_to_agent_plan():
+    cmd, _ = build_command(advisors.resolve("opencode"), _args(plan=True), _reg())
+    assert cmd[cmd.index("--agent") + 1] == "plan"
+
+
+def test_write_mode_expands_claude_to_bypass():
+    cmd, _ = build_command(advisors.resolve("claude"), _args(write=True), _reg())
+    assert cmd[cmd.index("--permission-mode") + 1] == "bypassPermissions"
+
+
+def test_write_mode_on_codex_opts_into_workspace_write():
+    # Stock codex exec is read-only; --write must opt into workspace-write.
+    cmd, _ = build_command(advisors.resolve("codex"), _args(write=True), _reg())
+    assert cmd[cmd.index("--sandbox") + 1] == "workspace-write"
+
+
+def test_plan_mode_on_codex_pins_read_only():
+    cmd, _ = build_command(advisors.resolve("codex"), _args(plan=True), _reg())
+    assert cmd[cmd.index("--sandbox") + 1] == "read-only"
+
+
+def test_write_mode_on_readonly_advisor_raises():
+    with pytest.raises(ModeError):
+        build_command(advisors.resolve("gemini"), _args(write=True), _reg())
+
+
+def test_plan_mode_on_advisor_without_plan_flags_warns_not_raises(capsys):
+    cmd, _ = build_command(advisors.resolve("gemini"), _args(plan=True), _reg())
+    # No plan flags to add, but no error: read-only is the safe default.
+    assert "--plan" not in cmd
+    assert "no distinct plan mode" in capsys.readouterr().err
+
+
+def test_write_and_permission_mode_are_mutually_exclusive():
+    with pytest.raises(SystemExit):
+        parse_args(["--write", "--permission-mode", "plan"])
+
+
+def test_write_and_plan_are_mutually_exclusive():
+    with pytest.raises(SystemExit):
+        parse_args(["--write", "--plan"])
+
+
+def test_explicit_permission_mode_still_works_for_claude():
+    cmd, _ = build_command(
+        advisors.resolve("claude"), _args(permission_mode="acceptEdits"), _reg()
+    )
+    assert cmd[cmd.index("--permission-mode") + 1] == "acceptEdits"
+
+
+def test_foreground_write_without_allow_path_warns(capsys):
+    build_command(advisors.resolve("commandcode"), _args(write=True), _reg())
+    assert "unbounded filesystem access" in capsys.readouterr().err

@@ -642,6 +642,28 @@ def test_worker_v2_record_without_s4_fields_still_loads(tmp_path):
     assert jobs_mod.delegation_verdict(loaded) == "unverified"
 
 
+def test_load_command_reads_delegation_mode(tmp_path):
+    """The semantic mode round-trips from command.json so the worker can hand it
+    to escalation. A missing mode (pre-mode record) loads as None."""
+    from crossagent.worker import _load_command
+
+    job_dir = jobs_mod.create_job_dir(tmp_path / "state", "job_mode")
+    base = {
+        "command": ["commandcode", "-p"],
+        "prompt_delivery": "positional",
+        "cwd": str(tmp_path),
+        "result_parser": "text",
+        "registry_path": str(tmp_path / "sessions.json"),
+        "key": "",
+        "advisor": "commandcode",
+    }
+    jobs_mod.atomic_json_write({**base, "mode": "write"}, job_dir / "command.json")
+    assert _load_command(job_dir).mode == "write"
+
+    jobs_mod.atomic_json_write(base, job_dir / "command.json")
+    assert _load_command(job_dir).mode is None
+
+
 def test_scope_module_importable_without_error():
     # Guard: the module and its git timeout constant are wired.
     assert scope_mod._GIT_TIMEOUT_SECONDS > 0

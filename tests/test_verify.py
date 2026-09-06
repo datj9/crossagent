@@ -35,6 +35,17 @@ def test_verifier_command_has_no_session_flags():
         assert flag not in cmd, flag
 
 
+def test_verifier_command_never_grants_write_mode():
+    """The verifier only reads the delegate's artifact; the delegate's --write
+    mode must never leak into the grading session. build_verifier_command takes
+    no mode, so no write flag can appear regardless of the delegate's mode."""
+    for name in ("claude", "commandcode", "opencode"):
+        cmd = build_verifier_command(resolve(name), None)
+        assert "bypassPermissions" not in cmd
+        assert "auto-accept" not in cmd
+        assert "--auto" not in cmd
+
+
 def test_verifier_command_requests_structured_output_when_supported():
     claude = resolve("claude")
     cmd = build_verifier_command(claude, None, schema_path="/tmp/schema.json")

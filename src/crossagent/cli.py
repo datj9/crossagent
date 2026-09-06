@@ -30,6 +30,14 @@ from . import worker as worker_mod
 from .advisors import Advisor
 
 
+class ModeError(Exception):
+    """Raised when a requested delegation mode is impossible for the advisor.
+
+    The only case today is ``--write`` on a read-only executor. Callers turn it
+    into a clean non-zero exit with the message, never a traceback.
+    """
+
+
 def read_prompt(args: argparse.Namespace) -> str:
     if args.prompt_file:
         return Path(args.prompt_file).read_text(encoding="utf-8")
@@ -78,6 +86,7 @@ def build_command(
         cmd.append("--safe-mode")
     if args.permission_mode:
         cmd.extend(["--permission-mode", args.permission_mode])
+    _apply_mode(cmd, advisor, args)
     if args.tools is not None:
         cmd.extend(["--tools", args.tools])
     for allowed in args.allowed_tools:
@@ -195,7 +204,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=[],
         help="Claude: repeatable --allowedTools value.",
     )
-    parser.add_argument("--permission-mode", help="Claude: --permission-mode value.")
+    _add_mode_args(parser)
     parser.add_argument("--system-prompt", help="Claude: --system-prompt value.")
     parser.add_argument(
         "--raw-arg",
@@ -231,6 +240,11 @@ def _print_advisors() -> int:
         print(f"{name:14} -> {adv.executable}{tag}")
         if adv.notes:
             print(f"{'':14}    {adv.notes}")
+        write_desc = shlex.join(adv.write_args) if adv.write_args else "unsupported"
+        plan_desc = (
+            shlex.join(adv.plan_args) if adv.plan_args else "default (read-only)"
+        )
+        print(f"{'':14}    modes: write={write_desc} | plan={plan_desc}")
     return 0
 
 
@@ -273,7 +287,11 @@ def _foreground_main(argv: list[str]) -> int:
     args._prompt = read_prompt(args)
     registry_path = Path(args.registry).expanduser()
     registry = reg.load(registry_path)
-    cmd, key = build_command(advisor, args, registry)
+    try:
+        cmd, key = build_command(advisor, args, registry)
+    except ModeError as exc:
+        print(f"[crossagent] {exc}", file=sys.stderr)
+        return 2
 
     print(f"[crossagent] running: {_redacted_command(cmd)}", file=sys.stderr)
 
@@ -496,6 +514,81 @@ def _parse_job_args(subcommand: str, argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _add_mode_args(parser: argparse.ArgumentParser) -> None:
+    """Add the delegation permission-mode flags, shared by both CLI parsers.
+
+    ``--write`` / ``--plan`` are advisor-agnostic intents that crossagent expands
+    to each advisor's native permission flags (see ``Advisor.mode_args``).
+    ``--permission-mode`` remains for passing Claude's raw value directly. All
+    three are mutually exclusive: they set the same underlying concept, so
+    combining them can only express a contradiction.
+    """
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--write",
+        dest="mode",
+        action="store_const",
+        const="write",
+        help=(
+            "Delegation: put the executor in write mode (edit files / run "
+            "commands unattended). Expands per advisor (commandcode auto-accept, "
+            "opencode --auto, claude bypassPermissions, codex default). Grants "
+            "unbounded filesystem access unless bounded with --allow-path (start "
+            "path only; the foreground path has no --allow-path)."
+        ),
+    )
+    group.add_argument(
+        "--plan",
+        dest="mode",
+        action="store_const",
+        const="plan",
+        help=(
+            "Delegation: put the executor in read-only/plan mode. Expands per "
+            "advisor; advisors that are already read-only by default accept this "
+            "as a no-op."
+        ),
+    )
+    group.add_argument(
+        "--permission-mode",
+        help="Claude: pass a raw --permission-mode value (mutually exclusive with --write/--plan).",
+    )
+    parser.set_defaults(mode=None)
+
+
+def _apply_mode(cmd: list[str], advisor: Advisor, args: argparse.Namespace) -> None:
+    """Expand the requested delegation mode into ``cmd`` for *advisor*.
+
+    Raises :class:`ModeError` when ``--write`` targets a read-only executor —
+    delegating a write to an advisor that cannot write is the silent failure this
+    feature exists to prevent, so it fails loudly and early. ``--plan`` on an
+    advisor with no distinct plan flags degrades to the advisor's default (a
+    warning, never an error): read-only is a safe fallback.
+    """
+    mode = getattr(args, "mode", None)
+    if mode is None:
+        return
+    if not advisor.supports_mode(mode):
+        raise ModeError(
+            f"advisor '{advisor.name}' has no write mode: delegating a write to a "
+            f"read-only executor would fail silently. Add write_args for it in "
+            f"{advisors_mod.USER_CONFIG}, or choose a write-capable advisor."
+        )
+    extra = advisor.mode_args(mode)
+    cmd.extend(extra)
+    if mode == "plan" and not extra:
+        print(
+            f"[crossagent] advisor '{advisor.name}' has no distinct plan mode; "
+            f"using its default (already read-only).",
+            file=sys.stderr,
+        )
+    if mode == "write" and not getattr(args, "allow_path", None):
+        print(
+            "[crossagent] warning: --write without --allow-path grants the executor "
+            "unbounded filesystem access.",
+            file=sys.stderr,
+        )
+
+
 def _add_advisor_args(parser: argparse.ArgumentParser) -> None:
     """Add the same advisor/invocation flags used by the foreground CLI."""
     parser.add_argument("--agent", "--advisor", dest="agent", default="claude")
@@ -512,7 +605,7 @@ def _add_advisor_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--partial", action="store_true")
     parser.add_argument("--tools")
     parser.add_argument("--allowed-tools", action="append", default=[])
-    parser.add_argument("--permission-mode")
+    _add_mode_args(parser)
     parser.add_argument("--system-prompt")
     parser.add_argument("--raw-arg", action="append", default=[])
     parser.add_argument("--registry", default=str(reg.DEFAULT_REGISTRY))
@@ -538,7 +631,22 @@ def _cmd_start(args: argparse.Namespace) -> int:
     args._prompt = read_prompt(args)
     registry_path = Path(args.registry).expanduser()
     registry = reg.load(registry_path)
-    cmd, key = build_command(advisor, args, registry, include_prompt=False)
+    try:
+        cmd, key = build_command(advisor, args, registry, include_prompt=False)
+    except ModeError as exc:
+        print(f"[crossagent] {exc}", file=sys.stderr)
+        return 2
+
+    # A raw --permission-mode is a Claude-specific literal flag, not a semantic
+    # mode, so it is NOT re-expanded onto escalation rungs (which may be other
+    # advisors). Combined with --escalate-to that means a failed write would
+    # escalate read-only. Steer the caller to --write/--plan, which do propagate.
+    if getattr(args, "permission_mode", None) and getattr(args, "escalate_to", None):
+        print(
+            "[crossagent] warning: --permission-mode does not propagate to "
+            "--escalate-to rungs; use --write/--plan so the mode carries to each rung.",
+            file=sys.stderr,
+        )
 
     state_root = jobs_mod.default_state_root()
     job_id = jobs_mod.generate_job_id()
@@ -976,6 +1084,10 @@ def _write_command_info(
         "verify_with": getattr(args, "verify_with", None),
         "verify_model": getattr(args, "verify_model", None),
         "escalate_to": getattr(args, "escalate_to", None) or [],
+        # Semantic delegation mode ("write"/"plan"/None). Persisted so escalation
+        # can re-expand it against the *child's* advisor rather than replaying the
+        # parent's literal permission flags (which are advisor-specific).
+        "mode": getattr(args, "mode", None),
     }
     jobs_mod.atomic_json_write(info, job_dir / "command.json")
 

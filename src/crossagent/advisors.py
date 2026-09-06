@@ -53,8 +53,41 @@ class Advisor:
     # Claude exposes ``--json-schema`` (research finding [6]: the payload lands in
     # ``structured_output``); no other built-in advisor has a verified equivalent.
     json_schema_flag: str | None = None
+    # Permission-mode expansion for delegation (write vs plan). ``--write`` and
+    # ``--plan`` are advisor-agnostic *intents*; each advisor declares the concrete
+    # flags that realise them so an orchestrator (or the escalation ladder) never
+    # has to know an advisor's native permission syntax. An empty tuple means the
+    # advisor has no distinct flags for that intent: ``--plan`` degrades to the
+    # advisor's default (already read-only for most), while ``--write`` on an
+    # empty ``write_args`` is a hard error (delegating a write to a read-only
+    # executor is the exact silent failure this feature exists to prevent).
+    write_args: tuple[str, ...] = ()
+    plan_args: tuple[str, ...] = ()
     experimental: bool = False
     notes: str = ""
+
+    def mode_args(self, mode: str | None) -> tuple[str, ...]:
+        """Return the concrete flags that realise a delegation *mode* intent.
+
+        ``None`` -> no mode requested -> no extra flags (advisor native default).
+        ``"write"`` -> ``write_args``; ``"plan"`` -> ``plan_args``.
+        """
+        if mode == "write":
+            return self.write_args
+        if mode == "plan":
+            return self.plan_args
+        return ()
+
+    def supports_mode(self, mode: str | None) -> bool:
+        """Whether the advisor declares concrete flags for *mode*.
+
+        ``None`` is always supported (it means "no mode"). ``"plan"`` is always
+        supported because read-only is a safe universal fallback. ``"write"`` is
+        supported only when ``write_args`` is non-empty.
+        """
+        if mode is None or mode == "plan":
+            return True
+        return bool(self.write_args)
 
     @property
     def supports_sessions(self) -> bool:
@@ -92,6 +125,14 @@ _BUILTINS: dict[str, Advisor] = {
         fork_flag="--fork-session",
         result_parser="claude-stream",
         json_schema_flag="--json-schema",
+        # ``--write`` grants unattended edit+command execution: acceptEdits alone
+        # still auto-DENIES every non-allowlisted Bash call in ``-p`` mode, which
+        # reproduces the silent read-only failure for any task that runs a
+        # command. bypassPermissions is the honest "unattended executor" contract
+        # — bound it with ``--allow-path``. ``--plan`` maps to Claude's own plan
+        # permission mode (read-only).
+        write_args=("--permission-mode", "bypassPermissions"),
+        plan_args=("--permission-mode", "plan"),
     ),
     "codex": Advisor(
         name="codex",
@@ -110,6 +151,11 @@ _BUILTINS: dict[str, Advisor] = {
         result_parser="codex-jsonl",
         resume_command=("resume",),
         session_event_field="thread_id",
+        # Stock ``codex exec`` runs sandbox=read-only, approval=never (probed), so
+        # ``--write`` must opt in to workspace-write explicitly; ``--plan`` pins
+        # read-only.
+        write_args=("--sandbox", "workspace-write"),
+        plan_args=("--sandbox", "read-only"),
         experimental=True,
         notes="Uses `codex exec --skip-git-repo-check --json <prompt>` with JSONL event streaming and resume.",
     ),
@@ -125,6 +171,11 @@ _BUILTINS: dict[str, Advisor] = {
         prompt_delivery="positional",
         model_flag="--model",
         result_parser="text",
+        # ``--auto`` selects opencode's build agent (edits allowed);
+        # ``--agent plan`` is read-only. Both are position-independent yargs
+        # options relative to the variadic message.
+        write_args=("--auto",),
+        plan_args=("--agent", "plan"),
         experimental=True,
         notes="Uses `opencode run <prompt>` (headless). Telemetry unmeasured; stays text-only.",
     ),
@@ -141,6 +192,14 @@ _BUILTINS: dict[str, Advisor] = {
         json_args=("--output-format", "json"),
         stream_args=("--output-format", "json"),
         result_parser="commandcode-json",
+        # ``--write`` maps to commandcode's full permission bypass. In
+        # non-interactive ``-p`` mode ``--permission-mode auto-accept`` is NOT
+        # enough — the write tools stay blocked and commandcode itself tells you
+        # to re-run with the bypass flag — so the honest write contract is the
+        # bypass (the same flag the /delegate skill uses). Bound it with
+        # ``--allow-path``. ``--plan`` is read-only.
+        write_args=("--yolo",),
+        plan_args=("--plan",),
         experimental=True,
         notes="Uses `commandcode -p --output-format json <prompt>` (non-interactive). Resume not wired by default.",
     ),
@@ -172,6 +231,8 @@ def _coerce(name: str, raw: dict[str, Any]) -> Advisor:
         "stream_args",
         "json_args",
         "resume_command",
+        "write_args",
+        "plan_args",
     }
     overrides: dict[str, Any] = {}
     for key, value in raw.items():

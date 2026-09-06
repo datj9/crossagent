@@ -335,3 +335,69 @@ def _events(job_dir: Path) -> list[dict]:
         for line in path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+
+
+# ---------------------------------------------------------------------------
+# Delegation mode propagation: a --write job must escalate to a write-capable
+# peer with the mode re-expanded against the CHILD advisor, never silently drop
+# to read-only.
+# ---------------------------------------------------------------------------
+
+
+def test_escalation_reexpands_write_mode_against_child_advisor(tmp_path):
+    state_root = tmp_path / "state"
+    parent = _failed_parent(state_root)
+    _spawned, launcher = _spawns()
+    child_id = _escalate(parent, state_root, ["claude:opus"], launcher, mode="write")
+
+    assert child_id is not None
+    command = json.loads((state_root / child_id / "command.json").read_text())
+    # Claude's write flag, not commandcode's — expanded for the child advisor.
+    assert command["command"][command["command"].index("--permission-mode") + 1] == (
+        "bypassPermissions"
+    )
+    # Semantic mode carried so a further escalation re-expands again.
+    assert command["mode"] == "write"
+
+
+def test_escalation_refuses_write_onto_readonly_rung(tmp_path):
+    state_root = tmp_path / "state"
+    parent = _failed_parent(state_root)
+    spawned, launcher = _spawns()
+    # gemini has no write mode; escalating a write onto it would silently run
+    # read-only, so the rung is refused and audited.
+    result = _escalate(parent, state_root, ["gemini"], launcher, mode="write")
+
+    assert result is None
+    assert spawned == []
+    events = _events(state_root / "job_parent")
+    skips = [e for e in events if e.get("event") == "escalation_skipped"]
+    assert len(skips) == 1
+    assert "write mode" in skips[0]["reason"]
+
+
+def test_escalation_write_mode_emits_child_write_flag(tmp_path):
+    # Regression guard: a --write escalation onto codex must actually put codex
+    # into workspace-write, not silently re-run read-only.
+    state_root = tmp_path / "state"
+    parent = _failed_parent(state_root)
+    _spawned, launcher = _spawns()
+    child_id = _escalate(parent, state_root, ["codex"], launcher, mode="write")
+
+    assert child_id is not None
+    command = json.loads((state_root / child_id / "command.json").read_text())
+    argv = command["command"]
+    assert argv[argv.index("--sandbox") + 1] == "workspace-write"
+
+
+def test_escalation_plan_mode_is_carried(tmp_path):
+    state_root = tmp_path / "state"
+    parent = _failed_parent(state_root)
+    _spawned, launcher = _spawns()
+    child_id = _escalate(parent, state_root, ["claude:opus"], launcher, mode="plan")
+
+    command = json.loads((state_root / child_id / "command.json").read_text())
+    assert command["mode"] == "plan"
+    assert command["command"][command["command"].index("--permission-mode") + 1] == (
+        "plan"
+    )

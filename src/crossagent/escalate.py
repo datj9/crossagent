@@ -73,7 +73,9 @@ def parse_rungs(rungs: Optional[list[str]]) -> list[tuple[str, Optional[str]]]:
     return parsed
 
 
-def _build_child_argv(advisor: Advisor, model: Optional[str]) -> list[str]:
+def _build_child_argv(
+    advisor: Advisor, model: Optional[str], mode: Optional[str] = None
+) -> list[str]:
     """Build the escalated child's advisor argv — a FRESH delegation.
 
     Mirrors the advisor-invocation core of ``crossagent start`` (default stream
@@ -82,12 +84,19 @@ def _build_child_argv(advisor: Advisor, model: Optional[str]) -> list[str]:
     child does not inherit the parent's fine-grained invocation flags
     (``--tools``, ``--safe-mode``, ``--permission-mode``); its write boundary is
     enforced structurally by the propagated scope allowlist instead.
+
+    The semantic delegation *mode* IS propagated and re-expanded against the
+    child's advisor: a ``--write`` job that fails must escalate to a peer that can
+    also write, not silently drop to read-only. ``maybe_escalate`` refuses to
+    stage a write escalation onto a read-only rung, so ``mode_args`` here always
+    resolves to a write-capable (or default-writes) invocation.
     """
     cmd = [advisor.executable, *advisor.base_args, *advisor.invoke_args]
     if model and advisor.model_flag:
         cmd.extend([advisor.model_flag, model])
     if advisor.supports_stream:
         cmd.extend(advisor.stream_args)
+    cmd.extend(advisor.mode_args(mode))
     return cmd
 
 
@@ -106,6 +115,7 @@ def maybe_escalate(
     pass_env: list[str],
     verify_with: Optional[str],
     verify_model: Optional[str],
+    mode: Optional[str] = None,
     launcher: Optional[Launcher] = None,
 ) -> Optional[str]:
     """Re-dispatch a *failed* delegation to the next ladder rung, if any.
@@ -131,6 +141,19 @@ def maybe_escalate(
         advisor = advisors_mod.resolve(advisor_name)
     except KeyError as exc:
         _audit_skip(job_dir, reason=f"unknown escalation advisor: {exc}")
+        return None
+
+    # A write delegation must not escalate onto a read-only executor: that would
+    # re-run the task in a mode that cannot possibly succeed, silently. Refuse the
+    # rung loudly (audited) rather than climb into a guaranteed failure.
+    if mode == "write" and not advisor.supports_mode("write"):
+        _audit_skip(
+            job_dir,
+            reason=(
+                f"escalation rung '{advisor.name}' has no write mode; "
+                f"cannot escalate a --write delegation onto a read-only executor"
+            ),
+        )
         return None
 
     child_id = jobs_mod.generate_job_id()
@@ -162,6 +185,7 @@ def maybe_escalate(
         verify_with=verify_with,
         verify_model=verify_model,
         escalate_to=remaining,
+        mode=mode,
         lineage=lineage,
         failed_job=failed_job,
     ):
@@ -249,9 +273,10 @@ def _write_child_command(
     verify_with: Optional[str],
     verify_model: Optional[str],
     escalate_to: list[str],
+    mode: Optional[str],
 ) -> None:
     command_payload = {
-        "command": _build_child_argv(advisor, model),
+        "command": _build_child_argv(advisor, model, mode),
         "prompt_delivery": advisor.prompt_delivery,
         "cwd": cwd,
         "result_parser": advisor.result_parser,
@@ -271,6 +296,9 @@ def _write_child_command(
         "verify_with": verify_with,
         "verify_model": verify_model,
         "escalate_to": escalate_to,
+        # Carry the semantic mode so a further escalation from this child
+        # re-expands write/plan against the next rung's advisor too.
+        "mode": mode,
     }
     jobs_mod.atomic_json_write(command_payload, child_dir / "command.json")
 
@@ -326,6 +354,7 @@ def _create_and_save_child(
     verify_with: Optional[str],
     verify_model: Optional[str],
     escalate_to: list[str],
+    mode: Optional[str],
     lineage: tuple[Optional[str], str, Optional[str], Optional[int]],
     failed_job: Job,
 ) -> bool:
@@ -353,6 +382,7 @@ def _create_and_save_child(
             verify_with=verify_with,
             verify_model=verify_model,
             escalate_to=escalate_to,
+            mode=mode,
         )
         child = _build_child_job(child_id, advisor, cwd, lineage, failed_job)
         jobs_mod.save_state(child_dir, child)

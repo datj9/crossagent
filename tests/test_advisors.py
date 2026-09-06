@@ -81,3 +81,40 @@ def test_malformed_user_config_is_ignored(tmp_path):
     cfg.write_text("{ not json")
     registry = advisors.available(cfg)
     assert "claude" in registry  # falls back to built-ins
+
+
+# --- Delegation mode support ------------------------------------------------
+
+
+def test_mode_args_maps_intent_to_flags():
+    cc = advisors.resolve("commandcode")
+    assert cc.mode_args("write") == ("--yolo",)
+    assert cc.mode_args("plan") == ("--plan",)
+    assert cc.mode_args(None) == ()
+
+
+def test_supports_mode_write_is_false_for_readonly_advisor():
+    assert advisors.resolve("gemini").supports_mode("write") is False
+    # plan and None are always supported (read-only is a safe fallback).
+    assert advisors.resolve("gemini").supports_mode("plan") is True
+    assert advisors.resolve("gemini").supports_mode(None) is True
+
+
+def test_codex_write_mode_opts_into_workspace_write():
+    codex = advisors.resolve("codex")
+    assert codex.write_args == ("--sandbox", "workspace-write")
+    assert codex.plan_args == ("--sandbox", "read-only")
+    assert codex.supports_mode("write") is True
+
+
+def test_mode_args_survive_user_override(tmp_path):
+    cfg = tmp_path / "advisors.json"
+    cfg.write_text(
+        json.dumps(
+            {"advisors": {"commandcode": {"write_args": ["--permission-mode", "yolo"]}}}
+        )
+    )
+    cc = advisors.available(cfg)["commandcode"]
+    # The list override is coerced to a tuple on the frozen dataclass.
+    assert cc.write_args == ("--permission-mode", "yolo")
+    assert cc.mode_args("write") == ("--permission-mode", "yolo")
