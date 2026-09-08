@@ -9,18 +9,52 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import tempfile
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Literal, Optional
+
+# The gate-result shapes now live in the dependency-free ``types`` module.
+# ``jobs`` uses these three as ``Job`` field annotations, which also re-exports
+# them for callers that still reference ``jobs_mod.CheckResultDict`` (e.g.
+# ``worker``). ``ScopeStatus``/``VerifyVerdict`` are imported straight from
+# ``types`` by ``scope``/``verify``.
+from .types import CheckResultDict, ScopeResultDict, VerifyResultDict
+
+# Where a job's cost figure came from. ``advisor`` is the vendor-declared
+# estimate, ``computed`` is derived from a local price table, and ``unknown``
+# means no cost was measured — never conflate that with a measured ``0.0``.
+CostSource = Literal["advisor", "computed", "unknown"]
+
+
+# The delegation verdict keeps "the delegate finished" separate from "the work
+# was verified" (D5). See :func:`delegation_verdict`.
+DelegationVerdict = Literal["verified", "failed", "unverified", "incomplete"]
+
+# Highest ``schema_version`` this build writes. Older records still load.
+CURRENT_SCHEMA_VERSION = 3
+_SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3})
+
+# Lineage parent ids arrive from CLI flags and environment variables, so they
+# are untrusted. Only the generated ``job_<...>`` shape is accepted; rejecting
+# anything else prevents ``../`` traversal or absolute-path escapes out of the
+# state root when a parent directory is resolved.
+_SAFE_JOB_ID_PATTERN = re.compile(r"^job_[A-Za-z0-9_\-]+$")
+
+
+def _is_safe_job_id(job_id: str) -> bool:
+    """Return True if *job_id* is a syntactically valid, path-safe job id."""
+    return bool(_SAFE_JOB_ID_PATTERN.match(job_id))
 
 
 # ---------------------------------------------------------------------------
 # State machine
 # ---------------------------------------------------------------------------
+
 
 class JobState(str, Enum):
     """All possible job lifecycle states."""
@@ -34,13 +68,33 @@ class JobState(str, Enum):
     ABANDONED = "abandoned"
 
 
-_TERMINAL_STATES = frozenset({
-    JobState.SUCCEEDED,
-    JobState.FAILED,
-    JobState.TIMED_OUT,
-    JobState.CANCELLED,
-    JobState.ABANDONED,
-})
+_TERMINAL_STATES = frozenset(
+    {
+        JobState.SUCCEEDED,
+        JobState.FAILED,
+        JobState.TIMED_OUT,
+        JobState.CANCELLED,
+        JobState.ABANDONED,
+    }
+)
+
+# A job is persisted before its detached worker has had a chance to record its
+# PID. Readers such as the dashboard must not treat that normal launch window
+# as evidence that the worker died.
+_PENDING_STARTUP_GRACE_SECONDS = 10
+MAX_NESTING_DEPTH = 8
+
+
+def _parse_iso(ts: "str | None") -> "datetime | None":
+    """Parse an ISO-8601 timestamp tolerant of the trailing Z suffix.
+
+    ``datetime.fromisoformat`` rejects ``Z`` on Python 3.9/3.10. We normalize
+    it to ``+00:00`` so any UTC timestamp — whether we wrote it or an external
+    caller did — round-trips cleanly. Returns ``None`` for empty input.
+    """
+    if not ts:
+        return None
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
 
 
 def is_terminal(state: JobState) -> bool:
@@ -52,8 +106,18 @@ def assert_valid_transition(from_state: JobState, to_state: JobState) -> None:
     """Raise :class:`ValueError` if moving from a terminal state to a different one.
 
     Transitioning to the same state is always allowed (no-op).
+
+    Special case: ABANDONED → RUNNING is permitted so that a slow-starting
+    worker (whose startup exceeded the pending grace window) can reclaim the
+    job instead of crashing and leaving it permanently stuck.  ABANDONED is a
+    reconciler *presumption*, not a confirmed terminal outcome, so this
+    one reclaim edge is safe.  All other terminal states remain frozen.
     """
     if is_terminal(from_state) and from_state != to_state:
+        # Allow the reconciler-presumed ABANDONED state to be reclaimed by a
+        # late-booting worker transitioning back to RUNNING.
+        if from_state == JobState.ABANDONED and to_state == JobState.RUNNING:
+            return
         raise ValueError(
             f"Cannot transition from terminal state '{from_state.value}' "
             f"to '{to_state.value}'"
@@ -64,6 +128,7 @@ def assert_valid_transition(from_state: JobState, to_state: JobState) -> None:
 # Data model
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class Job:
     """Immutable representation of a durable job's persisted state.
@@ -71,7 +136,7 @@ class Job:
     Every JSON response includes *schema_version*, *job_id*, and *status*.
     """
 
-    schema_version: int = 1
+    schema_version: int = CURRENT_SCHEMA_VERSION
     job_id: str = ""
     status: JobState = JobState.PENDING
     advisor: str = ""
@@ -92,11 +157,117 @@ class Job:
     error: Optional[str] = None
     finished_at: Optional[str] = None
     duration_seconds: Optional[float] = None
+    trace_id: Optional[str] = None
+    parent_job_id: Optional[str] = None
+    orchestrator_label: Optional[str] = None
+    nesting_depth: Optional[int] = None
+    # --- Advisor metrics (schema v3) -------------------------------------
+    # Two open-keyed maps (D1): per-advisor token categories and USD costs.
+    # Empty maps + ``cost_source == "unknown"`` mean *unmeasured*, which must
+    # stay distinguishable from a measured zero (D7). Token counts are NOT
+    # additive (D2): each token lives under exactly one ``usage_details`` key.
+    usage_details: dict[str, int] = field(default_factory=dict)
+    cost_details: dict[str, float] = field(default_factory=dict)
+    duration_ms: Optional[int] = None
+    cost_source: CostSource = "unknown"
+    model_reported: Optional[str] = None
+    # --- Independent check-gate (schema v3, slice S3) --------------------
+    # ``None`` means no check ran → *unverified*; a present dict with a
+    # non-zero ``exit_code`` is a failed delegation even when ``status`` is
+    # SUCCEEDED. The delegate's process outcome (``status``) and the work's
+    # verification (this field) are deliberately separate fields so "finished"
+    # can never be read as "verified" (D5).
+    check_result: Optional[CheckResultDict] = None
+    # --- Delegation security posture (schema v3, slice S4) ---------------
+    # ``scope_result`` is the diff-scope assertion outcome. ``None`` means no
+    # allowlist was declared (enforcement off) — distinct from a declared scope
+    # that passed (D7). A declared scope that was violated OR could not be
+    # determined fails the delegation (fail closed); see delegation_verdict.
+    scope_result: Optional[ScopeResultDict] = None
+    # Names — never values — of credential-bearing env vars withheld from the
+    # advisor child. ``None`` means the scrub did not run (a pre-S4 record); an
+    # empty list means it ran and withheld nothing (D7: absent != empty).
+    withheld_env: Optional[list[str]] = None
+    # --- Independent verification pass (schema v3, slice S5) -------------
+    # ``verify_result`` is the outcome of grading the delegate's artifact in a
+    # FRESH peer session (D6). ``None`` means no verification was requested —
+    # distinct from a verification that ran and failed or could not decide (D7).
+    # A ``verdict`` of ``fail`` blocks the green path; ``pass`` can green it;
+    # ``unverified``/``error`` are inconclusive. See :func:`delegation_verdict`.
+    verify_result: Optional[VerifyResultDict] = None
+
+
+def delegation_verdict(job: Job) -> DelegationVerdict:
+    """Return the delegation's verdict, distinguishing *finished* from *verified*.
+
+    D5: the verdict is the deterministic check exit code, never the delegate's
+    self-report and never its mere process exit.
+
+    - ``incomplete`` — the job has not reached a terminal state yet.
+    - ``failed`` — the delegate did not finish cleanly, OR it finished but the
+      independent check exited non-zero. A delegate that exits 0 while its check
+      fails is a *failed delegation*.
+    - ``unverified`` — the delegate finished cleanly but no check was run. This
+      is NOT a pass: a missing gate is never green.
+    - ``verified`` — the delegate finished cleanly and the check exited 0.
+
+    Slices S4 and S5 fold their gates into this same verdict rather than adding
+    new states. Every gate is combined the same way: **any failed gate blocks
+    the green path** (fail closed), at least one *passed* gate with no failures
+    greens the delegation, and a delegation with no decisive gate is
+    ``unverified`` — a missing gate is never a pass.
+
+    Per-gate mapping (a gate that was not requested contributes nothing):
+
+    - **Scope (S4, security gate):** ``violated``/``undetermined`` → fail (a
+      write outside the allowlist, or an inability to tell what changed, is never
+      trustworthy). ``ok`` is neutral — an in-bounds scope does not by itself
+      verify the *work*, so scope alone never greens a delegation.
+    - **Check (S3):** exit ``0`` → pass; any non-zero → fail.
+    - **Verify (S5):** ``pass`` → pass; ``fail`` → fail; ``unverified``/``error``
+      → neutral (inconclusive; graceful degradation per D4 — a verifier that
+      could only produce prose, or could not run, never greens and never
+      hard-fails).
+
+    A failing independent verification therefore blocks green even when the
+    shell check passed — which is the entire point of the fresh-session verifier
+    (D6). When no gate was declared this reduces to the pre-S3 behaviour and its
+    tests are unchanged.
+    """
+    if not is_terminal(job.status):
+        return "incomplete"
+    if job.status != JobState.SUCCEEDED:
+        return "failed"
+
+    any_pass = False
+
+    scope = job.scope_result
+    if scope is not None and scope.get("status") != "ok":
+        return "failed"
+
+    check = job.check_result
+    if check is not None:
+        if check.get("exit_code") == 0:
+            any_pass = True
+        else:
+            return "failed"
+
+    verify = job.verify_result
+    if verify is not None:
+        verdict = verify.get("verdict")
+        if verdict == "pass":
+            any_pass = True
+        elif verdict == "fail":
+            return "failed"
+        # "unverified"/"error" are inconclusive: neither green nor a hard fail.
+
+    return "verified" if any_pass else "unverified"
 
 
 # ---------------------------------------------------------------------------
 # Job ID generation
 # ---------------------------------------------------------------------------
+
 
 def generate_job_id() -> str:
     """Return a unique, sortable-ish, filesystem-safe job ID."""
@@ -105,9 +276,17 @@ def generate_job_id() -> str:
     return f"job_{ts}_{rand}"
 
 
+def generate_trace_id() -> str:
+    """Return an opaque trace identifier suitable for a job lineage tree."""
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    rand = os.urandom(4).hex()
+    return f"trace_{ts}_{rand}"
+
+
 # ---------------------------------------------------------------------------
 # State-root resolution
 # ---------------------------------------------------------------------------
+
 
 def default_state_root() -> Path:
     """Return the default root directory for job state.
@@ -124,6 +303,197 @@ def default_state_root() -> Path:
     if xdg:
         return Path(xdg) / "crossagent" / "jobs"
     return Path.home() / ".local" / "state" / "crossagent" / "jobs"
+
+
+# ---------------------------------------------------------------------------
+# Lineage resolution
+# ---------------------------------------------------------------------------
+
+
+def _walk_ancestor_chain(
+    start_job_id: str,
+    state_root: Path,
+    *,
+    new_job_id: str | None = None,
+    max_hops: int | None = None,
+) -> list[Job]:
+    """Walk the parent chain from *start_job_id* toward the root.
+
+    Returns a list of ancestor ``Job`` objects in order (parent, grandparent,
+    …).  Raises :class:`LineageError` if a cycle or self-reference is
+    detected.  The walk is bounded by *max_hops* (default
+    ``MAX_NESTING_DEPTH + 2``) so corrupt data cannot loop forever.
+    """
+    if max_hops is None:
+        max_hops = MAX_NESTING_DEPTH + 2
+    visited: set[str] = set()
+    ancestors: list[Job] = []
+    current_id = start_job_id
+    for _ in range(max_hops):
+        if current_id in visited:
+            raise LineageError(
+                f"Cycle detected in job lineage: job '{current_id}' "
+                f"appears twice in the ancestor chain"
+            )
+        visited.add(current_id)
+        if not _is_safe_job_id(current_id):
+            break
+        job_dir = job_dir_path(state_root, current_id)
+        try:
+            current = load_state(job_dir)
+        except (FileNotFoundError, JobError):
+            break
+        ancestors.append(current)
+        if current.parent_job_id is None:
+            break
+        if new_job_id is not None and current.parent_job_id == new_job_id:
+            raise LineageError(
+                f"Cycle detected: job '{new_job_id}' would be its own ancestor"
+            )
+        if current.parent_job_id in visited:
+            raise LineageError(
+                f"Cycle detected in job lineage: job '{current.parent_job_id}' "
+                f"appears twice in the ancestor chain"
+            )
+        current_id = current.parent_job_id
+    return ancestors
+
+
+def resolve_lineage(
+    *,
+    no_parent: bool = False,
+    parent_flag: str | None = None,
+    parent_env: str | None = None,
+    trace_flag: str | None = None,
+    trace_env: str | None = None,
+    label_flag: str | None = None,
+    label_env: str | None = None,
+    depth_env: str | None = None,
+    state_root: Path | None = None,
+    new_job_id: str | None = None,
+) -> tuple[str | None, str, str | None, int | None]:
+    """Resolve job lineage from CLI flags, env vars, and parent job state.
+
+    Returns ``(parent_job_id, trace_id, orchestrator_label, nesting_depth)``.
+
+    Validation rules (applied when a parent id is present):
+
+    1. EXPLICIT parent (``--parent`` flag) that cannot be loaded → raise
+       :class:`LineageError`.
+    2. INHERITED parent (``CROSSAGENT_PARENT_JOB_ID`` env) that cannot be loaded
+       → produce an ORPHAN: keep the parent id, ``nesting_depth = None``, do
+       **not** raise.
+    3. Loadable parent + ``--trace-id`` that differs from the parent's trace
+       → raise :class:`LineageError`.
+    4. Cycle in the ancestor chain → raise :class:`LineageError`.
+    5. Computed depth exceeds :data:`MAX_NESTING_DEPTH` → raise
+       :class:`LineageError`.
+    6. No parent → top-level, ``depth = 1``.
+    """
+    root = state_root if state_root is not None else default_state_root()
+
+    # --- PARENT ---
+    if no_parent:
+        parent = None
+        parent_source: str | None = None
+    elif parent_flag is not None:
+        parent = parent_flag
+        parent_source = "explicit"
+    elif parent_env is not None:
+        parent = parent_env
+        parent_source = "inherited"
+    else:
+        parent = None
+        parent_source = None
+
+    # --- NO PARENT: TOP-LEVEL ---
+    if parent is None:
+        trace_id = trace_flag or trace_env or generate_trace_id()
+        label = label_flag or label_env or None
+        return None, trace_id, label, 1
+
+    # --- PARENT ID MUST BE PATH-SAFE (untrusted flag/env input) ---
+    if not _is_safe_job_id(parent):
+        if parent_source == "explicit":
+            raise LineageError(
+                f"Invalid parent job id '{parent}': not a valid job identifier"
+            )
+        # Inherited but malformed → orphan; never build a filesystem path from it.
+        trace_id = trace_flag or trace_env or generate_trace_id()
+        label = label_flag or label_env or None
+        return parent, trace_id, label, None
+
+    # --- PARENT EXISTS: TRY TO LOAD ---
+    parent_dir = root / parent
+    try:
+        parent_job = load_state(parent_dir)
+    except (FileNotFoundError, JobError):
+        parent_job = None
+
+    # --- UNLOADABLE PARENT ---
+    if parent_job is None:
+        if parent_source == "explicit":
+            raise LineageError(
+                f"Parent job '{parent}' not found in state root '{root}'"
+            )
+        # Inherited orphan: keep parent_job_id; depth is genuinely unknown.
+        # (depth_env is intentionally ignored — an untrusted env hint must not
+        # fabricate a depth; the graph surfaces the missing parent instead.)
+        trace_id = trace_flag or trace_env or generate_trace_id()
+        label = label_flag or label_env or None
+        return parent, trace_id, label, None
+
+    # --- LOADABLE PARENT: VALIDATION ---
+
+    # Rule 3: explicit --trace-id conflicts with parent's trace.
+    if (
+        trace_flag is not None
+        and parent_job.trace_id is not None
+        and trace_flag != parent_job.trace_id
+    ):
+        raise LineageError(
+            f"Trace ID conflict: --trace-id '{trace_flag}' does not match "
+            f"parent job '{parent}' trace '{parent_job.trace_id}'"
+        )
+
+    # Rule 4: cycle detection + Rule 5: depth computation.
+    ancestors = _walk_ancestor_chain(parent, root, new_job_id=new_job_id)
+    reached_root = bool(ancestors) and ancestors[-1].parent_job_id is None
+    if reached_root:
+        # Complete chain to a top-level job — the walked length is authoritative.
+        depth: int | None = len(ancestors) + 1
+    elif parent_job.nesting_depth is not None:
+        # The chain is incomplete (a mid-chain ancestor is missing or corrupt),
+        # so the walked length understates the true depth. Trust the parent's
+        # own recorded depth: a deep parent with a broken chain must not be able
+        # to masquerade as shallow and slip under the depth cap.
+        depth = parent_job.nesting_depth + 1
+    else:
+        # Both the chain and the parent's stored depth are unknown (e.g. a child
+        # of an orphan). Use the walked length as a conservative LOWER BOUND so
+        # the cap still applies and orphan-under-orphan nesting can't grow
+        # unbounded; recording it lets deeper descendants keep counting up.
+        depth = len(ancestors) + 1
+
+    if depth is not None and depth > MAX_NESTING_DEPTH:
+        raise LineageError(
+            f"Maximum nesting depth ({MAX_NESTING_DEPTH}) exceeded: "
+            f"new job would be at depth {depth}"
+        )
+
+    # --- RESOLVE REMAINING FIELDS ---
+    trace_id = parent_job.trace_id or trace_flag or trace_env or generate_trace_id()
+
+    if label_flag is not None:
+        label: str | None = label_flag
+    elif parent_job.orchestrator_label is not None:
+        label = parent_job.orchestrator_label
+    elif label_env is not None:
+        label = label_env
+    else:
+        label = None
+
+    return parent, trace_id, label, depth
 
 
 # ---------------------------------------------------------------------------
@@ -174,14 +544,34 @@ def runtime_status(job: Job) -> dict[str, Any]:
     Prompt text and command data are never included.
     """
     now = datetime.now(timezone.utc)
-    started = datetime.fromisoformat(job.started_at) if job.started_at else now
+    started = _parse_iso(job.started_at) if job.started_at else now
     if started.tzinfo is None:
         started = started.replace(tzinfo=timezone.utc)
-    elapsed = int((now - started).total_seconds())
-    last_activity = datetime.fromisoformat(job.last_activity_at) if job.last_activity_at else started
+    last_activity = (
+        _parse_iso(job.last_activity_at) if job.last_activity_at else started
+    )
     if last_activity.tzinfo is None:
         last_activity = last_activity.replace(tzinfo=timezone.utc)
-    idle = int((now - last_activity).total_seconds())
+
+    if is_terminal(job.status):
+        if job.duration_seconds is not None:
+            elapsed = round(job.duration_seconds)
+        elif job.finished_at and job.started_at:
+            finished = _parse_iso(job.finished_at)
+            if finished.tzinfo is None:
+                finished = finished.replace(tzinfo=timezone.utc)
+            elapsed = int((finished - started).total_seconds())
+        else:
+            elapsed = int((now - started).total_seconds())
+        idle = 0
+    else:
+        elapsed = int((now - started).total_seconds())
+        idle = int((now - last_activity).total_seconds())
+
+    # Never report negative durations — clock skew, timezone confusion, or a
+    # started_at slightly in the future must not surface as a negative counter.
+    elapsed = max(0, elapsed)
+    idle = max(0, idle)
     return {
         "schema_version": job.schema_version,
         "job_id": job.job_id,
@@ -191,6 +581,20 @@ def runtime_status(job: Job) -> dict[str, Any]:
         "idle_seconds": idle,
         "last_event": job.last_event,
         "updated_at": job.updated_at,
+        "trace_id": job.trace_id,
+        "parent_job_id": job.parent_job_id,
+        "orchestrator_label": job.orchestrator_label,
+        "nesting_depth": job.nesting_depth,
+        "usage_details": job.usage_details,
+        "cost_details": job.cost_details,
+        "duration_ms": job.duration_ms,
+        "cost_source": job.cost_source,
+        "model_reported": job.model_reported,
+        "check_result": job.check_result,
+        "scope_result": job.scope_result,
+        "withheld_env": job.withheld_env,
+        "verify_result": job.verify_result,
+        "delegation_verdict": delegation_verdict(job),
     }
 
 
@@ -231,6 +635,7 @@ def collect_jobs(
 # Atomic I/O
 # ---------------------------------------------------------------------------
 
+
 def atomic_json_write(data: dict[str, Any], path: Path, *, mode: int = 0o600) -> None:
     """Write *data* as JSON to *path* atomically via temp sibling + os.replace.
 
@@ -267,6 +672,7 @@ def atomic_json_read(path: Path) -> dict[str, Any]:
 # Job directory helpers
 # ---------------------------------------------------------------------------
 
+
 def create_job_dir(state_root: Path, job_id: str) -> Path:
     """Create and return the private directory for *job_id* (mode 0o700)."""
     job_dir = state_root / job_id
@@ -292,6 +698,7 @@ def _ensure_private_file(path: Path) -> None:
 # Cancel request
 # ---------------------------------------------------------------------------
 
+
 def create_cancel_request(job_dir: Path) -> Path:
     """Create a ``cancel.request`` file in *job_dir* and return its path."""
     path = job_dir / "cancel.request"
@@ -308,6 +715,7 @@ def cancel_requested(job_dir: Path) -> bool:
 # ---------------------------------------------------------------------------
 # State lifecycle
 # ---------------------------------------------------------------------------
+
 
 def save_state(job_dir: Path, job: Job) -> Path:
     """Atomically write ``state.json`` in *job_dir* and return its path."""
@@ -336,7 +744,7 @@ def load_state(job_dir: Path) -> Job:
         raise InvalidStateError(f"Expected a mapping, got {type(data).__name__}")
 
     ver = data.get("schema_version")
-    if ver != 1:
+    if ver not in _SUPPORTED_SCHEMA_VERSIONS:
         raise InvalidStateError(f"Unsupported schema_version {ver}")
 
     raw = data.get("status")
@@ -351,11 +759,18 @@ def transition_to(
     new_status: JobState,
     *,
     job_dir: Optional[Path] = None,
+    actor: str = "user",
     **overrides: Any,
 ) -> Job:
     """Return a new ``Job`` with *new_status*, rejecting invalid regressions.
 
     If *job_dir* is supplied the updated state is also persisted atomically.
+
+    When reclaiming an ABANDONED job back to a nonterminal state (the one
+    permitted ABANDONED → RUNNING edge), stale terminal fields written during
+    the abandonment (error, finished_at, duration_seconds) are cleared so they
+    do not linger on the recovered job.  Callers may override any of these by
+    passing explicit keyword arguments.
     """
     assert_valid_transition(job.status, new_status)
     now_utc = datetime.now(timezone.utc)
@@ -366,14 +781,28 @@ def transition_to(
         **overrides,
     }
     if is_terminal(new_status) and job.started_at:
-        started = datetime.fromisoformat(job.started_at)
+        started = _parse_iso(job.started_at)
         if started.tzinfo is None:
             started = started.replace(tzinfo=timezone.utc)
         updates["finished_at"] = now
         updates["duration_seconds"] = (now_utc - started).total_seconds()
+    # Reclaim edge: ABANDONED → nonterminal.  Clear stale abandonment artefacts
+    # unless the caller explicitly overrides them.
+    elif job.status == JobState.ABANDONED and not is_terminal(new_status):
+        updates.setdefault("error", None)
+        updates.setdefault("finished_at", None)
+        updates.setdefault("duration_seconds", None)
     new_job = _update_job(job, updates)
     if job_dir is not None:
         save_state(job_dir, new_job)
+        append_event(
+            job_dir,
+            "transition",
+            actor=actor,
+            from_state=job.status.value,
+            to_state=new_status.value,
+            error=updates.get("error"),
+        )
     return new_job
 
 
@@ -388,29 +817,89 @@ def _update_job(job: Job, updates: dict[str, Any]) -> Job:
 # Stale-state reconciliation
 # ---------------------------------------------------------------------------
 
+
 def reconcile_stale(job: Job, job_dir: Path) -> Job:
     """If *job* has a nonterminal state but the worker is gone, mark abandoned.
 
     Returns the (potentially updated) Job.  The updated state is persisted
     if a transition occurs.
+
+    TOCTOU guard: the worker always writes its terminal state to disk *before*
+    exiting.  After the snapshot fails the liveness checks we therefore re-read
+    state.json and re-run the *full* liveness evaluation on the fresh copy —
+    the worker may have written a terminal state, booted (RUNNING with a live
+    PID), or recorded fresh activity in the meantime.  Only when the fresh copy
+    still fails every check do we persist ABANDONED, and we transition from the
+    fresh copy, never the snapshot.
+    """
+    if not _worker_presumed_dead(job):
+        return job
+    # Re-load from disk to close the TOCTOU window between the caller's
+    # snapshot and this decision.
+    try:
+        fresh_job = load_state(job_dir)
+    except (FileNotFoundError, JobError):
+        # state.json is unreadable — fall back to the in-memory copy.
+        fresh_job = job
+    else:
+        if not _worker_presumed_dead(fresh_job):
+            # Worker persisted its outcome, booted, or is provably alive;
+            # honour the fresh state.
+            return fresh_job
+    return transition_to(
+        fresh_job,
+        JobState.ABANDONED,
+        job_dir=job_dir,
+        actor="system:reconcile",
+        error="Worker process no longer exists",
+    )
+
+
+def _worker_presumed_dead(job: Job) -> bool:
+    """Return True when a nonterminal *job*'s worker appears to be gone.
+
+    Terminal jobs, pending jobs still inside the startup grace window, and
+    jobs whose recorded worker PID is alive are all presumed healthy.
     """
     if is_terminal(job.status):
-        return job
-    if job.worker_pid is None or not _pid_exists(job.worker_pid):
-        return transition_to(
-            job,
-            JobState.ABANDONED,
-            job_dir=job_dir,
-            error="Worker process no longer exists",
-        )
-    return job
+        return False
+    if (
+        job.status == JobState.PENDING
+        and job.worker_pid is None
+        and _pending_startup_grace_active(job)
+    ):
+        return False
+    return job.worker_pid is None or not _pid_exists(job.worker_pid)
+
+
+def _pending_startup_grace_active(job: Job) -> bool:
+    """Return whether a newly persisted pending job may still be launching."""
+    timestamp = job.updated_at or job.started_at
+    if not timestamp:
+        return False
+    try:
+        created = _parse_iso(timestamp)
+    except (TypeError, ValueError):
+        return False
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    age_seconds = (datetime.now(timezone.utc) - created).total_seconds()
+    return 0 <= age_seconds < _PENDING_STARTUP_GRACE_SECONDS
 
 
 def _pid_exists(pid: int) -> bool:
-    """Best-effort check whether *pid* refers to a live process."""
+    """Best-effort check whether *pid* refers to a live process.
+
+    On POSIX, ``os.kill(pid, 0)`` semantics:
+      - No exception        → process exists and is signalable.
+      - ``PermissionError`` → EPERM: process EXISTS but is owned by another user.
+      - ``ProcessLookupError`` → ESRCH: process does not exist.
+      - Other ``OSError``  → treat conservatively as dead.
+    """
     if sys.platform == "win32":
         try:
             import ctypes
+
             kernel32 = ctypes.windll.kernel32
             handle = kernel32.OpenProcess(0x1000, False, pid)
             if handle:
@@ -422,13 +911,20 @@ def _pid_exists(pid: int) -> bool:
     try:
         os.kill(pid, 0)
         return True
-    except (OSError, PermissionError):
+    except PermissionError:
+        # EPERM: the process exists but is owned by a different user.
+        return True
+    except ProcessLookupError:
+        # ESRCH: no process with this PID.
+        return False
+    except OSError:
         return False
 
 
 # ---------------------------------------------------------------------------
 # Exceptions
 # ---------------------------------------------------------------------------
+
 
 class JobError(Exception):
     """Base exception for job-related errors."""
@@ -445,3 +941,45 @@ class CorruptStateError(JobError):
 
 class InvalidStateError(JobError):
     """The stored state violates the expected schema."""
+
+
+class LineageError(JobError):
+    """Lineage validation failed (unknown parent, cycle, depth exceeded, etc.)."""
+
+
+# ---------------------------------------------------------------------------
+# Audit log
+# ---------------------------------------------------------------------------
+
+
+def append_event(
+    job_dir: Path, event: str, *, actor: str = "user", **payload: Any
+) -> None:
+    """Append one JSON line to <job_dir>/events.jsonl.
+
+    Atomic on POSIX for lines under the pipe buffer (our payloads are ~200 bytes).
+    Never raises on failure — the audit log must not break the operation it
+    observes. Errors are reported via stderr instead.
+
+    The payload MUST include enough context to reconstruct the transition. The
+    caller is responsible for not stashing prompt text or command data — those
+    are never audit-relevant.
+    """
+    import sys
+
+    line = json.dumps(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+            "actor": actor,
+            **payload,
+        },
+        sort_keys=True,
+    )
+    try:
+        with (job_dir / "events.jsonl").open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError as exc:
+        print(f"[crossagent] audit log write failed: {exc}", file=sys.stderr)

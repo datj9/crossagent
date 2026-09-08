@@ -4,7 +4,10 @@ from crossagent import registry
 
 
 def test_session_key_slugifies_names():
-    assert registry.session_key("claude", " Payment retry / API ") == "claude:payment-retry-api"
+    assert (
+        registry.session_key("claude", " Payment retry / API ")
+        == "claude:payment-retry-api"
+    )
     assert registry.session_key("claude", None) == ""
 
 
@@ -36,7 +39,9 @@ def test_load_recovers_from_corrupt_registry(tmp_path, capsys):
 
     assert loaded == {"sessions": {}}
     assert not path.exists()
-    assert path.with_suffix(".json.corrupt").read_text(encoding="utf-8") == "{invalid json"
+    assert (
+        path.with_suffix(".json.corrupt").read_text(encoding="utf-8") == "{invalid json"
+    )
     assert "Registry was invalid JSON" in capsys.readouterr().err
 
 

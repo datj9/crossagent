@@ -98,8 +98,9 @@ def test_index_serves_html(server_url):
 
 
 def test_api_jobs_lists_jobs(state_dir, server_url):
-    _write_manual_job(state_dir, "job_dash_one", jobs_mod.JobState.SUCCEEDED,
-                      name="dash-test")
+    _write_manual_job(
+        state_dir, "job_dash_one", jobs_mod.JobState.SUCCEEDED, name="dash-test"
+    )
     status, body = _get(server_url + "/api/jobs")
     assert status == 200
     payload = json.loads(body)
@@ -112,9 +113,30 @@ def test_api_jobs_lists_jobs(state_dir, server_url):
     assert "idle_seconds" in entry
 
 
+def test_api_jobs_lists_live_running_job(state_dir, server_url):
+    _write_manual_job(
+        state_dir, "job_dash_running", jobs_mod.JobState.RUNNING, worker_pid=os.getpid()
+    )
+    status, body = _get(server_url + "/api/jobs")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["jobs"][0]["job_id"] == "job_dash_running"
+    assert payload["jobs"][0]["status"] == "running"
+
+
+def test_api_jobs_does_not_abandon_job_during_startup(state_dir, server_url):
+    _write_manual_job(state_dir, "job_dash_starting", jobs_mod.JobState.PENDING)
+    status, body = _get(server_url + "/api/jobs")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["jobs"][0]["job_id"] == "job_dash_starting"
+    assert payload["jobs"][0]["status"] == "pending"
+
+
 def test_api_jobs_reconciles_stale_to_abandoned(state_dir, server_url):
-    _write_manual_job(state_dir, "job_dash_stale", jobs_mod.JobState.RUNNING,
-                      worker_pid=99999999)
+    _write_manual_job(
+        state_dir, "job_dash_stale", jobs_mod.JobState.RUNNING, worker_pid=99999999
+    )
     status, body = _get(server_url + "/api/jobs")
     assert status == 200
     payload = json.loads(body)
@@ -122,8 +144,9 @@ def test_api_jobs_reconciles_stale_to_abandoned(state_dir, server_url):
 
 
 def test_api_job_detail(state_dir, server_url):
-    _write_manual_job(state_dir, "job_dash_detail", jobs_mod.JobState.FAILED,
-                      name="detail-test")
+    _write_manual_job(
+        state_dir, "job_dash_detail", jobs_mod.JobState.FAILED, name="detail-test"
+    )
     status, body = _get(server_url + "/api/jobs/job_dash_detail")
     assert status == 200
     payload = json.loads(body)
@@ -138,8 +161,12 @@ def test_api_job_detail_unknown_is_404(server_url):
 
 
 def test_api_logs_serves_stdout(state_dir, server_url):
-    _write_manual_job(state_dir, "job_dash_logs", jobs_mod.JobState.SUCCEEDED,
-                      stdout_log="line one\nline two\n")
+    _write_manual_job(
+        state_dir,
+        "job_dash_logs",
+        jobs_mod.JobState.SUCCEEDED,
+        stdout_log="line one\nline two\n",
+    )
     status, body = _get(server_url + "/api/jobs/job_dash_logs/logs?stream=stdout")
     assert status == 200
     assert b"line one" in body
@@ -161,11 +188,21 @@ def test_traversal_job_id_is_rejected(state_dir, server_url):
 
 def test_prompt_never_exposed(state_dir, server_url):
     secret = "DASHBOARD_SECRET_PROMPT_7"
-    _write_manual_job(state_dir, "job_dash_secret", jobs_mod.JobState.SUCCEEDED,
-                      prompt=secret, stdout_log="clean output\n")
+    _write_manual_job(
+        state_dir,
+        "job_dash_secret",
+        jobs_mod.JobState.SUCCEEDED,
+        prompt=secret,
+        stdout_log="clean output\n",
+    )
 
-    for path in ("/", "/api/jobs", "/api/jobs/job_dash_secret",
-                 "/api/jobs/job_dash_secret/logs?stream=stdout"):
+    for path in (
+        "/",
+        "/api/jobs",
+        "/api/analytics",
+        "/api/jobs/job_dash_secret",
+        "/api/jobs/job_dash_secret/logs?stream=stdout",
+    ):
         _, body = _get(server_url + path)
         assert secret.encode() not in body, path
 
@@ -186,17 +223,537 @@ def test_security_headers_present(server_url):
 
 
 def test_page_escapes_job_fields_before_dom_insertion(server_url):
-    """The page must HTML-escape disk-sourced fields (name, advisor,
-    last_event, error) before innerHTML interpolation — XSS guard."""
+    """The page must route disk-sourced fields (name, advisor, last_event,
+    error) into the DOM only through a safe sink — an escaping helper or a
+    ``textContent`` writer — never via innerHTML string interpolation (XSS).
+
+    ``textCell(`` is the analytics/history sink: like ``setCellText``, it writes
+    through ``textContent`` (asserted separately below), so markup in a job field
+    is inert text. Pure non-DOM reads — the search haystack (``toLowerCase()``)
+    and filter comparisons (``!==``) — cannot inject and are exempt."""
     _, body = _get(server_url + "/")
     page = body.decode("utf-8")
     assert "function escapeHtml" in page
+    safe_sinks = ("escapeHtml(", "badge(", "setCellText(", "textCell(")
     for field in ("job.advisor", "job.name", "job.last_event", "job.error"):
         for line in page.splitlines():
-            if field in line and "innerHTML" not in line and "fetch(" not in line:
-                assert "escapeHtml(" in line or "badge(" in line, line
+            if field not in line or "innerHTML" in line or "fetch(" in line:
+                continue
+            # Non-DOM reads (search haystack, filter compares) can't inject.
+            if ".toLowerCase()" in line or "!==" in line or "===" in line:
+                continue
+            assert any(sink in line for sink in safe_sinks), line
+
+
+def test_textcell_sink_uses_textcontent(server_url):
+    """The analytics/history ``textCell`` helper must write via textContent, so
+    a hostile advisor name or model id renders as inert text, not markup."""
+    page = _get(server_url + "/")[1].decode("utf-8")
+    assert "function textCell(" in page
+    # Locate the helper body and confirm it assigns textContent, never innerHTML.
+    start = page.index("function textCell(")
+    body_slice = page[start : start + 400]
+    assert "textContent" in body_slice
+    assert "innerHTML" not in body_slice
+
+
+def test_page_html_contains_adaptive_poll(server_url):
+    response = urllib.request.urlopen(server_url + "/")
+    body = response.read().decode("utf-8")
+    assert "hasRunningJobs ? 3000 : 15000" in body
+    assert "let hasRunningJobs = false;" in body
+
+
+def test_page_supports_light_color_scheme(server_url):
+    """The palette is tokenized so both schemes work; guard the light branch.
+
+    Asserts the capability, not the values — hex assertions would break on every
+    palette tweak, while this fails only if light theming is removed outright.
+    """
+    status, body = _get(server_url + "/")
+    assert status == 200
+    assert "prefers-color-scheme: light" in body.decode("utf-8")
+
+
+def test_page_defines_semantic_color_tokens(server_url):
+    """Colors go through tokens, so a theme override cannot miss a usage site."""
+    text = _get(server_url + "/")[1].decode("utf-8")
+    for token in ("--surface", "--text", "--text-muted", "--text-faint"):
+        assert f"{token}:" in text
+
+
+def test_job_rows_are_a_keyboard_accessible_listbox(server_url):
+    """Job selection must be reachable without a mouse.
+
+    The container carries a static ``role="listbox"``, but rows are built in JS,
+    so their ``role="option"`` is applied via ``setAttribute`` and never appears
+    as a literal attribute in the served markup — assert the call, not the tag.
+    """
+    text = _get(server_url + "/")[1].decode("utf-8")
+    assert 'role="listbox"' in text
+    assert '"role", "option"' in text
+    assert "aria-selected" in text
+
+
+def test_page_defines_visible_focus_indicator(server_url):
+    """Keyboard focus must be visible, not suppressed by the restyle."""
+    assert "focus-visible" in _get(server_url + "/")[1].decode("utf-8")
+
+
+def test_page_respects_reduced_motion(server_url):
+    assert "prefers-reduced-motion" in _get(server_url + "/")[1].decode("utf-8")
 
 
 def test_cli_wires_dashboard_subcommand():
     from crossagent.cli import _JOB_SUBCOMMANDS
+
     assert "dashboard" in _JOB_SUBCOMMANDS
+
+
+# ---------------------------------------------------------------------------
+# Events endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_api_events_offset_zero(state_dir, server_url):
+    _write_manual_job(
+        state_dir,
+        "job_ev_offset",
+        jobs_mod.JobState.SUCCEEDED,
+        stdout_log="line one\nline two\n",
+    )
+    status, body = _get(server_url + "/api/jobs/job_ev_offset/events?offset=0")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["schema_version"] == 1
+    assert payload["job_id"] == "job_ev_offset"
+    assert payload["requested_offset"] == 0
+    assert payload["file_size"] == len("line one\nline two\n")
+    expected_bytes = len("line one\nline two\n")
+    assert payload["next_offset"] == expected_bytes
+    assert payload["at_eof"] is True
+    assert payload["has_more"] is False
+    assert payload["reset"] is False
+    assert len(payload["events"]) == 2
+    assert payload["events"][0]["body"] == "line one"
+    assert payload["events"][1]["body"] == "line two"
+
+
+def test_api_events_partial_final_line(state_dir, server_url):
+    # A genuinely RUNNING job (live worker) must NOT consume a partial final
+    # line — it waits for the line to be completed. A live worker_pid keeps
+    # reconcile_stale from abandoning it.
+    _write_manual_job(
+        state_dir,
+        "job_ev_partial",
+        jobs_mod.JobState.RUNNING,
+        worker_pid=os.getpid(),
+        stdout_log="complete\nincomplete",
+    )
+    status, body = _get(server_url + "/api/jobs/job_ev_partial/events?offset=0")
+    assert status == 200
+    payload = json.loads(body)
+    assert len(payload["events"]) == 1
+    assert payload["events"][0]["body"] == "complete"
+    assert payload["next_offset"] == len("complete\n")
+    assert payload["at_eof"] is False
+
+
+def test_api_events_terminal_emits_final_unterminated_line(state_dir, server_url):
+    # A terminal job's final line will never gain a trailing newline, so it must
+    # be emitted rather than withheld forever.
+    _write_manual_job(
+        state_dir,
+        "job_ev_terminal_tail",
+        jobs_mod.JobState.SUCCEEDED,
+        stdout_log="first\nlast-no-newline",
+    )
+    status, body = _get(server_url + "/api/jobs/job_ev_terminal_tail/events?offset=0")
+    assert status == 200
+    payload = json.loads(body)
+    bodies = [ev["body"] for ev in payload["events"]]
+    assert "first" in bodies
+    assert "last-no-newline" in bodies
+    assert payload["next_offset"] == len("first\nlast-no-newline")
+    assert payload["at_eof"] is True
+
+
+def test_api_events_offset_past_eof_resets(state_dir, server_url):
+    _write_manual_job(
+        state_dir,
+        "job_ev_reset",
+        jobs_mod.JobState.SUCCEEDED,
+        stdout_log="hello\n",
+    )
+    status, body = _get(server_url + "/api/jobs/job_ev_reset/events?offset=99999")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["reset"] is True
+    assert payload["requested_offset"] == 99999
+    assert len(payload["events"]) == 1
+    assert payload["events"][0]["body"] == "hello"
+
+
+def test_api_events_claude_advisor(state_dir, server_url):
+    init_line = json.dumps(
+        {
+            "type": "system",
+            "subtype": "init",
+            "model": "claude-3-opus",
+            "session_id": "sess_test",
+            "cwd": "/tmp",
+        }
+    )
+    assistant_line = json.dumps(
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "Hello!"}]},
+        }
+    )
+    result_line = json.dumps(
+        {
+            "type": "result",
+            "subtype": "message_stop",
+            "total_cost_usd": 0.01,
+        }
+    )
+    stdout = init_line + "\n" + assistant_line + "\n" + result_line + "\n"
+    _write_manual_job(
+        state_dir,
+        "job_ev_claude",
+        jobs_mod.JobState.SUCCEEDED,
+        advisor="claude",
+        stdout_log=stdout,
+    )
+    status, body = _get(server_url + "/api/jobs/job_ev_claude/events")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["event_format"] == "claude-stream"
+    kinds = [e["kind"] for e in payload["events"]]
+    assert kinds == ["init", "assistant", "result"]
+
+
+def test_api_events_codex_advisor(state_dir, server_url):
+    # Regression: a codex advisor must yield codex-jsonl normalized events, not
+    # raw "text" output. This closes the gap that hid the endpoint wiring bug.
+    thread_line = json.dumps({"type": "thread.started", "thread_id": "th_1"})
+    message_line = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": "Done."},
+        }
+    )
+    turn_done = json.dumps({"type": "turn.completed", "usage": {}})
+    stdout = thread_line + "\n" + message_line + "\n" + turn_done + "\n"
+    _write_manual_job(
+        state_dir,
+        "job_ev_codex",
+        jobs_mod.JobState.SUCCEEDED,
+        advisor="codex",
+        stdout_log=stdout,
+    )
+    status, body = _get(server_url + "/api/jobs/job_ev_codex/events")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["event_format"] == "codex-jsonl"
+    kinds = [e["kind"] for e in payload["events"]]
+    assert kinds == ["init", "assistant", "result"]
+
+
+def test_api_events_unknown_job(state_dir, server_url):
+    status, body = _get(server_url + "/api/jobs/job_nope/events")
+    assert status == 404
+
+
+def test_api_events_no_stdout_log(state_dir, server_url):
+    _write_manual_job(
+        state_dir,
+        "job_ev_nolog",
+        jobs_mod.JobState.PENDING,
+    )
+    status, body = _get(server_url + "/api/jobs/job_ev_nolog/events")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["file_size"] == 0
+    assert payload["events"] == []
+    assert payload["at_eof"] is True
+
+
+def test_api_events_default_offset_is_zero(state_dir, server_url):
+    _write_manual_job(
+        state_dir,
+        "job_ev_default",
+        jobs_mod.JobState.SUCCEEDED,
+        stdout_log="data\n",
+    )
+    status, body = _get(server_url + "/api/jobs/job_ev_default/events")
+    assert status == 200
+    payload = json.loads(body)
+    assert len(payload["events"]) == 1
+
+
+def test_api_events_negative_offset_treated_as_zero(state_dir, server_url):
+    _write_manual_job(
+        state_dir,
+        "job_ev_neg",
+        jobs_mod.JobState.SUCCEEDED,
+        stdout_log="data\n",
+    )
+    status, body = _get(server_url + "/api/jobs/job_ev_neg/events?offset=-5")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["requested_offset"] == 0
+
+
+def test_api_events_utf8_byte_offset(state_dir, server_url):
+    multi_byte = "héllo\nworld\n"
+    raw_bytes = multi_byte.encode("utf-8")
+    _write_manual_job(
+        state_dir,
+        "job_ev_utf8",
+        jobs_mod.JobState.SUCCEEDED,
+        stdout_log=multi_byte,
+    )
+    status, body = _get(server_url + "/api/jobs/job_ev_utf8/events?offset=0")
+    assert status == 200
+    payload = json.loads(body)
+    assert len(payload["events"]) == 2
+    assert payload["next_offset"] == len(raw_bytes)
+    assert payload["events"][0]["body"] == "héllo"
+    assert payload["events"][1]["body"] == "world"
+
+    # Re-fetch with offset AFTER the first line (byte offset of 'h' in 'héllo'
+    # is 0; 'é' is 2 bytes in UTF-8, so "héllo\n" = 7 bytes).
+    first_line_bytes = len("héllo\n".encode("utf-8"))
+    status2, body2 = _get(
+        server_url + "/api/jobs/job_ev_utf8/events?offset=" + str(first_line_bytes)
+    )
+    assert status2 == 200
+    payload2 = json.loads(body2)
+    assert len(payload2["events"]) == 1
+    assert payload2["events"][0]["body"] == "world"
+
+
+def test_dashboard_html_has_audit_tab(server_url):
+    """Audit tab is rendered in the detail pane (PR #13 feature merged onto PR #12)."""
+    response = urllib.request.urlopen(server_url + "/")
+    body = response.read().decode("utf-8")
+    assert 'id="tab-audit"' in body
+    assert "let detailTab" in body
+
+
+def test_api_job_audit_returns_events(state_dir, server_url):
+    """GET /api/jobs/<id>/audit returns parsed events.jsonl entries."""
+    import os
+    from crossagent.jobs import (
+        Job,
+        JobState,
+        save_state,
+        job_dir_path,
+        append_event,
+    )
+
+    job_dir = job_dir_path(state_dir, "job_audit_evs")
+    job_dir.mkdir(parents=True, exist_ok=True)
+    save_state(
+        job_dir,
+        Job(
+            job_id="job_audit_evs",
+            status=JobState.SUCCEEDED,
+            started_at="2026-07-19T00:00:00+00:00",
+            worker_pid=os.getpid(),
+        ),
+    )
+    append_event(
+        job_dir, "transition", actor="user", from_state="running", to_state="succeeded"
+    )
+    status, body = _get(server_url + "/api/jobs/job_audit_evs/audit")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["job_id"] == "job_audit_evs"
+    assert len(payload["events"]) == 1
+    assert payload["events"][0]["actor"] == "user"
+    assert payload["events"][0]["from_state"] == "running"
+    assert payload["events"][0]["to_state"] == "succeeded"
+
+
+def test_api_job_audit_unknown_job_is_404(server_url):
+    status, _ = _get(server_url + "/api/jobs/job_audit_unknown/audit")
+    assert status == 404
+
+
+# ---------------------------------------------------------------------------
+# Analytics endpoint + view (slice S6)
+# ---------------------------------------------------------------------------
+
+
+def _write_job_with_metrics(
+    state_root: Path,
+    job_id: str,
+    status: jobs_mod.JobState,
+    *,
+    advisor: str = "claude",
+    model_reported: "str | None" = None,
+    usage_details: "dict[str, int] | None" = None,
+    cost_details: "dict[str, float] | None" = None,
+    cost_source: str = "unknown",
+    duration_ms: "int | None" = None,
+    check_result: "dict | None" = None,
+    schema_version: int = 3,
+) -> None:
+    job_dir = state_root / job_id
+    job_dir.mkdir(parents=True)
+    now = datetime.now(timezone.utc).isoformat()
+    job = jobs_mod.Job(
+        schema_version=schema_version,
+        job_id=job_id,
+        status=status,
+        advisor=advisor,
+        started_at=now,
+        updated_at=now,
+        last_activity_at=now,
+        model_reported=model_reported,
+        usage_details=usage_details or {},
+        cost_details=cost_details or {},
+        cost_source=cost_source,  # type: ignore[arg-type]
+        duration_ms=duration_ms,
+        check_result=check_result,  # type: ignore[arg-type]
+    )
+    jobs_mod.save_state(job_dir, job)
+
+
+def test_api_analytics_returns_rollups(state_dir, server_url):
+    _write_job_with_metrics(
+        state_dir,
+        "job_an_claude",
+        jobs_mod.JobState.SUCCEEDED,
+        advisor="claude",
+        model_reported="claude-opus-5",
+        usage_details={"input_tokens": 100, "output_tokens": 20},
+        cost_details={"total": 0.5},
+        cost_source="advisor",
+        duration_ms=1200,
+        check_result={
+            "command": "pytest",
+            "exit_code": 0,
+            "stdout_tail": "",
+            "stderr_tail": "",
+        },
+    )
+    status, body = _get(server_url + "/api/analytics")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["job_count"] == 1
+    advisor_keys = [rollup["key"] for rollup in payload["by_advisor"]]
+    assert "claude" in advisor_keys
+    model_keys = [rollup["key"] for rollup in payload["by_model"]]
+    assert "claude-opus-5" in model_keys
+    claude = next(r for r in payload["by_advisor"] if r["key"] == "claude")
+    assert claude["check"]["pass_rate"] == 1.0
+    assert claude["cost"]["total"] == 0.5
+    assert claude["tokens"]["total"] == 120  # cache-free input + output
+
+
+def test_api_analytics_unmeasured_stays_none_not_zero(state_dir, server_url):
+    # codex emits no cost — the endpoint must report it as null, never 0.0, so
+    # the UI can render "not measured".
+    _write_job_with_metrics(
+        state_dir,
+        "job_an_codex",
+        jobs_mod.JobState.SUCCEEDED,
+        advisor="codex",
+        usage_details={"input_tokens": 50, "output_tokens": 5},
+    )
+    payload = json.loads(_get(server_url + "/api/analytics")[1])
+    codex = next(r for r in payload["by_advisor"] if r["key"] == "codex")
+    assert codex["cost"]["total"] is None
+    assert codex["cost"]["mean"] is None
+    assert codex["duration"]["mean_ms"] is None
+
+
+def test_api_analytics_includes_legacy_records(state_dir, server_url):
+    # A schema-1 record predates every metric field; it must appear in counts
+    # without breaking the rollup.
+    _write_job_with_metrics(
+        state_dir,
+        "job_an_legacy",
+        jobs_mod.JobState.SUCCEEDED,
+        advisor="opencode",
+        schema_version=1,
+    )
+    payload = json.loads(_get(server_url + "/api/analytics")[1])
+    assert payload["job_count"] == 1
+    legacy = next(r for r in payload["by_advisor"] if r["key"] == "opencode")
+    assert legacy["cost"]["total"] is None
+    assert legacy["tokens"]["total"] is None
+
+
+def test_page_has_analytics_view(server_url):
+    """The Analytics toggle and its rollup + history surfaces are present."""
+    page = _get(server_url + "/")[1].decode("utf-8")
+    assert 'id="view-analytics"' in page
+    assert 'id="analytics-view"' in page
+    assert 'id="an-model-body"' in page
+    assert 'id="an-advisor-body"' in page
+    assert 'id="an-history-body"' in page
+
+
+def test_page_renders_not_measured_label(server_url):
+    """Unmeasured metrics render an explicit label, never a fabricated zero."""
+    page = _get(server_url + "/")[1].decode("utf-8")
+    assert "not measured" in page
+    assert "function unmeasuredCell(" in page
+
+
+def test_page_analytics_history_is_keyboard_accessible(server_url):
+    """History drill-down and filters are reachable without a mouse.
+
+    Drill-down is a real <button> (natively focusable), and the filters carry
+    aria-labels plus a focus-visible ring — asserts the capability, not values.
+    """
+    page = _get(server_url + "/")[1].decode("utf-8")
+    assert "link-btn" in page
+    assert ".link-btn:focus-visible" in page
+    assert 'aria-label="Search delegations' in page
+    assert 'aria-label="Filter history by advisor"' in page
+    assert 'aria-label="Filter history by verdict"' in page
+
+
+def test_page_analytics_tables_scroll_within_card(server_url):
+    """Wide rollup/history tables scroll sideways in their own container so the
+    page body never overflows horizontally at 390px."""
+    page = _get(server_url + "/")[1].decode("utf-8")
+    assert ".table-scroll { overflow-x: auto;" in page
+
+
+def test_page_token_helper_excludes_cache_subsets(server_url):
+    """The client-side per-job token total mirrors the non-additive rule (D2):
+    cache/reasoning keys are skipped so they never double-count."""
+    page = _get(server_url + "/")[1].decode("utf-8")
+    assert "function jobTokenTotal(" in page
+    start = page.index("function jobTokenTotal(")
+    body_slice = page[start : start + 600]
+    assert '"cache"' in body_slice and '"reasoning"' in body_slice
+
+
+# ---------------------------------------------------------------------------
+# trace_mismatch graph cue (slice S6, discovered item 2)
+# ---------------------------------------------------------------------------
+
+
+def test_page_defines_trace_mismatch_token_both_themes(server_url):
+    """The mismatch cue color is a token defined in BOTH the dark default and the
+    prefers-color-scheme: light block, so live theme switching stays correct."""
+    page = _get(server_url + "/")[1].decode("utf-8")
+    assert page.count("--graph-mismatch:") == 2  # dark :root + light override
+
+
+def test_page_graph_renders_trace_mismatch_distinctly(server_url):
+    """A trace_mismatch diagnostic gets its own violet dotted cue, distinct from
+    the red dashed missing_parent treatment, on both the edge and the node."""
+    page = _get(server_url + "/")[1].decode("utf-8")
+    assert 'd.type === "trace_mismatch"' in page
+    assert "mismatchIds" in page
+    # The canvas reads the token via getComputedStyle like every other graph
+    # color, so it repaints correctly on theme change.
+    assert 'mismatch: token("--graph-mismatch")' in page

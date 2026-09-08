@@ -31,14 +31,43 @@ def test_experimental_advisors_are_flagged():
         assert advisors.resolve(name).experimental
 
 
+def test_commandcode_wires_json_telemetry():
+    cc = advisors.resolve("commandcode")
+    assert cc.result_parser == "commandcode-json"
+    assert cc.json_args == ("--output-format", "json")
+    assert cc.stream_args == ("--output-format", "json")
+    # supports_stream must be true so build_command appends the JSON flag.
+    assert cc.supports_stream
+
+
+def test_codex_base_args_skip_git_repo_check():
+    codex = advisors.resolve("codex")
+    assert codex.base_args == ("exec", "--skip-git-repo-check")
+
+
+def test_commandcode_json_wiring_survives_user_override(tmp_path):
+    """A user override that only tweaks the model must not drop the new
+    json_args/result_parser layered from the built-in (dataclasses.replace)."""
+    cfg = tmp_path / "advisors.json"
+    cfg.write_text(json.dumps({"advisors": {"commandcode": {"model_flag": "-m"}}}))
+    cc = advisors.available(cfg)["commandcode"]
+    assert cc.model_flag == "-m"
+    assert cc.result_parser == "commandcode-json"
+    assert cc.json_args == ("--output-format", "json")
+
+
 def test_user_config_overrides_builtin(tmp_path):
     cfg = tmp_path / "advisors.json"
-    cfg.write_text(json.dumps({
-        "advisors": {
-            "codex": {"executable": "my-codex", "base_args": ["run", "--fast"]},
-            "myllm": {"executable": "myllm", "prompt_delivery": "flag:-q"},
-        }
-    }))
+    cfg.write_text(
+        json.dumps(
+            {
+                "advisors": {
+                    "codex": {"executable": "my-codex", "base_args": ["run", "--fast"]},
+                    "myllm": {"executable": "myllm", "prompt_delivery": "flag:-q"},
+                }
+            }
+        )
+    )
     registry = advisors.available(cfg)
     assert registry["codex"].executable == "my-codex"
     assert registry["codex"].base_args == ("run", "--fast")

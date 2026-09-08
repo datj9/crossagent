@@ -24,7 +24,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-import pytest
 
 from crossagent import runner
 
@@ -39,6 +38,7 @@ def _cmd(*args: str) -> list[str]:
 # =========================================================================
 # Test helpers
 # =========================================================================
+
 
 class RecordingConsumer:
     """Record every stdout/stderr line and return them in finish()."""
@@ -140,8 +140,10 @@ def test_stderr_flood_no_deadlock():
     consumer = RecordingConsumer()
     outcome = runner.run(
         _cmd(
-            "--stderr-count", "1500",
-            "--stderr-line-size", "1024",
+            "--stderr-count",
+            "1500",
+            "--stderr-line-size",
+            "1024",
         ),
         consumer=consumer,
     )
@@ -161,8 +163,10 @@ def test_large_stdout_streamed_to_consumer():
     consumer = RecordingConsumer()
     outcome = runner.run(
         _cmd(
-            "--stdout-count", "1500",
-            "--stdout-line-size", "1024",
+            "--stdout-count",
+            "1500",
+            "--stdout-line-size",
+            "1024",
         ),
         consumer=consumer,
     )
@@ -305,5 +309,3 @@ def _pid_exists(pid: int) -> bool:
         return True
     except (OSError, ProcessLookupError):
         return False
-
-

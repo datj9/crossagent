@@ -10,7 +10,7 @@ own via ~/.config/crossagent/advisors.json without touching code.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +23,7 @@ PROMPT_DELIVERIES = frozenset({"dashdash", "positional"})
 # How to read the advisor's answer back out of its stdout.
 #   "claude-stream" -> parse newline-delimited stream-json events, take the result event
 #   "text"          -> capture raw stdout as the answer
-RESULT_PARSERS = frozenset({"claude-stream", "codex-jsonl", "text"})
+RESULT_PARSERS = frozenset({"claude-stream", "codex-jsonl", "commandcode-json", "text"})
 
 USER_CONFIG = Path.home() / ".config" / "crossagent" / "advisors.json"
 
@@ -46,16 +46,31 @@ class Advisor:
     result_parser: str = "text"
     resume_command: tuple[str, ...] | None = None
     session_event_field: str | None = None
+    # Flag that requests a machine-checkable JSON output contract for the
+    # independent verification pass (slice S5). ``None`` means the advisor has no
+    # such contract, so a verifier built on it degrades to parsing a JSON verdict
+    # out of the answer text (D4 graceful degradation — never a hard failure).
+    # Claude exposes ``--json-schema`` (research finding [6]: the payload lands in
+    # ``structured_output``); no other built-in advisor has a verified equivalent.
+    json_schema_flag: str | None = None
     experimental: bool = False
     notes: str = ""
 
     @property
     def supports_sessions(self) -> bool:
-        return self.resume_flag is not None or self.session_name_flag is not None or self.resume_command is not None
+        return (
+            self.resume_flag is not None
+            or self.session_name_flag is not None
+            or self.resume_command is not None
+        )
 
     @property
     def supports_stream(self) -> bool:
-        return self.result_parser in ("claude-stream", "codex-jsonl")
+        return self.result_parser in (
+            "claude-stream",
+            "codex-jsonl",
+            "commandcode-json",
+        )
 
 
 # --- Built-in advisors -------------------------------------------------------
@@ -76,11 +91,18 @@ _BUILTINS: dict[str, Advisor] = {
         session_name_flag="--name",
         fork_flag="--fork-session",
         result_parser="claude-stream",
+        json_schema_flag="--json-schema",
     ),
     "codex": Advisor(
         name="codex",
         executable="codex",
-        base_args=("exec",),
+        # --skip-git-repo-check: `codex exec` refuses to run (exit 1, empty
+        # stdout) with "Not inside a trusted directory" whenever the cwd is not
+        # a trusted git repo (S2 probe). crossagent runs from arbitrary --cwd
+        # paths, so without this a delegation from a non-repo directory fails
+        # confusingly with no JSON to parse. Skipping the check only bypasses
+        # codex's own trust gate; it grants no extra capability.
+        base_args=("exec", "--skip-git-repo-check"),
         prompt_delivery="positional",
         model_flag="--model",
         json_args=("--json",),
@@ -89,8 +111,13 @@ _BUILTINS: dict[str, Advisor] = {
         resume_command=("resume",),
         session_event_field="thread_id",
         experimental=True,
-        notes="Uses `codex exec --json <prompt>` with JSONL event streaming and resume.",
+        notes="Uses `codex exec --skip-git-repo-check --json <prompt>` with JSONL event streaming and resume.",
     ),
+    # opencode stays on the text parser: its SUCCESS telemetry shape is
+    # unmeasured (every probe run failed on provider creds, S2). `run --format
+    # json` exists, but wiring it without a verified success event shape would
+    # risk dropping the answer or inventing field names (D4). Re-probe with
+    # working creds before wiring. Telemetry degrades to unknown via text.
     "opencode": Advisor(
         name="opencode",
         executable="opencode",
@@ -99,7 +126,7 @@ _BUILTINS: dict[str, Advisor] = {
         model_flag="--model",
         result_parser="text",
         experimental=True,
-        notes="Uses `opencode run <prompt>` (headless).",
+        notes="Uses `opencode run <prompt>` (headless). Telemetry unmeasured; stays text-only.",
     ),
     "commandcode": Advisor(
         name="commandcode",
@@ -107,10 +134,18 @@ _BUILTINS: dict[str, Advisor] = {
         invoke_args=("-p",),
         prompt_delivery="positional",
         model_flag="--model",
-        result_parser="text",
+        # `-p --output-format json` emits an NDJSON event stream ending in a
+        # type:"result" line with camelCase usage, durationMs, and finalText
+        # (verified live on CommandCode 1.4.1, S2 probe). Plain `-p` text mode
+        # emits zero telemetry, so the JSON flag is required to reach analytics.
+        json_args=("--output-format", "json"),
+        stream_args=("--output-format", "json"),
+        result_parser="commandcode-json",
         experimental=True,
-        notes="Uses `commandcode -p <prompt>` (non-interactive). Resume not wired by default.",
+        notes="Uses `commandcode -p --output-format json <prompt>` (non-interactive). Resume not wired by default.",
     ),
+    # gemini is not installed on this machine, so its telemetry shape is
+    # unverifiable; it stays text-only until it can be probed live.
     "gemini": Advisor(
         name="gemini",
         executable="gemini",
@@ -118,7 +153,7 @@ _BUILTINS: dict[str, Advisor] = {
         model_flag="--model",
         result_parser="text",
         experimental=True,
-        notes="Uses `gemini -p <prompt>` (non-interactive).",
+        notes="Uses `gemini -p <prompt>` (non-interactive). Not installed here; telemetry unverified.",
     ),
 }
 
@@ -128,8 +163,16 @@ _ALIASES = {"cmd": "commandcode", "cc": "claude", "oc": "opencode"}
 
 def _coerce(name: str, raw: dict[str, Any]) -> Advisor:
     """Build an Advisor from a user-config dict, layering onto a built-in if one exists."""
-    base = _BUILTINS.get(name, Advisor(name=name, executable=raw.get("executable", name)))
-    tuple_fields = {"base_args", "invoke_args", "stream_args", "json_args", "resume_command"}
+    base = _BUILTINS.get(
+        name, Advisor(name=name, executable=raw.get("executable", name))
+    )
+    tuple_fields = {
+        "base_args",
+        "invoke_args",
+        "stream_args",
+        "json_args",
+        "resume_command",
+    }
     overrides: dict[str, Any] = {}
     for key, value in raw.items():
         if key in tuple_fields and isinstance(value, list):
@@ -168,5 +211,7 @@ def resolve(name: str, config_path: Path | None = None) -> Advisor:
     registry = available(config_path)
     if canonical not in registry:
         known = ", ".join(sorted(registry))
-        raise KeyError(f"Unknown advisor '{name}'. Known advisors: {known}. Add your own in {USER_CONFIG}.")
+        raise KeyError(
+            f"Unknown advisor '{name}'. Known advisors: {known}. Add your own in {USER_CONFIG}."
+        )
     return registry[canonical]

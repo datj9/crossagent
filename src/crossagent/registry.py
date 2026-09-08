@@ -36,7 +36,10 @@ def load(path: Path) -> dict[str, Any]:
     except json.JSONDecodeError:
         backup = path.with_suffix(path.suffix + ".corrupt")
         path.replace(backup)
-        print(f"[crossagent] Registry was invalid JSON; moved to {backup}", file=sys.stderr)
+        print(
+            f"[crossagent] Registry was invalid JSON; moved to {backup}",
+            file=sys.stderr,
+        )
         return {"sessions": {}}
     if not isinstance(data, dict):
         return {"sessions": {}}
@@ -55,8 +58,17 @@ def stored_session_id(registry: dict[str, Any], key: str) -> str | None:
     return entry.get("session_id") if isinstance(entry, dict) else None
 
 
-def record(path: Path, registry: dict[str, Any], key: str, *, session_id: str, name: str | None,
-           cwd: str, advisor: str, model: str) -> dict[str, Any]:
+def record(
+    path: Path,
+    registry: dict[str, Any],
+    key: str,
+    *,
+    session_id: str,
+    name: str | None,
+    cwd: str,
+    advisor: str,
+    model: str,
+) -> dict[str, Any]:
     """Return a NEW registry dict with the session recorded, and persist it."""
     sessions = dict(registry.get("sessions", {}))
     sessions[key] = {

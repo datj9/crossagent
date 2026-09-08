@@ -3,6 +3,58 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses semantic versioning.
 
+## [0.1.5] - 2026-07-20
+
+### Added
+- **Orchestrator graph + job lineage** (`src/crossagent/graph.py`): the dashboard
+  now renders a directed graph of job nodes plus synthesized orchestrator-root
+  nodes (keyed by `trace_id`), with cycle-safe edge linking and built-in
+  diagnostics for data-integrity issues. Exposed via new dashboard endpoints and
+  surfaced in the web UI.
+- **Live event feed** (`src/crossagent/feed.py`): pure event normalizer that
+  converts raw advisor stdout lines (Claude stream-json, Codex JSONL, or plain
+  text) into structured feed events streamed by the dashboard event-stream
+  endpoint — independent of the stateful parser classes, zero side effects.
+- **Append-only `events.jsonl` audit log per job**: the worker now appends every
+  lifecycle event to `~/.local/state/crossagent/jobs/<job-id>/events.jsonl`, and
+  the dashboard reads it back for per-job replay and audit.
+
+### Fixed
+- Dashboard polling is now adaptive: it backs off when no jobs are running and
+  tightens up when there is live activity, instead of polling at a fixed rate.
+- Tolerate `Z`-suffixed ISO timestamps (`...Z`) when parsing job state on
+  Python 3.9 and 3.10, where `datetime.fromisoformat` did not yet accept the
+  `Z` suffix.
+
+## [0.1.4] - 2026-07-18
+
+### Added
+- `-v` / `--version` flag on the top-level CLI: prints `crossagent <version>`
+  and exits.
+
+## [0.1.3] - 2026-07-18
+
+### Fixed
+- Stop the dashboard reconciler from corrupting job state: after observing a
+  worker PID die, `reconcile_stale` re-reads `state.json` and re-runs the full
+  liveness decision (terminal state, pending grace, live worker PID) on the
+  fresh copy before abandoning — closing the TOCTOU race that could flip
+  succeeded jobs to `abandoned`.
+- Treat `PermissionError` from `kill(pid, 0)` as "process alive" (EPERM means
+  the PID exists) instead of presuming the worker dead.
+- Allow a slow-booting worker to reclaim a job the reconciler marked
+  `abandoned` during the startup grace window, clearing stale abandonment
+  artefacts instead of crashing on an illegal state transition.
+
+## [0.1.2] - 2026-07-18
+
+### Fixed
+- Extract the final Codex response from the `item.text` field emitted by current
+  `codex exec --json` versions, while retaining support for older content shapes.
+- Keep newly launched jobs visible on the dashboard by allowing the detached
+  worker a short startup grace period to record its PID. Stale running jobs and
+  genuinely orphaned pending jobs are still reconciled to `abandoned`.
+
 ## [0.1.1] - 2026-07-18
 
 ### Added
