@@ -38,6 +38,7 @@ class Advisor:
     invoke_args: tuple[str, ...] = ()
     prompt_delivery: str = "positional"  # "dashdash" | "positional" | "flag:<flag>"
     model_flag: str | None = None
+    default_model: str | None = None
     stream_args: tuple[str, ...] = ()
     json_args: tuple[str, ...] = ()
     resume_flag: str | None = None
@@ -146,6 +147,7 @@ _BUILTINS: dict[str, Advisor] = {
         base_args=("exec", "--skip-git-repo-check"),
         prompt_delivery="positional",
         model_flag="--model",
+        default_model="gpt-6-astra",
         json_args=("--json",),
         stream_args=("--json",),
         result_parser="codex-jsonl",
@@ -218,6 +220,22 @@ _BUILTINS: dict[str, Advisor] = {
 
 # Friendly aliases callers may type.
 _ALIASES = {"cmd": "commandcode", "cc": "claude", "oc": "opencode"}
+
+# Short model aliases, scoped per advisor so a name never leaks across CLIs
+# (each advisor's own CLI resolves its own shorthands; we only expand ours).
+MODEL_ALIASES: dict[str, dict[str, str]] = {
+    "codex": {"gpt6": "gpt-6-astra", "astra": "gpt-6-astra"},
+}
+
+
+def resolve_model(name: str | None, advisor_name: str) -> str | None:
+    """Expand a per-advisor model alias. Returns None when no model was requested."""
+    if not isinstance(name, str):
+        return None
+    candidate = name.strip()
+    if not candidate:
+        return None
+    return MODEL_ALIASES.get(advisor_name, {}).get(candidate.lower(), candidate)
 
 
 def _coerce(name: str, raw: dict[str, Any]) -> Advisor:

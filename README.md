@@ -279,12 +279,44 @@ Create `~/.config/crossagent/advisors.json`:
 {
   "advisors": {
     "codex": { "executable": "codex", "base_args": ["exec", "--full-auto"] },
-    "myllm": { "executable": "myllm", "prompt_delivery": "flag:-q", "model_flag": "--model" }
+    "myllm": { "executable": "myllm", "prompt_delivery": "flag:-q", "model_flag": "--model", "default_model": "myllm-pro" }
   }
 }
 ```
 
 Fields layer onto the built-ins, so you only specify what differs. `prompt_delivery` is `dashdash` (prompt after `--`), `positional` (prompt as last arg), or `flag:<flag>` (prompt is the value of a flag).
+
+### Model selection
+
+`--model` takes a model id or a **per-advisor alias**. Aliases are scoped to one
+advisor so a name never leaks across CLIs — for `codex`, `gpt6` and `astra` both
+expand to `gpt-6-astra` (case-insensitive); anything else is passed through
+verbatim, so each CLI still resolves its own shorthands.
+
+Each advisor may declare a `default_model`, used when `--model` is omitted.
+**Codex second opinions now default to `gpt-6-astra`** (GPT-6 Astra); every other
+advisor still has no default and falls through to whatever its own CLI picks.
+
+Resolution order for a fresh invocation:
+
+1. explicit `--model <id-or-alias>` (alias-expanded),
+2. the advisor's `default_model`,
+3. no `--model` flag at all — the advisor CLI's own default.
+
+Two escape hatches:
+
+- `--model default` (any case) suppresses the flag entirely, so your own
+  `~/.codex/config.toml` decides.
+- Clear the default permanently in `~/.config/crossagent/advisors.json`:
+
+  ```json
+  { "advisors": { "codex": { "default_model": null } } }
+  ```
+
+On **resume**, a `default_model` is never injected — switching models mid-thread
+would change the advisor under an existing conversation. An explicit `--model`
+still applies. The resolved id (not the alias) is what gets persisted to the
+session registry and a job's `command.json`.
 
 ## Skill usage inside an agent
 

@@ -3,6 +3,17 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses semantic versioning.
 
+## [Unreleased]
+
+### Added
+- **Per-advisor `default_model` + model aliases**: codex second opinions now
+  default to `gpt-6-astra` (GPT-6 Astra), with `gpt6`/`astra` as case-insensitive
+  aliases scoped to the codex advisor only. Override via
+  `advisors.json` (`"codex": {"default_model": null}`) or `--model default`,
+  which suppresses the `--model` flag entirely. Defaults are never injected on
+  resume, and the resolved model id is what gets persisted to the session
+  registry and `command.json`.
+
 ## [0.1.5] - 2026-07-20
 
 ### Added
