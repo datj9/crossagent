@@ -46,6 +46,24 @@ def test_verifier_command_never_grants_write_mode():
         assert "--auto" not in cmd
 
 
+def test_verifier_command_pins_low_reasoning_on_the_codex_default_model():
+    """A verifier session is a fresh default-model ask, so it inherits the same
+    cost-saving `low` effort the ask/start paths use."""
+    cmd = build_verifier_command(resolve("codex"), "gpt-6-astra")
+    assert cmd[cmd.index("-c") + 1] == "model_reasoning_effort=low"
+
+
+def test_verifier_command_omits_reasoning_for_a_non_default_model():
+    for model in ("gpt-5.6-sol", None):
+        cmd = build_verifier_command(resolve("codex"), model)
+        assert "-c" not in cmd
+
+
+def test_verifier_command_omits_reasoning_for_advisors_without_the_knob():
+    cmd = build_verifier_command(resolve("claude"), "opus")
+    assert "-c" not in cmd
+
+
 def test_verifier_command_requests_structured_output_when_supported():
     claude = resolve("claude")
     cmd = build_verifier_command(claude, None, schema_path="/tmp/schema.json")

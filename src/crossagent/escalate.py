@@ -45,7 +45,7 @@ from typing import Any, Callable, Optional
 
 from . import advisors as advisors_mod
 from . import jobs as jobs_mod
-from .advisors import Advisor
+from .advisors import Advisor, default_reasoning_for_model
 from .jobs import Job, delegation_verdict
 
 # Launches a detached worker for a child job. Injectable so escalation can be
@@ -94,6 +94,11 @@ def _build_child_argv(
     cmd = [advisor.executable, *advisor.base_args, *advisor.invoke_args]
     if model and advisor.model_flag:
         cmd.extend([advisor.model_flag, model])
+    # An escalation is always a fresh delegation, so the advisor's default
+    # reasoning effort applies whenever the rung actually names its default model
+    # (same cost rule the foreground/ask paths use). No --reasoning plumbing
+    # here: ladder rungs carry no user invocation flags.
+    cmd.extend(advisor.reasoning_args(default_reasoning_for_model(advisor, model)))
     if advisor.supports_stream:
         cmd.extend(advisor.stream_args)
     cmd.extend(advisor.mode_args(mode))

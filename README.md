@@ -318,6 +318,40 @@ would change the advisor under an existing conversation. An explicit `--model`
 still applies. The resolved id (not the alias) is what gets persisted to the
 session registry and a job's `command.json`.
 
+### Reasoning effort
+
+GPT-6 Astra's reasoning ladder is `minimal | low | medium | high | xhigh | max`,
+and effort is a cost multiplier. A second opinion is a *reviewer*, not an author,
+so **crossagent's own default `gpt-6-astra` asks run at `low`** — it emits
+`-c model_reasoning_effort=low`, visible in the `[crossagent] running:` line:
+
+```bash
+crossagent --agent codex --prompt "Review this retry policy"
+# codex exec --skip-git-repo-check --model gpt-6-astra -c model_reasoning_effort=low --json <prompt>
+```
+
+This overrides a `model_reasoning_effort` setting in your `~/.codex/config.toml`
+**for crossagent's own asks only** — the config file is never modified, and your
+interactive `codex` sessions are untouched.
+
+- `--reasoning <level>` picks any rung explicitly. It applies to a resumed
+  thread too (like an explicit `--model`).
+- `--reasoning default` (any case) sends no override, so `config.toml` wins.
+- The default effort applies only on a **fresh** call that actually sends the
+  advisor's `default_model`: pick another model (`--model gpt-5.6-sol`) or resume
+  a thread and no override is emitted.
+- Opt out permanently in `~/.config/crossagent/advisors.json`:
+
+  ```json
+  { "advisors": { "codex": { "default_reasoning_effort": null } } }
+  ```
+
+Advisors other than `codex` declare no reasoning-effort key, so `--reasoning` on
+them is dropped with a warning rather than guessed at. Escalation rungs and
+verifier sessions are fresh delegations and follow the same default. The
+requested level is persisted alongside the model in the session registry and a
+job's `command.json`.
+
 ## Skill usage inside an agent
 
 Once installed, the skill auto-triggers on phrases like *"ask Claude"*, *"debate with Claude"*, *"ask Codex"*, *"second opinion"*, *"hỏi ý với Claude"*. The agent packages context, runs `crossagent`, and reports both views. See [`skills/crossagent/SKILL.md`](skills/crossagent/SKILL.md).

@@ -71,6 +71,11 @@ def _redacted_command(cmd: list[str]) -> str:
 # escape hatch back to whatever the advisor CLI's own config already picks.
 _MODEL_SENTINEL_DEFAULT = "default"
 
+# Literal `--reasoning default` (any case) means "emit no reasoning override at
+# all" — the escape hatch back to whatever the advisor CLI's own config picks
+# (for codex: `model_reasoning_effort` in ~/.codex/config.toml).
+_REASONING_SENTINEL_DEFAULT = "default"
+
 
 def _is_resume(
     advisor: Advisor, args: argparse.Namespace, registry: dict[str, Any]
@@ -107,6 +112,46 @@ def effective_model(
     return advisors_mod.resolve_model(raw, advisor.name) or ""
 
 
+def effective_reasoning(
+    advisor: Advisor,
+    args: argparse.Namespace,
+    *,
+    is_resume: bool,
+    chosen_model: str,
+) -> str:
+    """The reasoning effort actually requested (and persisted); empty = none.
+
+    An explicit ``--reasoning`` level wins on BOTH a fresh call and a resume —
+    the caller named a level for this turn, exactly as an explicit ``--model``
+    survives a resume. ``--reasoning default`` suppresses the override entirely.
+
+    With no flag, the advisor's ``default_reasoning_effort`` applies only on a
+    FRESH call whose model is the advisor's own ``default_model`` (crossagent
+    picked that model, so it may pick the effort too). A resume returns empty —
+    never switch effort mid-thread — which, like the ``effective_model`` quirk,
+    also means a resumed turn persists no reasoning level.
+    """
+    requested = getattr(args, "reasoning", "") or ""
+    if not isinstance(requested, str):
+        requested = ""
+    level = requested.strip().lower()
+    if level == _REASONING_SENTINEL_DEFAULT:
+        return ""
+    if level:
+        if level not in advisors_mod.VALID_REASONING_EFFORTS:
+            choices = "|".join(sorted(advisors_mod.VALID_REASONING_EFFORTS))
+            print(
+                "[crossagent] error: argument --reasoning: invalid choice: "
+                f"'{requested.strip()}' (choose from {choices}, or 'default')",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        return level
+    if is_resume:
+        return ""
+    return advisors_mod.default_reasoning_for_model(advisor, chosen_model)
+
+
 def build_command(
     advisor: Advisor,
     args: argparse.Namespace,
@@ -116,11 +161,25 @@ def build_command(
 ) -> tuple[list[str], str]:
     cmd = [advisor.executable, *advisor.base_args, *advisor.invoke_args]
 
-    chosen_model = effective_model(
-        advisor, args, is_resume=_is_resume(advisor, args, registry)
-    )
+    is_resume = _is_resume(advisor, args, registry)
+    chosen_model = effective_model(advisor, args, is_resume=is_resume)
     if chosen_model and advisor.model_flag:
         cmd.extend([advisor.model_flag, chosen_model])
+
+    # Reasoning effort rides a global `-c` override, so it must be emitted before
+    # the stream/resume args below (codex rejects `-c` after the `resume`
+    # subcommand). A level on an advisor with no reasoning knob is dropped, not
+    # guessed at — say so, mirroring how _apply_mode warns on a degraded --plan.
+    reasoning = effective_reasoning(
+        advisor, args, is_resume=is_resume, chosen_model=chosen_model
+    )
+    if reasoning and advisor.reasoning_effort_config_key is None:
+        print(
+            f"[crossagent] advisor '{advisor.name}' has no reasoning-effort setting; "
+            f"ignoring --reasoning {reasoning}.",
+            file=sys.stderr,
+        )
+    cmd.extend(advisor.reasoning_args(reasoning))
 
     if advisor.supports_stream:
         cmd.extend(args.stream and advisor.stream_args or advisor.json_args)
@@ -229,6 +288,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--reasoning",
+        default="",
+        help=(
+            "codex/GPT-6 reasoning effort: minimal|low|medium|high|xhigh|max. "
+            "Empty = low when sending the default gpt-6-astra model. 'default' "
+            "sends no override so codex config.toml wins."
+        ),
+    )
+    parser.add_argument(
         "--safe-mode",
         action="store_true",
         help="Claude: run with --safe-mode (skip repo config/skills/hooks).",
@@ -288,7 +356,12 @@ def _print_advisors() -> int:
         tag = " (experimental)" if adv.experimental else ""
         print(f"{name:14} -> {adv.executable}{tag}")
         if adv.default_model:
-            print(f"{'':14}    default model: {adv.default_model}")
+            effort = (
+                f" (reasoning effort: {adv.default_reasoning_effort})"
+                if adv.default_reasoning_effort
+                else ""
+            )
+            print(f"{'':14}    default model: {adv.default_model}{effort}")
         if adv.notes:
             print(f"{'':14}    {adv.notes}")
         write_desc = shlex.join(adv.write_args) if adv.write_args else "unsupported"
@@ -385,6 +458,8 @@ def _dispatch(
         print(parsed.result, end="" if parsed.result.endswith("\n") else "\n")
 
     if parsed.session_id and key:
+        is_resume = _is_resume(advisor, args, registry)
+        chosen_model = effective_model(advisor, args, is_resume=is_resume)
         reg.record(
             registry_path,
             registry,
@@ -393,8 +468,9 @@ def _dispatch(
             name=args.name,
             cwd=args.cwd or os.getcwd(),
             advisor=advisor.name,
-            model=effective_model(
-                advisor, args, is_resume=_is_resume(advisor, args, registry)
+            model=chosen_model,
+            reasoning=effective_reasoning(
+                advisor, args, is_resume=is_resume, chosen_model=chosen_model
             ),
         )
         print(
@@ -676,6 +752,7 @@ def _add_advisor_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--prompt")
     parser.add_argument("--cwd")
     parser.add_argument("--model", default="")
+    parser.add_argument("--reasoning", default="")
     parser.add_argument("--safe-mode", action="store_true")
     parser.add_argument("--no-stream", dest="stream", action="store_false")
     parser.add_argument("--partial", action="store_true")
@@ -1157,6 +1234,12 @@ def _write_command_info(
         "key": key,
         "name": args.name,
         "model": effective_model(advisor, args, is_resume=is_resume),
+        "reasoning": effective_reasoning(
+            advisor,
+            args,
+            is_resume=is_resume,
+            chosen_model=effective_model(advisor, args, is_resume=is_resume),
+        ),
         "advisor": advisor.name,
         "check": getattr(args, "check", None),
         "check_timeout": getattr(

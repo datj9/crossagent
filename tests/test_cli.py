@@ -1,6 +1,7 @@
 import json
 import subprocess
 import sys
+from dataclasses import replace
 
 import pytest
 
@@ -234,6 +235,168 @@ def test_job_start_argv_path_also_gets_the_codex_default_model():
     assert cmd[cmd.index("--model") + 1] == "gpt-6-astra"
 
 
+# ---------------------------------------------------------------------------
+# Reasoning effort (codex/GPT-6 defaults to low for cost)
+# ---------------------------------------------------------------------------
+
+_LOW = ["-c", "model_reasoning_effort=low"]
+
+
+def _reasoning_value(cmd):
+    return cmd[cmd.index("-c") + 1] if "-c" in cmd else None
+
+
+def test_codex_fresh_invocation_defaults_to_low_reasoning_effort():
+    cmd, _ = build_command(
+        advisors.resolve("codex"), _args(agent="codex"), {"sessions": {}}
+    )
+    assert cmd[cmd.index("--model") + 1] == "gpt-6-astra"
+    assert _reasoning_value(cmd) == "model_reasoning_effort=low"
+
+
+def test_codex_default_ask_builds_the_expected_argv():
+    cmd, _ = build_command(
+        advisors.resolve("codex"), _args(agent="codex"), {"sessions": {}}
+    )
+    assert cmd == [
+        "codex",
+        "exec",
+        "--skip-git-repo-check",
+        "--model",
+        "gpt-6-astra",
+        *_LOW,
+        "--json",
+        "hello?",
+    ]
+
+
+def test_explicit_reasoning_level_overrides_the_default():
+    cmd, _ = build_command(
+        advisors.resolve("codex"),
+        _args(agent="codex", reasoning="high"),
+        {"sessions": {}},
+    )
+    assert _reasoning_value(cmd) == "model_reasoning_effort=high"
+
+
+def test_explicit_reasoning_level_is_lowercased():
+    cmd, _ = build_command(
+        advisors.resolve("codex"),
+        _args(agent="codex", reasoning="HIGH"),
+        {"sessions": {}},
+    )
+    assert _reasoning_value(cmd) == "model_reasoning_effort=high"
+
+
+def test_invalid_reasoning_level_exits_two(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        build_command(
+            advisors.resolve("codex"),
+            _args(agent="codex", reasoning="turbo"),
+            {"sessions": {}},
+        )
+    assert excinfo.value.code == 2
+    assert "--reasoning" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("sentinel", ["default", "DEFAULT", " Default "])
+def test_reasoning_default_sentinel_suppresses_the_override(sentinel):
+    cmd, _ = build_command(
+        advisors.resolve("codex"),
+        _args(agent="codex", reasoning=sentinel),
+        {"sessions": {}},
+    )
+    assert "-c" not in cmd
+
+
+def test_reasoning_default_sentinel_leaves_the_model_flag_alone():
+    cmd, _ = build_command(
+        advisors.resolve("codex"),
+        _args(agent="codex", reasoning="default", model="gpt6"),
+        {"sessions": {}},
+    )
+    assert cmd[cmd.index("--model") + 1] == "gpt-6-astra"
+    assert "-c" not in cmd
+
+
+def test_a_non_default_model_gets_no_forced_low_reasoning():
+    cmd, _ = build_command(
+        advisors.resolve("codex"), _args(agent="codex", model="o3"), {"sessions": {}}
+    )
+    assert cmd[cmd.index("--model") + 1] == "o3"
+    assert "-c" not in cmd
+
+
+def test_the_default_model_typed_verbatim_still_gets_low_reasoning():
+    cmd, _ = build_command(
+        advisors.resolve("codex"),
+        _args(agent="codex", model="GPT-6-Astra"),
+        {"sessions": {}},
+    )
+    assert _reasoning_value(cmd) == "model_reasoning_effort=low"
+
+
+def test_low_reasoning_applies_to_an_aliased_configured_default_model():
+    aliased = replace(advisors.resolve("codex"), default_model="gpt6")
+    cmd, _ = build_command(aliased, _args(agent="codex"), {"sessions": {}})
+    assert cmd[cmd.index("--model") + 1] == "gpt-6-astra"
+    assert _reasoning_value(cmd) == "model_reasoning_effort=low"
+
+
+def test_codex_resume_does_not_force_low_reasoning():
+    registry = {"sessions": {"codex:topic-a": {"session_id": "thread-123"}}}
+    cmd, _ = build_command(
+        advisors.resolve("codex"), _args(agent="codex", name="topic-a"), registry
+    )
+    assert "-c" not in cmd
+
+
+def test_explicit_reasoning_survives_resume_and_precedes_the_resume_token():
+    registry = {"sessions": {"codex:topic-a": {"session_id": "thread-123"}}}
+    cmd, _ = build_command(
+        advisors.resolve("codex"),
+        _args(agent="codex", name="topic-a", reasoning="high"),
+        registry,
+    )
+    assert _reasoning_value(cmd) == "model_reasoning_effort=high"
+    assert cmd.index("-c") < cmd.index("resume")
+
+
+def test_claude_fresh_invocation_gets_no_reasoning_override():
+    cmd, _ = build_command(
+        advisors.resolve("claude"), _args(name="topic-a"), {"sessions": {}}
+    )
+    assert "-c" not in cmd
+
+
+def test_reasoning_on_an_advisor_without_a_config_key_warns_and_emits_nothing(capsys):
+    cmd, _ = build_command(
+        advisors.resolve("claude"), _args(reasoning="low"), {"sessions": {}}
+    )
+    assert "-c" not in cmd
+    assert "no reasoning-effort setting" in capsys.readouterr().err
+
+
+def test_job_start_argv_path_also_gets_low_reasoning():
+    args = _parse_job_args("start", ["--agent", "codex", "--prompt", "hello?"])
+    args._prompt = "hello?"
+    cmd, _ = build_command(
+        advisors.resolve("codex"), args, {"sessions": {}}, include_prompt=False
+    )
+    assert _reasoning_value(cmd) == "model_reasoning_effort=low"
+
+
+def test_job_start_accepts_an_explicit_reasoning_flag():
+    args = _parse_job_args(
+        "start", ["--agent", "codex", "--prompt", "hello?", "--reasoning", "xhigh"]
+    )
+    args._prompt = "hello?"
+    cmd, _ = build_command(
+        advisors.resolve("codex"), args, {"sessions": {}}, include_prompt=False
+    )
+    assert _reasoning_value(cmd) == "model_reasoning_effort=xhigh"
+
+
 def _fake_run_advisor(*_args, **_kwargs):
     return 0, parsers_mod.ParsedResult(result="ok", session_id="thread-7")
 
@@ -312,6 +475,78 @@ def test_command_info_persists_the_default_model_and_skips_it_on_resume(tmp_path
     )
     resumed = json.loads((job_dir / "command.json").read_text(encoding="utf-8"))
     assert resumed["model"] == ""
+
+
+def test_registry_record_persists_the_reasoning_effort(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli_mod, "_run_advisor", _fake_run_advisor)
+    registry_path = tmp_path / "sessions.json"
+
+    _dispatch(
+        advisors.resolve("codex"),
+        _args(agent="codex", name="topic-a"),
+        ["codex"],
+        "codex:topic-a",
+        {"sessions": {}},
+        registry_path,
+    )
+    capsys.readouterr()
+    assert reg.load(registry_path)["sessions"]["codex:topic-a"]["reasoning"] == "low"
+
+    _dispatch(
+        advisors.resolve("codex"),
+        _args(agent="codex", name="topic-b", reasoning="xhigh"),
+        ["codex"],
+        "codex:topic-b",
+        {"sessions": {}},
+        registry_path,
+    )
+    capsys.readouterr()
+    assert reg.load(registry_path)["sessions"]["codex:topic-b"]["reasoning"] == "xhigh"
+
+
+def test_registry_record_persists_no_reasoning_for_claude(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(cli_mod, "_run_advisor", _fake_run_advisor)
+    registry_path = tmp_path / "sessions.json"
+
+    _dispatch(
+        advisors.resolve("claude"),
+        _args(name="topic-a"),
+        ["claude"],
+        "claude:topic-a",
+        {"sessions": {}},
+        registry_path,
+    )
+    capsys.readouterr()
+    assert reg.load(registry_path)["sessions"]["claude:topic-a"]["reasoning"] == ""
+
+
+def test_command_info_persists_the_reasoning_effort_and_skips_it_on_resume(tmp_path):
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    codex = advisors.resolve("codex")
+    args = _args(agent="codex", name="topic-a")
+
+    _write_command_info(
+        job_dir, codex, args, ["codex"], "", tmp_path / "s.json", is_resume=False
+    )
+    fresh = json.loads((job_dir / "command.json").read_text(encoding="utf-8"))
+    assert fresh["reasoning"] == "low"
+
+    _write_command_info(
+        job_dir, codex, args, ["codex"], "", tmp_path / "s.json", is_resume=True
+    )
+    resumed = json.loads((job_dir / "command.json").read_text(encoding="utf-8"))
+    assert resumed["reasoning"] == ""
+
+
+def test_list_advisors_shows_the_default_reasoning_effort(monkeypatch, capsys):
+    builtin_codex = advisors._BUILTINS["codex"]
+    monkeypatch.setattr(advisors, "available", lambda *a, **k: {"codex": builtin_codex})
+    assert main(["--list-advisors"]) == 0
+    out = capsys.readouterr().out
+    assert "default model: gpt-6-astra (reasoning effort: low)" in out
 
 
 def test_list_advisors_shows_the_default_model(monkeypatch, capsys):
