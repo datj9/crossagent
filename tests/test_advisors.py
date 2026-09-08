@@ -126,6 +126,77 @@ def test_user_config_can_override_default_model(tmp_path):
     assert advisors.available(cfg)["codex"].default_model == "gpt-5.6-sol"
 
 
+def test_codex_defaults_to_low_reasoning_effort_and_others_have_none():
+    codex = advisors.resolve("codex")
+    assert codex.default_reasoning_effort == "low"
+    assert codex.reasoning_effort_config_key == "model_reasoning_effort"
+    for name in ("claude", "opencode", "commandcode", "gemini"):
+        adv = advisors.resolve(name)
+        assert adv.default_reasoning_effort is None
+        assert adv.reasoning_effort_config_key is None
+
+
+def test_reasoning_args_builds_the_codex_config_override():
+    assert advisors.resolve("codex").reasoning_args("low") == (
+        "-c",
+        "model_reasoning_effort=low",
+    )
+
+
+@pytest.mark.parametrize("level", ["", None])
+def test_reasoning_args_is_empty_without_a_level(level):
+    assert advisors.resolve("codex").reasoning_args(level) == ()
+
+
+def test_reasoning_args_is_empty_for_an_advisor_with_no_config_key():
+    assert advisors.resolve("claude").reasoning_args("low") == ()
+
+
+def test_valid_reasoning_efforts_covers_the_gpt6_ladder():
+    assert advisors.VALID_REASONING_EFFORTS == frozenset(
+        {"minimal", "low", "medium", "high", "xhigh", "max"}
+    )
+
+
+def test_user_config_can_override_default_reasoning_effort(tmp_path):
+    cfg = tmp_path / "advisors.json"
+    cfg.write_text(
+        json.dumps({"advisors": {"codex": {"default_reasoning_effort": "high"}}})
+    )
+    codex = advisors.available(cfg)["codex"]
+    assert codex.default_reasoning_effort == "high"
+    assert codex.reasoning_args("high") == ("-c", "model_reasoning_effort=high")
+
+
+def test_user_config_can_clear_default_reasoning_effort(tmp_path):
+    cfg = tmp_path / "advisors.json"
+    cfg.write_text(
+        json.dumps({"advisors": {"codex": {"default_reasoning_effort": None}}})
+    )
+    codex = advisors.available(cfg)["codex"]
+    assert codex.default_reasoning_effort is None
+    # Other built-in fields survive the layering.
+    assert codex.reasoning_effort_config_key == "model_reasoning_effort"
+
+
+def test_default_reasoning_for_model_gates_on_the_default_model():
+    codex = advisors.resolve("codex")
+    assert advisors.default_reasoning_for_model(codex, "gpt-6-astra") == "low"
+    # Case-insensitive: a caller may type the model id in any case.
+    assert advisors.default_reasoning_for_model(codex, "GPT-6-Astra") == "low"
+    assert advisors.default_reasoning_for_model(codex, "gpt-5.6-sol") == ""
+    assert advisors.default_reasoning_for_model(codex, "") == ""
+    assert advisors.default_reasoning_for_model(codex, None) == ""
+    assert advisors.default_reasoning_for_model(advisors.resolve("claude"), "opus") == ""
+
+
+def test_default_reasoning_for_model_resolves_an_aliased_default_model(tmp_path):
+    cfg = tmp_path / "advisors.json"
+    cfg.write_text(json.dumps({"advisors": {"codex": {"default_model": "gpt6"}}}))
+    codex = advisors.available(cfg)["codex"]
+    assert advisors.default_reasoning_for_model(codex, "gpt-6-astra") == "low"
+
+
 def test_malformed_user_config_is_ignored(tmp_path):
     cfg = tmp_path / "advisors.json"
     cfg.write_text("{ not json")

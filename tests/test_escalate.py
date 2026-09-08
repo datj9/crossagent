@@ -7,7 +7,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from crossagent import jobs as jobs_mod
-from crossagent.escalate import _drop_first_nonblank, maybe_escalate, parse_rungs
+from crossagent.advisors import resolve
+from crossagent.escalate import (
+    _build_child_argv,
+    _drop_first_nonblank,
+    maybe_escalate,
+    parse_rungs,
+)
 from crossagent.jobs import (
     MAX_NESTING_DEPTH,
     Job,
@@ -49,6 +55,28 @@ def test_drop_first_nonblank_removes_only_the_spawned_rung():
     assert _drop_first_nonblank(["claude:opus", "codex"]) == ["codex"]
     assert _drop_first_nonblank(["", "claude", "codex"]) == ["codex"]
     assert _drop_first_nonblank(["only"]) == []
+
+
+# ---------------------------------------------------------------------------
+# Child argv: reasoning effort on a fresh default-model rung
+# ---------------------------------------------------------------------------
+
+
+def test_child_argv_pins_low_reasoning_on_the_codex_default_model():
+    cmd = _build_child_argv(resolve("codex"), "gpt-6-astra")
+    assert cmd[cmd.index("-c") + 1] == "model_reasoning_effort=low"
+    # The `-c` override is global and must precede the stream flags.
+    assert cmd.index("-c") < cmd.index("--json")
+
+
+def test_child_argv_omits_reasoning_for_a_non_default_model():
+    for model in ("gpt-5.6-sol", None):
+        cmd = _build_child_argv(resolve("codex"), model)
+        assert "-c" not in cmd
+
+
+def test_child_argv_omits_reasoning_for_advisors_without_the_knob():
+    assert "-c" not in _build_child_argv(resolve("claude"), "opus")
 
 
 # ---------------------------------------------------------------------------

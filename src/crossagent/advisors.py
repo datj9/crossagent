@@ -27,6 +27,13 @@ RESULT_PARSERS = frozenset({"claude-stream", "codex-jsonl", "commandcode-json", 
 
 USER_CONFIG = Path.home() / ".config" / "crossagent" / "advisors.json"
 
+# Reasoning-effort ladder. codex owns this vocabulary (GPT-6 Astra accepts every
+# rung; codex 0.145 rejects anything else), so the whitelist lives next to the
+# advisor specs rather than in the CLI.
+VALID_REASONING_EFFORTS = frozenset(
+    {"minimal", "low", "medium", "high", "xhigh", "max"}
+)
+
 
 @dataclass(frozen=True)
 class Advisor:
@@ -39,6 +46,12 @@ class Advisor:
     prompt_delivery: str = "positional"  # "dashdash" | "positional" | "flag:<flag>"
     model_flag: str | None = None
     default_model: str | None = None
+    # Reasoning effort crossagent asks for when it sends ``default_model`` on a
+    # FRESH call, and the advisor-native config key that carries it. ``None``
+    # means "this advisor has no reasoning knob crossagent knows how to set", so
+    # the advisor CLI's own configuration is left untouched.
+    default_reasoning_effort: str | None = None
+    reasoning_effort_config_key: str | None = None
     stream_args: tuple[str, ...] = ()
     json_args: tuple[str, ...] = ()
     resume_flag: str | None = None
@@ -78,6 +91,17 @@ class Advisor:
         if mode == "plan":
             return self.plan_args
         return ()
+
+    def reasoning_args(self, level: str | None) -> tuple[str, ...]:
+        """Return the flags that pin *level* as this advisor's reasoning effort.
+
+        Empty when no level was requested, or when the advisor exposes no
+        reasoning-effort config key (there is nothing to set, so a requested
+        level is dropped rather than guessed at).
+        """
+        if not level or self.reasoning_effort_config_key is None:
+            return ()
+        return ("-c", f"{self.reasoning_effort_config_key}={level}")
 
     def supports_mode(self, mode: str | None) -> bool:
         """Whether the advisor declares concrete flags for *mode*.
@@ -148,6 +172,14 @@ _BUILTINS: dict[str, Advisor] = {
         prompt_delivery="positional",
         model_flag="--model",
         default_model="gpt-6-astra",
+        # GPT-6 Astra bills reasoning effort as a cost multiplier, and codex
+        # reads the level from ~/.codex/config.toml — which may well be set to
+        # `high` for the user's own interactive work. A second opinion is a
+        # reviewer, not an author: `low` is strong enough there at a fraction of
+        # the tokens, so crossagent's own default asks pin `low` via a visible
+        # `-c` override (the user's config file is never modified).
+        default_reasoning_effort="low",
+        reasoning_effort_config_key="model_reasoning_effort",
         json_args=("--json",),
         stream_args=("--json",),
         result_parser="codex-jsonl",
@@ -159,7 +191,11 @@ _BUILTINS: dict[str, Advisor] = {
         write_args=("--sandbox", "workspace-write"),
         plan_args=("--sandbox", "read-only"),
         experimental=True,
-        notes="Uses `codex exec --skip-git-repo-check --json <prompt>` with JSONL event streaming and resume.",
+        notes=(
+            "Uses `codex exec --skip-git-repo-check --json <prompt>` with JSONL event "
+            "streaming and resume. Fresh asks on the default model run at `low` "
+            "reasoning effort (-c model_reasoning_effort=low); override with --reasoning."
+        ),
     ),
     # opencode stays on the text parser: its SUCCESS telemetry shape is
     # unmeasured (every probe run failed on provider creds, S2). `run --format
@@ -236,6 +272,25 @@ def resolve_model(name: str | None, advisor_name: str) -> str | None:
     if not candidate:
         return None
     return MODEL_ALIASES.get(advisor_name, {}).get(candidate.lower(), candidate)
+
+
+def default_reasoning_for_model(advisor: Advisor, model: str | None) -> str:
+    """The advisor's default reasoning effort, but only when *model* IS its default.
+
+    Crossagent only claims to know the right effort for the model it chose itself,
+    so the gate compares *model* against the alias-resolved ``default_model``,
+    case-insensitively: a config that sets ``default_model: "gpt6"`` and a caller
+    who types ``--model GPT-6-Astra`` both still land on the default effort, while
+    any other model is left to the advisor CLI's own configuration.
+    """
+    if not advisor.default_reasoning_effort or not advisor.default_model:
+        return ""
+    if not isinstance(model, str) or not model.strip():
+        return ""
+    resolved = resolve_model(advisor.default_model, advisor.name) or ""
+    if resolved.lower() != model.strip().lower():
+        return ""
+    return advisor.default_reasoning_effort
 
 
 def _coerce(name: str, raw: dict[str, Any]) -> Advisor:

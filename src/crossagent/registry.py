@@ -68,8 +68,14 @@ def record(
     cwd: str,
     advisor: str,
     model: str,
+    reasoning: str = "",
 ) -> dict[str, Any]:
-    """Return a NEW registry dict with the session recorded, and persist it."""
+    """Return a NEW registry dict with the session recorded, and persist it.
+
+    ``reasoning`` is the effort level crossagent asked for ("" = none, which is
+    also what a resumed turn records — the same overwrite-on-resume quirk the
+    ``model`` field already has).
+    """
     sessions = dict(registry.get("sessions", {}))
     sessions[key] = {
         "session_id": session_id,
@@ -77,6 +83,7 @@ def record(
         "advisor": advisor,
         "cwd": str(Path(cwd).resolve()),
         "model": model,
+        "reasoning": reasoning,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     updated = {**registry, "sessions": sessions}

@@ -6,6 +6,17 @@ All notable changes to this project are documented here. Format loosely follows
 ## [Unreleased]
 
 ### Added
+- **`low` reasoning effort for default GPT-6 Astra asks**: crossagent's default
+  `gpt-6-astra` second opinions now run at `low` reasoning effort (cheaper;
+  strong enough for a reviewer), emitted as a visible
+  `-c model_reasoning_effort=low` override that never modifies your
+  `~/.codex/config.toml`. Applies to `ask`, job `start`, escalation rungs and
+  verifier sessions — always fresh calls on the advisor's own default model.
+  Override with `--reasoning minimal|low|medium|high|xhigh|max` (which also
+  applies on resume), `--reasoning default` (send no override), or
+  `advisors.json` (`"codex": {"default_reasoning_effort": null}`). The requested
+  level is persisted next to the model in the session registry and
+  `command.json`.
 - **Per-advisor `default_model` + model aliases**: codex second opinions now
   default to `gpt-6-astra` (GPT-6 Astra), with `gpt6`/`astra` as case-insensitive
   aliases scoped to the codex advisor only. Override via

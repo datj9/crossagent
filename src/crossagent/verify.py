@@ -55,7 +55,7 @@ from typing import Any, Optional
 from . import credentials as credentials_mod
 from . import parsers as parsers_mod
 from . import runner as runner_mod
-from .advisors import Advisor
+from .advisors import Advisor, default_reasoning_for_model
 from .types import VerifyResultDict, VerifyVerdict
 
 # A verification that never terminates must not hang the worker forever.
@@ -130,6 +130,10 @@ def build_verifier_command(
     cmd = [advisor.executable, *advisor.base_args, *advisor.invoke_args]
     if model and advisor.model_flag:
         cmd.extend([advisor.model_flag, model])
+    # A verifier session is always fresh, so the advisor's default reasoning
+    # effort applies whenever *model* is its own default model (the same cost
+    # rule the ask/start paths use). No user-facing --reasoning here.
+    cmd.extend(advisor.reasoning_args(default_reasoning_for_model(advisor, model)))
     if advisor.supports_stream:
         # Single-shot JSON (not streaming): the terminal event is the whole
         # payload, which is the cleanest carrier for a structured verdict.
