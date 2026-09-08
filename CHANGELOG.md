@@ -5,7 +5,16 @@ All notable changes to this project are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-08
+
 ### Added
+- **`--write` / `--plan` delegation permission modes**: advisor-agnostic intents
+  that crossagent expands into each advisor's concrete permission flags. `--plan`
+  pins the executor to a read-only planning mode; `--write` grants unattended
+  edit + command execution, and warns (steer it with `--allow-path`) when the
+  scope is unbounded. The mode carries through `--escalate-to` rungs and is
+  refused on a read-only executor, so a `--write` delegation never silently
+  degrades to read-only.
 - **`low` reasoning effort for default GPT-6 Astra asks**: crossagent's default
   `gpt-6-astra` second opinions now run at `low` reasoning effort (cheaper;
   strong enough for a reviewer), emitted as a visible
@@ -24,6 +33,12 @@ All notable changes to this project are documented here. Format loosely follows
   which suppresses the `--model` flag entirely. Defaults are never injected on
   resume, and the resolved model id is what gets persisted to the session
   registry and `command.json`.
+
+### Changed
+- **`--write` fails closed outside a git repository**: `--write` now refuses to
+  run (exit 2) when the cwd is not a git worktree, because the delegate's writes
+  can't be scoped or audited against a baseline there. Run from inside a git repo
+  (or point `--cwd` at one), or drop `--write`.
 
 ## [0.1.5] - 2026-07-20
 
