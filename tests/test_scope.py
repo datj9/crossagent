@@ -237,3 +237,17 @@ def test_git_unavailable_is_undetermined(repo: Path, monkeypatch):
     assert baseline.repo_root is None
     outcome = assert_scope(baseline, ["src"], str(repo))
     assert outcome.status == "undetermined"
+
+
+def test_is_git_repo_true_inside_worktree(repo: Path):
+    assert scope_mod.is_git_repo(str(repo)) is True
+
+
+def test_is_git_repo_false_outside_worktree(tmp_path: Path):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert scope_mod.is_git_repo(str(plain)) is False
+
+
+def test_is_git_repo_false_for_nonexistent_cwd(tmp_path: Path):
+    assert scope_mod.is_git_repo(str(tmp_path / "does-not-exist")) is False

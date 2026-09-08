@@ -26,6 +26,7 @@ from . import jobs as jobs_mod
 from . import parsers as parsers_mod
 from . import registry as reg
 from . import runner as runner_mod
+from . import scope as scope_mod
 from . import worker as worker_mod
 from .advisors import Advisor
 
@@ -33,8 +34,9 @@ from .advisors import Advisor
 class ModeError(Exception):
     """Raised when a requested delegation mode is impossible for the advisor.
 
-    The only case today is ``--write`` on a read-only executor. Callers turn it
-    into a clean non-zero exit with the message, never a traceback.
+    Raised for ``--write`` on a read-only executor, and for ``--write`` in a cwd
+    that is not a git repository (scope cannot be enforced there). Callers turn
+    it into a clean non-zero exit with the message, never a traceback.
     """
 
 
@@ -288,6 +290,7 @@ def _foreground_main(argv: list[str]) -> int:
     registry_path = Path(args.registry).expanduser()
     registry = reg.load(registry_path)
     try:
+        _require_scopable_cwd_for_write(args)
         cmd, key = build_command(advisor, args, registry)
     except ModeError as exc:
         print(f"[crossagent] {exc}", file=sys.stderr)
@@ -533,9 +536,10 @@ def _add_mode_args(parser: argparse.ArgumentParser) -> None:
             "Delegation: put the executor in write mode (edit files / run "
             "commands unattended). Expands per advisor (commandcode --yolo, "
             "opencode --auto, claude bypassPermissions, codex --sandbox "
-            "workspace-write). Grants "
-            "unbounded filesystem access unless bounded with --allow-path (start "
-            "path only; the foreground path has no --allow-path)."
+            "workspace-write). Requires the working directory to be a git "
+            "repository (refused otherwise, exit 2). Grants unbounded filesystem "
+            "access within it unless bounded with --allow-path (start path only; "
+            "the foreground path has no --allow-path)."
         ),
     )
     group.add_argument(
@@ -554,6 +558,26 @@ def _add_mode_args(parser: argparse.ArgumentParser) -> None:
         help="Claude: pass a raw --permission-mode value (mutually exclusive with --write/--plan).",
     )
     parser.set_defaults(mode=None)
+
+
+def _require_scopable_cwd_for_write(args: argparse.Namespace) -> None:
+    """Refuse ``--write`` when the cwd is not a git worktree (fail closed).
+
+    Scope enforcement (``scope.py``) attributes a delegate's writes via git; with
+    no repo there is nothing to compare against, so a write delegation would run
+    with unbounded, unauditable filesystem access. Refuse up front rather than
+    warn: the post-hoc ``undetermined`` verdict arrives only after the writes.
+    """
+    if getattr(args, "mode", None) != "write":
+        return
+    cwd = args.cwd or os.getcwd()
+    if scope_mod.is_git_repo(cwd):
+        return
+    raise ModeError(
+        f"--write requires a git repository so the delegate's writes can be "
+        f"scoped and audited, but the working directory is not one: {cwd}. "
+        f"Run from inside a git repo (or pass --cwd pointing at one), or drop --write."
+    )
 
 
 def _apply_mode(cmd: list[str], advisor: Advisor, args: argparse.Namespace) -> None:
@@ -633,6 +657,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
     registry_path = Path(args.registry).expanduser()
     registry = reg.load(registry_path)
     try:
+        _require_scopable_cwd_for_write(args)
         cmd, key = build_command(advisor, args, registry, include_prompt=False)
     except ModeError as exc:
         print(f"[crossagent] {exc}", file=sys.stderr)

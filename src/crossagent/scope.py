@@ -125,6 +125,15 @@ def _repo_root(cwd: str) -> Optional[str]:
     return root or None
 
 
+def is_git_repo(cwd: str) -> bool:
+    """Return True when *cwd* lies inside a git worktree.
+
+    A non-repo, an unavailable git, or a nonexistent *cwd* all yield False:
+    scope cannot be enforced there, and callers must fail closed.
+    """
+    return _repo_root(cwd) is not None
+
+
 def _dirty_paths(cwd: str) -> Optional[list[str]]:
     """Return repo-relative paths of every dirty file, or ``None`` on git error.
 
