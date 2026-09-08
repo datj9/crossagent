@@ -1,3 +1,4 @@
+import subprocess
 import sys
 
 import pytest
@@ -325,3 +326,44 @@ def test_explicit_permission_mode_still_works_for_claude():
 def test_foreground_write_without_allow_path_warns(capsys):
     build_command(advisors.resolve("commandcode"), _args(write=True), _reg())
     assert "unbounded filesystem access" in capsys.readouterr().err
+
+
+def _git_init(path):
+    path.mkdir()
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+
+
+def test_foreground_write_outside_git_repo_exits_2_before_dispatch(tmp_path, capsys):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    code = main(["--agent", "commandcode", "--write", "--prompt", "hi", "--cwd", str(plain)])
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "--write requires a git repository" in captured.err
+    assert str(plain) in captured.err
+    assert "running:" not in captured.err
+    assert captured.out == ""
+
+
+def test_foreground_write_inside_git_repo_reaches_dispatch(tmp_path, monkeypatch, capsys):
+    repo = tmp_path / "repo"
+    _git_init(repo)
+    missing = Advisor(
+        name="missing", executable="crossagent-definitely-missing-cli", write_args=["--yolo"]
+    )
+    monkeypatch.setattr(advisors, "resolve", lambda _name: missing)
+    code = main(["--agent", "missing", "--write", "--prompt", "hi", "--cwd", str(repo)])
+    captured = capsys.readouterr()
+    assert code == 127
+    assert "--write requires a git repository" not in captured.err
+    assert "unbounded filesystem access" in captured.err
+
+
+def test_foreground_plan_outside_git_repo_is_not_gated(tmp_path, monkeypatch, capsys):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    missing = Advisor(name="missing", executable="crossagent-definitely-missing-cli")
+    monkeypatch.setattr(advisors, "resolve", lambda _name: missing)
+    code = main(["--agent", "missing", "--plan", "--prompt", "hi", "--cwd", str(plain)])
+    assert code == 127
+    assert "--write requires a git repository" not in capsys.readouterr().err

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -997,6 +998,55 @@ def test_start_without_allow_path_records_none_scope(
     info = json.loads(command_path.read_text(encoding="utf-8"))
     assert info["scope_paths"] is None
     assert info["pass_env"] == []
+
+
+def test_start_write_outside_git_repo_exits_2_and_creates_no_job(
+    state_dir, fake_codex_in_path, tmp_path, capsys
+):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    code = main(
+        ["start", "--agent", "codex", "--write", "--prompt", "hi", "--cwd", str(plain), "--json"]
+    )
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "--write requires a git repository" in captured.err
+    assert captured.out == ""
+    assert not state_dir.exists() or not any(state_dir.iterdir())
+
+
+def test_start_write_with_allow_path_outside_git_repo_still_exits_2(
+    state_dir, fake_codex_in_path, tmp_path, capsys
+):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    code = main(
+        ["start", "--agent", "codex", "--write", "--allow-path", "src",
+         "--prompt", "hi", "--cwd", str(plain), "--json"]
+    )
+    assert code == 2
+    assert "--write requires a git repository" in capsys.readouterr().err
+
+
+def test_start_write_inside_git_repo_succeeds(state_dir, fake_codex_in_path, tmp_path, capsys):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    code = main(
+        ["start", "--agent", "codex", "--write", "--prompt", "hi", "--cwd", str(repo), "--json"]
+    )
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    assert "unbounded filesystem access" in captured.err
+    job_id = json.loads(captured.out)["job_id"]
+    job = _wait_for_terminal(job_id)
+    assert job.status == jobs_mod.JobState.SUCCEEDED
+    command_path = (
+        jobs_mod.job_dir_path(jobs_mod.default_state_root(), job_id) / "command.json"
+    )
+    info = json.loads(command_path.read_text(encoding="utf-8"))
+    assert info["mode"] == "write"
+    assert info["cwd"] == str(repo)
 
 
 def test_require_complete_fails_on_failed_check(state_dir, fake_codex_in_path, capsys):
