@@ -20,12 +20,24 @@ from typing import Any
 
 from . import __version__
 from . import advisors as advisors_mod
+from . import check as check_mod
+from . import credentials as credentials_mod
 from . import jobs as jobs_mod
 from . import parsers as parsers_mod
 from . import registry as reg
 from . import runner as runner_mod
+from . import scope as scope_mod
 from . import worker as worker_mod
 from .advisors import Advisor
+
+
+class ModeError(Exception):
+    """Raised when a requested delegation mode is impossible for the advisor.
+
+    Raised for ``--write`` on a read-only executor, and for ``--write`` in a cwd
+    that is not a git repository (scope cannot be enforced there). Callers turn
+    it into a clean non-zero exit with the message, never a traceback.
+    """
 
 
 def read_prompt(args: argparse.Namespace) -> str:
@@ -119,6 +131,7 @@ def build_command(
         cmd.append("--safe-mode")
     if args.permission_mode:
         cmd.extend(["--permission-mode", args.permission_mode])
+    _apply_mode(cmd, advisor, args)
     if args.tools is not None:
         cmd.extend(["--tools", args.tools])
     for allowed in args.allowed_tools:
@@ -151,10 +164,16 @@ def build_command(
 
 
 def _run_advisor(
-    cmd: list[str], cwd: str | None, parser_name: str
+    cmd: list[str],
+    cwd: str | None,
+    parser_name: str,
+    *,
+    env: dict[str, str] | None = None,
 ) -> tuple[int, parsers_mod.ParsedResult]:
     parser = parsers_mod.get_parser(parser_name)
-    outcome = runner_mod.run(cmd, cwd=cwd, consumer=parser, max_runtime_seconds=None)
+    outcome = runner_mod.run(
+        cmd, cwd=cwd, env=env, consumer=parser, max_runtime_seconds=None
+    )
     parsed = (
         outcome.result
         if isinstance(outcome.result, parsers_mod.ParsedResult)
@@ -234,7 +253,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=[],
         help="Claude: repeatable --allowedTools value.",
     )
-    parser.add_argument("--permission-mode", help="Claude: --permission-mode value.")
+    _add_mode_args(parser)
     parser.add_argument("--system-prompt", help="Claude: --system-prompt value.")
     parser.add_argument(
         "--raw-arg",
@@ -244,6 +263,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--registry", default=str(reg.DEFAULT_REGISTRY), help="Session registry path."
+    )
+    parser.add_argument(
+        "--pass-env",
+        action="append",
+        default=[],
+        dest="pass_env",
+        help=(
+            "Name of an environment variable to pass through to the advisor even "
+            "though it matches a credential pattern (e.g. the advisor's own API "
+            "key). Repeatable. By default all credential-bearing env vars are "
+            "withheld from the advisor, matching the durable-job path."
+        ),
     )
     parser.add_argument(
         "--list-advisors", action="store_true", help="Print known advisors and exit."
@@ -260,6 +291,11 @@ def _print_advisors() -> int:
             print(f"{'':14}    default model: {adv.default_model}")
         if adv.notes:
             print(f"{'':14}    {adv.notes}")
+        write_desc = shlex.join(adv.write_args) if adv.write_args else "unsupported"
+        plan_desc = (
+            shlex.join(adv.plan_args) if adv.plan_args else "default (read-only)"
+        )
+        print(f"{'':14}    modes: write={write_desc} | plan={plan_desc}")
     return 0
 
 
@@ -302,7 +338,12 @@ def _foreground_main(argv: list[str]) -> int:
     args._prompt = read_prompt(args)
     registry_path = Path(args.registry).expanduser()
     registry = reg.load(registry_path)
-    cmd, key = build_command(advisor, args, registry)
+    try:
+        _require_scopable_cwd_for_write(args)
+        cmd, key = build_command(advisor, args, registry)
+    except ModeError as exc:
+        print(f"[crossagent] {exc}", file=sys.stderr)
+        return 2
 
     print(f"[crossagent] running: {_redacted_command(cmd)}", file=sys.stderr)
 
@@ -326,7 +367,14 @@ def _dispatch(
     registry: dict[str, Any],
     registry_path: Path,
 ) -> int:
-    code, parsed = _run_advisor(cmd, args.cwd, advisor.result_parser)
+    # A foreground advisor is a delegate too: withhold the caller's ambient
+    # credentials (S4 policy), sharing the exact scrub the durable-job path uses
+    # (worker.build_advisor_env delegates to the same helper) so the two dispatch
+    # modes can never drift. ``--pass-env NAME`` is the caller's opt-out.
+    advisor_env = credentials_mod.scrub_env(
+        os.environ, pass_through=getattr(args, "pass_env", [])
+    )
+    code, parsed = _run_advisor(cmd, args.cwd, advisor.result_parser, env=advisor_env)
 
     if parsed.failure:
         error = parsed.error or f"{advisor.name} exited with code {code}"
@@ -394,6 +442,80 @@ def _parse_job_args(subcommand: str, argv: list[str]) -> argparse.Namespace:
             help="Maximum seconds the advisor may run (default 1800).",
         )
         parser.add_argument("--termination-grace", type=float, default=10.0)
+        parser.add_argument(
+            "--check",
+            help=(
+                "Verification command crossagent runs itself after the delegate "
+                "finishes; its exit code is the delegation verdict (0 = verified). "
+                "Without --check the job is labelled unverified, never passing."
+            ),
+        )
+        parser.add_argument(
+            "--check-timeout",
+            type=float,
+            default=check_mod.CHECK_DEFAULT_TIMEOUT_SECONDS,
+            help=(
+                "Seconds the --check command may run before it is treated as "
+                "failed (default 600)."
+            ),
+        )
+        parser.add_argument(
+            "--allow-path",
+            action="append",
+            default=None,
+            dest="allow_path",
+            help=(
+                "Declare a path (file or directory subtree) the delegate is "
+                "allowed to modify. Repeatable. When given, crossagent asserts "
+                "after the run that the delegate touched nothing outside the "
+                "declared set (compared by resolved real location, so symlink/.. "
+                "escapes cannot defeat it) and fails the delegation otherwise. "
+                "Omit to leave scope enforcement off."
+            ),
+        )
+        parser.add_argument(
+            "--pass-env",
+            action="append",
+            default=[],
+            dest="pass_env",
+            help=(
+                "Name of an environment variable to pass through to the delegate "
+                "even though it matches a credential pattern (e.g. the advisor's "
+                "own API key). Repeatable. By default all credential-bearing env "
+                "vars are withheld from the delegate."
+            ),
+        )
+        parser.add_argument(
+            "--verify-with",
+            dest="verify_with",
+            help=(
+                "Advisor that independently verifies the delegate's work in a "
+                "FRESH peer session, with the diff/answer supplied as user-turn "
+                "input (removes the implicit-authorship channel that weakens "
+                "self-grading). A failing verdict blocks the green path; a "
+                "prose-only or errored verifier degrades to unverified, never a "
+                "pass. Omit to leave verification off."
+            ),
+        )
+        parser.add_argument(
+            "--verify-model",
+            dest="verify_model",
+            help="Model/alias for the --verify-with advisor (advisor default if omitted).",
+        )
+        parser.add_argument(
+            "--escalate-to",
+            action="append",
+            default=None,
+            dest="escalate_to",
+            metavar="ADVISOR[:MODEL]",
+            help=(
+                "Re-dispatch a FAILED delegation (failing check, scope violation, "
+                "or failing verification) to this larger peer as a same-trace "
+                "child job. Repeatable to form an escalation ladder; each rung is "
+                "tried in turn as the previous fails. Bounded by the nesting-depth "
+                "cap. Omit to leave escalation off."
+            ),
+        )
         parser.add_argument("--json", action="store_true")
         parser.set_defaults(stream=True)
     elif subcommand == "wait":
@@ -446,6 +568,103 @@ def _parse_job_args(subcommand: str, argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _add_mode_args(parser: argparse.ArgumentParser) -> None:
+    """Add the delegation permission-mode flags, shared by both CLI parsers.
+
+    ``--write`` / ``--plan`` are advisor-agnostic intents that crossagent expands
+    to each advisor's native permission flags (see ``Advisor.mode_args``).
+    ``--permission-mode`` remains for passing Claude's raw value directly. All
+    three are mutually exclusive: they set the same underlying concept, so
+    combining them can only express a contradiction.
+    """
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--write",
+        dest="mode",
+        action="store_const",
+        const="write",
+        help=(
+            "Delegation: put the executor in write mode (edit files / run "
+            "commands unattended). Expands per advisor (commandcode --yolo, "
+            "opencode --auto, claude bypassPermissions, codex --sandbox "
+            "workspace-write). Requires the working directory to be a git "
+            "repository (refused otherwise, exit 2). Grants unbounded filesystem "
+            "access within it unless bounded with --allow-path (start path only; "
+            "the foreground path has no --allow-path)."
+        ),
+    )
+    group.add_argument(
+        "--plan",
+        dest="mode",
+        action="store_const",
+        const="plan",
+        help=(
+            "Delegation: put the executor in read-only/plan mode. Expands per "
+            "advisor; advisors that are already read-only by default accept this "
+            "as a no-op."
+        ),
+    )
+    group.add_argument(
+        "--permission-mode",
+        help="Claude: pass a raw --permission-mode value (mutually exclusive with --write/--plan).",
+    )
+    parser.set_defaults(mode=None)
+
+
+def _require_scopable_cwd_for_write(args: argparse.Namespace) -> None:
+    """Refuse ``--write`` when the cwd is not a git worktree (fail closed).
+
+    Scope enforcement (``scope.py``) attributes a delegate's writes via git; with
+    no repo there is nothing to compare against, so a write delegation would run
+    with unbounded, unauditable filesystem access. Refuse up front rather than
+    warn: the post-hoc ``undetermined`` verdict arrives only after the writes.
+    """
+    if getattr(args, "mode", None) != "write":
+        return
+    cwd = args.cwd or os.getcwd()
+    if scope_mod.is_git_repo(cwd):
+        return
+    raise ModeError(
+        f"--write requires a git repository so the delegate's writes can be "
+        f"scoped and audited, but the working directory is not one: {cwd}. "
+        f"Run from inside a git repo (or pass --cwd pointing at one), or drop --write."
+    )
+
+
+def _apply_mode(cmd: list[str], advisor: Advisor, args: argparse.Namespace) -> None:
+    """Expand the requested delegation mode into ``cmd`` for *advisor*.
+
+    Raises :class:`ModeError` when ``--write`` targets a read-only executor —
+    delegating a write to an advisor that cannot write is the silent failure this
+    feature exists to prevent, so it fails loudly and early. ``--plan`` on an
+    advisor with no distinct plan flags degrades to the advisor's default (a
+    warning, never an error): read-only is a safe fallback.
+    """
+    mode = getattr(args, "mode", None)
+    if mode is None:
+        return
+    if not advisor.supports_mode(mode):
+        raise ModeError(
+            f"advisor '{advisor.name}' has no write mode: delegating a write to a "
+            f"read-only executor would fail silently. Add write_args for it in "
+            f"{advisors_mod.USER_CONFIG}, or choose a write-capable advisor."
+        )
+    extra = advisor.mode_args(mode)
+    cmd.extend(extra)
+    if mode == "plan" and not extra:
+        print(
+            f"[crossagent] advisor '{advisor.name}' has no distinct plan mode; "
+            f"using its default (already read-only).",
+            file=sys.stderr,
+        )
+    if mode == "write" and not getattr(args, "allow_path", None):
+        print(
+            "[crossagent] warning: --write without --allow-path grants the executor "
+            "unbounded filesystem access.",
+            file=sys.stderr,
+        )
+
+
 def _add_advisor_args(parser: argparse.ArgumentParser) -> None:
     """Add the same advisor/invocation flags used by the foreground CLI."""
     parser.add_argument("--agent", "--advisor", dest="agent", default="claude")
@@ -462,7 +681,7 @@ def _add_advisor_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--partial", action="store_true")
     parser.add_argument("--tools")
     parser.add_argument("--allowed-tools", action="append", default=[])
-    parser.add_argument("--permission-mode")
+    _add_mode_args(parser)
     parser.add_argument("--system-prompt")
     parser.add_argument("--raw-arg", action="append", default=[])
     parser.add_argument("--registry", default=str(reg.DEFAULT_REGISTRY))
@@ -488,7 +707,23 @@ def _cmd_start(args: argparse.Namespace) -> int:
     args._prompt = read_prompt(args)
     registry_path = Path(args.registry).expanduser()
     registry = reg.load(registry_path)
-    cmd, key = build_command(advisor, args, registry, include_prompt=False)
+    try:
+        _require_scopable_cwd_for_write(args)
+        cmd, key = build_command(advisor, args, registry, include_prompt=False)
+    except ModeError as exc:
+        print(f"[crossagent] {exc}", file=sys.stderr)
+        return 2
+
+    # A raw --permission-mode is a Claude-specific literal flag, not a semantic
+    # mode, so it is NOT re-expanded onto escalation rungs (which may be other
+    # advisors). Combined with --escalate-to that means a failed write would
+    # escalate read-only. Steer the caller to --write/--plan, which do propagate.
+    if getattr(args, "permission_mode", None) and getattr(args, "escalate_to", None):
+        print(
+            "[crossagent] warning: --permission-mode does not propagate to "
+            "--escalate-to rungs; use --write/--plan so the mode carries to each rung.",
+            file=sys.stderr,
+        )
 
     state_root = jobs_mod.default_state_root()
     job_id = jobs_mod.generate_job_id()
@@ -610,8 +845,13 @@ def _cmd_wait(args: argparse.Namespace) -> int:
     else:
         print(f"[crossagent] {job.job_id} status={job.status.value}", file=sys.stderr)
 
-    if args.require_complete and job.status != jobs_mod.JobState.SUCCEEDED:
-        return 1
+    if args.require_complete:
+        # Gate on the delegation VERDICT, not just process exit (D5). A delegate
+        # that exited 0 while its --check failed is a failed delegation and must
+        # not pass this gate. "unverified" (no --check requested) preserves the
+        # historical behaviour of succeeding on a clean process exit.
+        if jobs_mod.delegation_verdict(job) not in ("verified", "unverified"):
+            return 1
     return 0
 
 
@@ -654,7 +894,68 @@ def _cmd_result(args: argparse.Namespace) -> int:
         return 1
 
     print(result_path.read_text(encoding="utf-8"), end="")
-    return 0
+    summary = _metrics_summary(job)
+    if summary:
+        print(f"[crossagent] {summary}", file=sys.stderr)
+    # The delegate finished (status SUCCEEDED), but "finished" is not "verified"
+    # (D5). Report the check verdict loudly and let it drive the exit code so a
+    # scripted caller cannot mistake a failed-check delegation for a good one.
+    verdict = jobs_mod.delegation_verdict(job)
+    _print_verdict(job, verdict, file=sys.stderr)
+    return 1 if verdict == "failed" else 0
+
+
+def _print_verdict(job: jobs_mod.Job, verdict: str, *, file: Any = sys.stderr) -> None:
+    """Print a one-line delegation verdict to *file* (stderr by default)."""
+    if verdict == "verified":
+        print("[crossagent] delegation verified — all declared gates passed", file=file)
+    elif verdict == "unverified":
+        print(
+            "[crossagent] delegation UNVERIFIED — the delegate finished but no "
+            "gate confirmed its work (no --check/--verify-with, or an "
+            "inconclusive verifier)",
+            file=file,
+        )
+    elif verdict == "failed":
+        print(
+            f"[crossagent] delegation FAILED verification — {_failed_reason(job)}",
+            file=file,
+        )
+
+
+def _failed_reason(job: jobs_mod.Job) -> str:
+    """Describe why a delegation failed, naming the actual failing gate."""
+    if job.status != jobs_mod.JobState.SUCCEEDED:
+        return f"delegate did not finish cleanly (status {job.status.value})"
+    scope = job.scope_result
+    if scope is not None and scope.get("status") != "ok":
+        return f"scope {scope.get('status')} ({len(scope.get('violating_paths') or [])} path(s))"
+    check = job.check_result
+    if check is not None and check.get("exit_code") != 0:
+        return f"check exited {check.get('exit_code')}"
+    verify = job.verify_result
+    if verify is not None and verify.get("verdict") == "fail":
+        return f"independent verification by {verify.get('advisor')} returned fail"
+    return "a declared gate did not pass"
+
+
+def _metrics_summary(job: jobs_mod.Job) -> str:
+    """Return a one-line advisor-metrics summary, or ``""`` when nothing was
+    measured. Cost/token/duration go to stderr so piped stdout stays the result.
+    """
+    parts: list[str] = []
+    total_cost = job.cost_details.get("total")
+    if job.cost_source != "unknown" and total_cost is not None:
+        parts.append(f"cost=${total_cost:.4f} ({job.cost_source})")
+    input_tokens = job.usage_details.get("input_tokens")
+    output_tokens = job.usage_details.get("output_tokens")
+    if input_tokens is not None or output_tokens is not None:
+        parts.append(f"tokens={input_tokens or 0} in / {output_tokens or 0} out")
+    if job.duration_ms is not None:
+        parts.append(f"duration={job.duration_ms}ms")
+    if job.model_reported:
+        parts.append(f"model={job.model_reported}")
+    return "  ".join(parts)
 
 
 def _cmd_logs(args: argparse.Namespace) -> int:
@@ -750,7 +1051,10 @@ def _print_job_table(listed_jobs: list[jobs_mod.Job]) -> None:
     if not listed_jobs:
         print("[crossagent] no jobs found", file=sys.stderr)
         return
-    header = f"{'JOB ID':<34} {'STATUS':<10} {'ADVISOR':<12} {'ELAPSED':>8} {'IDLE':>6}  NAME"
+    header = (
+        f"{'JOB ID':<34} {'STATUS':<10} {'ADVISOR':<12} "
+        f"{'ELAPSED':>8} {'IDLE':>6} {'COST':>9} {'CHECK':>6}  NAME"
+    )
     print(header)
     for job in listed_jobs:
         entry = _format_status(job)
@@ -762,7 +1066,8 @@ def _print_job_table(listed_jobs: list[jobs_mod.Job]) -> None:
         )
         print(
             f"{job.job_id:<34} {job.status.value:<10} {job.advisor:<12} "
-            f"{elapsed:>8} {idle:>6}  {job.name}"
+            f"{elapsed:>8} {idle:>6} {_format_cost(job):>9} {_format_check(job):>6}  "
+            f"{job.name}"
         )
 
 
@@ -770,6 +1075,32 @@ def _format_duration(elapsed_seconds: int, job: jobs_mod.Job) -> str:
     if job.duration_seconds is not None:
         return _format_seconds(int(job.duration_seconds))
     return _format_seconds(elapsed_seconds)
+
+
+def _format_cost(job: jobs_mod.Job) -> str:
+    """Return a short cost cell. An unmeasured cost shows ``-``, never ``$0``.
+
+    A measured zero (``cost_source`` advisor/computed) still renders as an
+    amount so it stays distinguishable from *not measured* (D7).
+    """
+    total = job.cost_details.get("total")
+    if job.cost_source == "unknown" or total is None:
+        return "-"
+    return f"${total:.4f}"
+
+
+def _format_check(job: jobs_mod.Job) -> str:
+    """Return the check cell. ``-`` means no check ran (unverified), NOT a pass.
+
+    The check outcome is shown independently of STATUS so a reader sees both
+    "did the delegate finish" (STATUS) and "did the work verify" (CHECK) — a
+    ``succeeded``/``FAIL`` row is exactly the failed delegation the product
+    exists to surface (D5).
+    """
+    check = job.check_result
+    if check is None:
+        return "-"
+    return "pass" if check.get("exit_code") == 0 else "FAIL"
 
 
 def _cmd_dashboard(args: argparse.Namespace) -> int:
@@ -827,6 +1158,23 @@ def _write_command_info(
         "name": args.name,
         "model": effective_model(advisor, args, is_resume=is_resume),
         "advisor": advisor.name,
+        "check": getattr(args, "check", None),
+        "check_timeout": getattr(
+            args, "check_timeout", check_mod.CHECK_DEFAULT_TIMEOUT_SECONDS
+        ),
+        # Delegation security posture (S4). ``scope_paths`` is ``None`` when no
+        # --allow-path was given (enforcement off), distinct from an empty list.
+        "scope_paths": getattr(args, "allow_path", None),
+        "pass_env": getattr(args, "pass_env", []),
+        # Independent verification + escalation ladder (S5). ``verify_with`` is
+        # ``None`` when off; ``escalate_to`` is the (possibly empty) rung list.
+        "verify_with": getattr(args, "verify_with", None),
+        "verify_model": getattr(args, "verify_model", None),
+        "escalate_to": getattr(args, "escalate_to", None) or [],
+        # Semantic delegation mode ("write"/"plan"/None). Persisted so escalation
+        # can re-expand it against the *child's* advisor rather than replaying the
+        # parent's literal permission flags (which are advisor-specific).
+        "mode": getattr(args, "mode", None),
     }
     jobs_mod.atomic_json_write(info, job_dir / "command.json")
 

@@ -34,6 +34,7 @@ from crossagent.jobs import (
     create_cancel_request,
     create_job_dir,
     default_state_root,
+    delegation_verdict,
     generate_job_id,
     generate_trace_id,
     is_terminal,
@@ -122,7 +123,7 @@ def test_transition_to_basic():
     updated = transition_to(job, JobState.RUNNING)
     assert updated.status == JobState.RUNNING
     assert updated.job_id == "job_test_1"
-    assert updated.schema_version == 2
+    assert updated.schema_version == 3
     assert updated.updated_at != ""
     assert updated.finished_at is None
 
@@ -177,10 +178,12 @@ def test_transition_to_persists_when_job_dir_given(tmp_path):
 
 def test_append_event_writes_jsonl_line(tmp_path):
     from crossagent.jobs import append_event
+
     append_event(tmp_path, "transition", from_state="pending", to_state="running")
     log_path = tmp_path / "events.jsonl"
     assert log_path.exists()
     import json as _json
+
     line = log_path.read_text(encoding="utf-8").strip()
     parsed = _json.loads(line)
     assert parsed["event"] == "transition"
@@ -190,12 +193,17 @@ def test_append_event_writes_jsonl_line(tmp_path):
 
 
 def test_transition_to_appends_audit_event(tmp_path):
-    job = Job(job_id="job_audit", status=JobState.RUNNING, started_at="2026-07-19T10:00:00+00:00")
+    job = Job(
+        job_id="job_audit",
+        status=JobState.RUNNING,
+        started_at="2026-07-19T10:00:00+00:00",
+    )
     transition_to(job, JobState.SUCCEEDED, job_dir=tmp_path)
     log_path = tmp_path / "events.jsonl"
     assert log_path.exists()
     import json as _json
-    lines = [l for l in log_path.read_text().splitlines() if l.strip()]
+
+    lines = [line for line in log_path.read_text().splitlines() if line.strip()]
     assert len(lines) == 1
     parsed = _json.loads(lines[0])
     assert parsed["from_state"] == "running"
@@ -205,16 +213,25 @@ def test_transition_to_appends_audit_event(tmp_path):
 
 def test_append_event_does_not_raise_on_unwritable_dir(tmp_path):
     from crossagent.jobs import append_event
+
     bad_dir = tmp_path / "does-not-exist"
     append_event(bad_dir, "transition", from_state="x", to_state="y")
 
 
 def test_append_event_records_actor(tmp_path):
     from crossagent.jobs import append_event
+
     append_event(tmp_path, "transition", actor="user", from_state="x", to_state="y")
-    append_event(tmp_path, "transition", actor="system:reconcile", from_state="y", to_state="z")
+    append_event(
+        tmp_path, "transition", actor="system:reconcile", from_state="y", to_state="z"
+    )
     import json as _json
-    lines = [l for l in (tmp_path / "events.jsonl").read_text().splitlines() if l.strip()]
+
+    lines = [
+        line
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
     assert len(lines) == 2
     assert _json.loads(lines[0])["actor"] == "user"
     assert _json.loads(lines[1])["actor"] == "system:reconcile"
@@ -222,8 +239,10 @@ def test_append_event_records_actor(tmp_path):
 
 def test_append_event_default_actor_is_user(tmp_path):
     from crossagent.jobs import append_event
+
     append_event(tmp_path, "transition", from_state="x", to_state="y")
     import json as _json
+
     parsed = _json.loads((tmp_path / "events.jsonl").read_text().strip())
     assert parsed["actor"] == "user"
 
@@ -232,10 +251,14 @@ def test_reconcile_stale_tags_actor_system(tmp_path):
     """When reconcile_stale abandons a dead worker, the audit event must
     carry actor='system:reconcile' so it can be filtered from user-initiated
     transitions in the dashboard."""
-    import os
     from crossagent.jobs import (
-        Job, JobState, save_state, job_dir_path, reconcile_stale,
+        Job,
+        JobState,
+        save_state,
+        job_dir_path,
+        reconcile_stale,
     )
+
     fake_pid = 2_000_000
     job = Job(
         job_id="job_reconcile_actor",
@@ -249,7 +272,12 @@ def test_reconcile_stale_tags_actor_system(tmp_path):
     save_state(job_dir, job)
     reconcile_stale(job, job_dir)
     import json as _json
-    lines = [l for l in (job_dir / "events.jsonl").read_text().splitlines() if l.strip()]
+
+    lines = [
+        line
+        for line in (job_dir / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
     assert len(lines) == 1
     parsed = _json.loads(lines[0])
     assert parsed["actor"] == "system:reconcile"
@@ -448,7 +476,7 @@ def test_load_state_non_dict(tmp_path):
 def test_status_response_includes_required_fields():
     job = Job(job_id="job_sr1", status=JobState.RUNNING, advisor="claude")
     resp = status_response(job)
-    assert resp == {"schema_version": 2, "job_id": "job_sr1", "status": "running"}
+    assert resp == {"schema_version": 3, "job_id": "job_sr1", "status": "running"}
 
 
 def test_status_response_excludes_prompt_and_command():
@@ -696,7 +724,7 @@ def test_load_state_accepts_v1_and_v2(tmp_path):
 def test_load_state_rejects_unsupported_version(tmp_path):
     job_dir = create_job_dir(tmp_path, "job_badver2")
     atomic_json_write(
-        {"schema_version": 3, "job_id": "job_badver2", "status": "running"},
+        {"schema_version": 4, "job_id": "job_badver2", "status": "running"},
         job_dir / "state.json",
     )
     with pytest.raises(InvalidStateError):
@@ -1636,3 +1664,299 @@ def test_transition_to_handles_z_suffix_started_at(tmp_path):
     assert updated.finished_at is not None
     assert updated.duration_seconds is not None
     assert updated.duration_seconds >= 0
+
+
+# =========================================================================
+# Delegation verdict (slice S3): "delegate finished" vs "work verified"
+# =========================================================================
+
+
+def _succeeded(check_exit=None):
+    check = (
+        None
+        if check_exit is None
+        else {
+            "command": "pytest",
+            "exit_code": check_exit,
+            "stdout_tail": "",
+            "stderr_tail": "",
+        }
+    )
+    return Job(job_id="job_v", status=JobState.SUCCEEDED, check_result=check)
+
+
+def test_delegation_verdict_incomplete_while_running():
+    job = Job(job_id="job_v", status=JobState.RUNNING)
+    assert delegation_verdict(job) == "incomplete"
+
+
+def test_delegation_verdict_failed_when_delegate_did_not_finish():
+    job = Job(job_id="job_v", status=JobState.FAILED)
+    assert delegation_verdict(job) == "failed"
+
+
+def test_delegation_verdict_failed_delegate_ignores_a_passing_check():
+    """A crashed delegate is a failed delegation even if a pre-existing check
+    still passes — status not SUCCEEDED dominates."""
+    job = Job(
+        job_id="job_v",
+        status=JobState.FAILED,
+        check_result={
+            "command": "pytest",
+            "exit_code": 0,
+            "stdout_tail": "",
+            "stderr_tail": "",
+        },
+    )
+    assert delegation_verdict(job) == "failed"
+
+
+def test_delegation_verdict_unverified_when_no_check():
+    assert delegation_verdict(_succeeded(check_exit=None)) == "unverified"
+
+
+def test_delegation_verdict_verified_when_check_passes():
+    assert delegation_verdict(_succeeded(check_exit=0)) == "verified"
+
+
+def test_delegation_verdict_failed_when_check_fails_despite_clean_exit():
+    """The load-bearing case: delegate exits 0 but the check fails -> failed."""
+    assert delegation_verdict(_succeeded(check_exit=1)) == "failed"
+
+
+def test_runtime_status_includes_check_fields():
+    job = _succeeded(check_exit=2)
+    result = runtime_status(job)
+    assert result["delegation_verdict"] == "failed"
+    assert result["check_result"]["exit_code"] == 2
+
+
+def test_v2_record_loads_with_check_result_none(tmp_path):
+    """A pre-S3 record on disk (no check_result key) loads as unverified, never
+    as a failed or passing check (D7: absent != false)."""
+    job_dir = create_job_dir(tmp_path, "job_v2")
+    atomic_json_write(
+        {
+            "schema_version": 2,
+            "job_id": "job_v2",
+            "status": "succeeded",
+        },
+        job_dir / "state.json",
+    )
+    loaded = load_state(job_dir)
+    assert loaded.check_result is None
+    assert delegation_verdict(loaded) == "unverified"
+
+
+# =========================================================================
+# Delegation verdict interaction with the diff-scope assertion (slice S4).
+# A declared scope that was violated OR could not be determined fails the
+# delegation (fail closed) without adding a fifth verdict state.
+# =========================================================================
+
+
+def _scope(status, violating=()):
+    return {
+        "declared": ["src"],
+        "status": status,
+        "violating_paths": list(violating),
+        "detail": "",
+    }
+
+
+def _succeeded_scope(scope_status, *, check_exit=None):
+    check = (
+        None
+        if check_exit is None
+        else {
+            "command": "pytest",
+            "exit_code": check_exit,
+            "stdout_tail": "",
+            "stderr_tail": "",
+        }
+    )
+    return Job(
+        job_id="job_v",
+        status=JobState.SUCCEEDED,
+        scope_result=_scope(scope_status),
+        check_result=check,
+    )
+
+
+def test_delegation_verdict_scope_violation_fails_even_with_passing_check():
+    """A scope violation dominates: a passing check cannot green a delegation
+    that wrote outside its declared allowlist."""
+    job = _succeeded_scope("violated", check_exit=0)
+    assert delegation_verdict(job) == "failed"
+
+
+def test_delegation_verdict_undetermined_scope_is_failed_not_pass():
+    """Fail closed: an undetermined scope (couldn't tell what changed) is never
+    verified, even with a passing check."""
+    job = _succeeded_scope("undetermined", check_exit=0)
+    assert delegation_verdict(job) == "failed"
+
+
+def test_delegation_verdict_scope_ok_defers_to_check_gate():
+    """An in-bounds scope does not by itself verify: the check gate still runs.
+    Scope ok + passing check -> verified; scope ok + no check -> unverified."""
+    assert delegation_verdict(_succeeded_scope("ok", check_exit=0)) == "verified"
+    assert delegation_verdict(_succeeded_scope("ok", check_exit=None)) == "unverified"
+
+
+def test_delegation_verdict_scope_ok_but_check_fails_is_failed():
+    assert delegation_verdict(_succeeded_scope("ok", check_exit=1)) == "failed"
+
+
+def test_delegation_verdict_absent_scope_preserves_pre_s4_behaviour():
+    """No scope declared (scope_result None) skips the gate entirely."""
+    job = Job(job_id="job_v", status=JobState.SUCCEEDED, scope_result=None)
+    assert delegation_verdict(job) == "unverified"
+
+
+def test_runtime_status_surfaces_scope_and_withheld_env():
+    job = Job(
+        job_id="job_v",
+        status=JobState.SUCCEEDED,
+        scope_result=_scope("violated", violating=["evil.py"]),
+        withheld_env=["AWS_SECRET_ACCESS_KEY"],
+    )
+    result = runtime_status(job)
+    assert result["scope_result"]["status"] == "violated"
+    assert result["withheld_env"] == ["AWS_SECRET_ACCESS_KEY"]
+    assert result["delegation_verdict"] == "failed"
+
+
+def test_v3_scope_result_round_trips_on_disk(tmp_path):
+    job_dir = create_job_dir(tmp_path, "job_scope_rt")
+    job = Job(
+        job_id="job_scope_rt",
+        status=JobState.SUCCEEDED,
+        scope_result=_scope("violated", violating=["evil.py"]),
+        withheld_env=["GITHUB_TOKEN"],
+    )
+    save_state(job_dir, job)
+    loaded = load_state(job_dir)
+    assert loaded.scope_result == _scope("violated", violating=["evil.py"])
+    assert loaded.withheld_env == ["GITHUB_TOKEN"]
+
+
+# =========================================================================
+# Delegation verdict interaction with the independent verification pass
+# (slice S5). A fresh-session verifier grades the delegate's artifact; a
+# structured "fail" blocks green even when the shell check passed (D6),
+# while a prose-only "unverified" degrades gracefully and never greens.
+# =========================================================================
+
+
+def _verify(verdict, *, structured=True):
+    return {
+        "advisor": "codex",
+        "model": "gpt-5.6-sol",
+        "verdict": verdict,
+        "structured": structured,
+        "detail": "",
+    }
+
+
+def _succeeded_verify(verify_verdict=None, *, check_exit=None, scope_status=None):
+    check = (
+        None
+        if check_exit is None
+        else {
+            "command": "pytest",
+            "exit_code": check_exit,
+            "stdout_tail": "",
+            "stderr_tail": "",
+        }
+    )
+    return Job(
+        job_id="job_v",
+        status=JobState.SUCCEEDED,
+        check_result=check,
+        scope_result=None if scope_status is None else _scope(scope_status),
+        verify_result=None if verify_verdict is None else _verify(verify_verdict),
+    )
+
+
+def test_delegation_verdict_verified_when_verification_passes():
+    """A structured pass from the fresh verifier greens the delegation even with
+    no shell check declared."""
+    assert delegation_verdict(_succeeded_verify("pass")) == "verified"
+
+
+def test_delegation_verdict_failed_when_verification_fails():
+    assert delegation_verdict(_succeeded_verify("fail")) == "failed"
+
+
+def test_delegation_verdict_verify_fail_blocks_green_despite_passing_check():
+    """The load-bearing D6 case: the shell check passed, but the independent
+    verifier says the work is wrong -> failed. A failing verification blocks the
+    green path a same-context self-grade might have waved through."""
+    job = _succeeded_verify("fail", check_exit=0)
+    assert delegation_verdict(job) == "failed"
+
+
+def test_delegation_verdict_prose_verification_is_unverified_not_pass():
+    """An advisor that produced no machine-checkable verdict (prose) degrades to
+    'unverified' and never greens: inconclusive is not a pass (D4)."""
+    job = _succeeded_verify("unverified", check_exit=None)
+    assert delegation_verdict(job) == "unverified"
+
+
+def test_delegation_verdict_errored_verification_is_inconclusive():
+    """A verifier that could not run leaves the delegation unverified, never a
+    hard fail (the verifier broke, not the work)."""
+    assert delegation_verdict(_succeeded_verify("error")) == "unverified"
+
+
+def test_delegation_verdict_prose_verify_does_not_downgrade_passing_check():
+    """A passing shell check greens the delegation; an inconclusive verify does
+    not drag it back to unverified."""
+    job = _succeeded_verify("unverified", check_exit=0)
+    assert delegation_verdict(job) == "verified"
+
+
+def test_delegation_verdict_scope_violation_dominates_passing_verification():
+    """Fail closed still wins: a scope violation fails the delegation even when
+    the independent verifier passed."""
+    job = _succeeded_verify("pass", scope_status="violated")
+    assert delegation_verdict(job) == "failed"
+
+
+def test_delegation_verdict_absent_verify_preserves_pre_s5_behaviour():
+    job = Job(job_id="job_v", status=JobState.SUCCEEDED, verify_result=None)
+    assert delegation_verdict(job) == "unverified"
+
+
+def test_runtime_status_surfaces_verify_result():
+    job = _succeeded_verify("fail", check_exit=0)
+    result = runtime_status(job)
+    assert result["verify_result"]["verdict"] == "fail"
+    assert result["delegation_verdict"] == "failed"
+
+
+def test_v3_verify_result_round_trips_on_disk(tmp_path):
+    job_dir = create_job_dir(tmp_path, "job_verify_rt")
+    job = Job(
+        job_id="job_verify_rt",
+        status=JobState.SUCCEEDED,
+        verify_result=_verify("pass", structured=True),
+    )
+    save_state(job_dir, job)
+    loaded = load_state(job_dir)
+    assert loaded.verify_result == _verify("pass", structured=True)
+    assert delegation_verdict(loaded) == "verified"
+
+
+def test_v2_record_without_verify_result_still_loads(tmp_path):
+    """A pre-S5 record on disk (no verify_result key) loads with it absent, not
+    crashing — absent (not requested) stays distinct from failed (D7)."""
+    job_dir = create_job_dir(tmp_path, "job_v2_verify")
+    atomic_json_write(
+        {"schema_version": 2, "job_id": "job_v2_verify", "status": "succeeded"},
+        job_dir / "state.json",
+    )
+    loaded = load_state(job_dir)
+    assert loaded.verify_result is None
+    assert delegation_verdict(loaded) == "unverified"

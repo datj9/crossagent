@@ -17,10 +17,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from . import advisors as advisors_mod
+from . import check as check_mod
+from . import credentials as credentials_mod
+from . import escalate as escalate_mod
 from . import jobs as jobs_mod
 from . import parsers as parsers_mod
 from . import registry as reg_mod
 from . import runner as runner_mod
+from . import scope as scope_mod
+from . import verify as verify_mod
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +45,25 @@ class _JobCommand:
     name: Optional[str]
     model: str
     advisor: str
+    check: Optional[str]
+    check_timeout: float
+    # Delegation security posture (slice S4). ``scope_paths`` is the declared
+    # allowlist — ``None`` means no scope was declared (enforcement off), which
+    # stays distinct from a declared-and-empty list. ``pass_env`` names the
+    # credential env vars the caller opted to pass through to the delegate.
+    scope_paths: Optional[list[str]]
+    pass_env: list[str]
+    # Independent verification + escalation (slice S5). ``verify_with`` names the
+    # advisor that grades the delegate's artifact in a fresh session (``None`` =
+    # off). ``escalate_to`` is the ordered ladder of ``advisor[:model]`` rungs a
+    # failed delegation is re-dispatched up ([] = off).
+    verify_with: Optional[str]
+    verify_model: Optional[str]
+    escalate_to: list[str]
+    # Semantic delegation mode ("write"/"plan"/None). The original job's command
+    # already has the expanded permission flags baked into ``command``; ``mode`` is
+    # carried so an escalation can re-expand the intent against the child advisor.
+    mode: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +155,28 @@ def worker_main(job_id: str, state_dir: Path) -> int:
         last_event="worker.started",
     )
 
-    advisor_env = build_advisor_env(job, state_dir)
+    # Capture the pre-delegation working-tree baseline BEFORE the delegate runs,
+    # so a tree that was already dirty is not later misattributed to it (S4).
+    # Only when a scope was declared — otherwise enforcement is off entirely.
+    scope_baseline = (
+        scope_mod.capture_baseline(command.cwd)
+        if command.scope_paths is not None
+        else None
+    )
+
+    # Credential-bearing env vars are withheld from the delegate by default
+    # (S4). Record only the NAMES withheld (never values) for the audit trail;
+    # both the launch env and this record use the same predicate, so they agree.
+    withheld = credentials_mod.withheld_names(os.environ, command.pass_env)
+    advisor_env = build_advisor_env(job, state_dir, pass_env=command.pass_env)
+    if withheld:
+        jobs_mod.append_event(
+            job_dir,
+            "env_scrub",
+            actor="system:security",
+            withheld=withheld,
+            count=len(withheld),
+        )
 
     try:
         outcome = runner_mod.run(
@@ -191,8 +237,31 @@ def worker_main(job_id: str, state_dir: Path) -> int:
         final_state = jobs_mod.JobState.FAILED
         error = f"Advisor exited with code {outcome.exit_code}"
 
+    # Run the independent check-gate (S3) if one was configured. This runs
+    # regardless of the delegate's own outcome so failing-check output is
+    # captured even when the delegate crashed. ``None`` means no check ran →
+    # the delegation is *unverified*, never silently a pass (D5).
+    check_result = _run_configured_check(command, job_dir)
+
+    # Run the diff-scope assertion (S4) if an allowlist was declared. It fails
+    # closed: a violation OR an inability to determine what changed is recorded
+    # distinctly and drives the delegation verdict to failed, never a pass.
+    scope_result = _run_scope_assertion(command, scope_baseline, job_dir)
+
+    # Run the independent verification pass (S5) if a verifier was declared. A
+    # FRESH peer session grades the delegate's artifact supplied as user-turn
+    # input (D6). A structured ``fail`` verdict blocks the green path; a
+    # prose-only or errored verifier degrades to inconclusive, never a pass.
+    verify_result = _run_verification(command, prompt, parsed.result, job_dir)
+
     now = datetime.now(timezone.utc).isoformat()
-    jobs_mod.transition_to(
+    # Persist the advisor telemetry the parser extracted (S1) and the check-gate
+    # outcome (S3) on the SAME terminal transition — the worker is the only
+    # writer of terminal state, so any field not forwarded here never lands on
+    # disk. ``parsed`` fields and ``check_result`` already default to unknown /
+    # None when nothing was measured (D4/D7), so this never fails the job and
+    # never turns an unmeasured metric into a zero or an unrun check into a pass.
+    job = jobs_mod.transition_to(
         job,
         final_state,
         job_dir=job_dir,
@@ -200,9 +269,155 @@ def worker_main(job_id: str, state_dir: Path) -> int:
         advisor_exit_code=outcome.exit_code,
         last_activity_at=now,
         last_event=final_state.value,
+        usage_details=parsed.usage_details,
+        cost_details=parsed.cost_details,
+        duration_ms=parsed.duration_ms,
+        cost_source=parsed.cost_source,
+        model_reported=parsed.model_reported,
+        check_result=check_result,
+        scope_result=scope_result,
+        withheld_env=withheld,
+        verify_result=verify_result,
+    )
+
+    # Escalate-on-failure (S5). Runs AFTER the terminal state is persisted, so
+    # the failed parent is complete on disk before its same-trace child is
+    # spawned. maybe_escalate is a no-op unless the delegation FAILED and an
+    # escalation ladder remains; it never raises and respects MAX_NESTING_DEPTH.
+    escalate_mod.maybe_escalate(
+        job,
+        prompt=prompt,
+        state_root=state_dir,
+        job_dir=job_dir,
+        cwd=command.cwd,
+        registry_path=command.registry_path,
+        escalate_to=command.escalate_to,
+        check=command.check,
+        check_timeout=command.check_timeout,
+        scope_paths=command.scope_paths,
+        pass_env=command.pass_env,
+        verify_with=command.verify_with,
+        verify_model=command.verify_model,
+        mode=command.mode,
     )
 
     return 0
+
+
+def _run_configured_check(
+    command: _JobCommand, job_dir: Path
+) -> Optional[jobs_mod.CheckResultDict]:
+    """Run the caller's ``--check`` command, if any, and return its outcome.
+
+    Returns ``None`` when no check was configured — a missing gate is recorded
+    as *unverified*, never as a pass (D5). The check runs in the delegate's cwd
+    so it observes the delegate's edits.
+    """
+    if not command.check:
+        return None
+    outcome = check_mod.run_check(
+        command.check,
+        cwd=command.cwd,
+        timeout=command.check_timeout,
+    )
+    # Audit the verdict, but never the check's OUTPUT (which can contain
+    # secrets) — only the caller-supplied command and its deterministic exit
+    # code go to the append-only audit log.
+    jobs_mod.append_event(
+        job_dir,
+        "check",
+        actor="system:check",
+        command=command.check,
+        exit_code=outcome.exit_code,
+    )
+    return outcome.to_dict()
+
+
+def _run_scope_assertion(
+    command: _JobCommand,
+    baseline: Optional[scope_mod.ScopeBaseline],
+    job_dir: Path,
+) -> Optional[jobs_mod.ScopeResultDict]:
+    """Assert the delegate's writes against the declared allowlist (S4).
+
+    Returns ``None`` when no scope was declared (enforcement off) — kept
+    distinct from a declared scope that passed (D7). Otherwise the outcome is
+    audited (status + offending paths, which are file paths, never secrets) and
+    persisted. ``assert_scope`` never raises, so this can never crash the worker
+    nor degrade a scope failure into a silent pass.
+    """
+    if command.scope_paths is None or baseline is None:
+        return None
+    outcome = scope_mod.assert_scope(baseline, command.scope_paths, command.cwd)
+    jobs_mod.append_event(
+        job_dir,
+        "scope",
+        actor="system:scope",
+        status=outcome.status,
+        declared=list(outcome.declared),
+        violating_paths=list(outcome.violating_paths),
+    )
+    return outcome.to_dict()
+
+
+def _run_verification(
+    command: _JobCommand,
+    prompt: str,
+    result_text: Optional[str],
+    job_dir: Path,
+) -> Optional[jobs_mod.VerifyResultDict]:
+    """Run the independent verification pass (S5), if a verifier was declared.
+
+    Returns ``None`` when no verifier was requested — distinct from a
+    verification that ran and failed (D7). The verifier is a FRESH peer session
+    grading the delegate's artifact as user-turn input (D6); it is a delegate
+    too, so it runs with credentials scrubbed. An unknown verifier advisor or a
+    delegate that produced no artifact is recorded as an ``error`` outcome
+    (inconclusive), never a crash and never a silent pass.
+    """
+    if not command.verify_with:
+        return None
+    try:
+        advisor = advisors_mod.resolve(command.verify_with)
+    except KeyError as exc:
+        outcome = verify_mod.VerifyOutcome(
+            command.verify_with,
+            command.verify_model,
+            "error",
+            False,
+            f"unknown verifier advisor: {exc}",
+        )
+    else:
+        structured = advisor.json_schema_flag is not None
+        if result_text is None:
+            outcome = verify_mod.VerifyOutcome(
+                advisor.name,
+                command.verify_model,
+                "error",
+                structured,
+                "delegate produced no artifact to verify",
+            )
+        else:
+            artifact = verify_mod.build_artifact(prompt, result_text, command.cwd)
+            outcome = verify_mod.run_verification(
+                advisor,
+                command.verify_model,
+                artifact,
+                cwd=command.cwd,
+                pass_env=command.pass_env,
+                timeout=verify_mod.VERIFY_DEFAULT_TIMEOUT_SECONDS,
+            )
+    # Audit the verdict, never the artifact (which can contain repo content).
+    jobs_mod.append_event(
+        job_dir,
+        "verify",
+        actor="system:verify",
+        advisor=outcome.advisor,
+        model=outcome.model,
+        verdict=outcome.verdict,
+        structured=outcome.structured,
+    )
+    return outcome.to_dict()
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +438,28 @@ def _load_command(job_dir: Path) -> _JobCommand:
         name=data.get("name"),
         model=str(data.get("model", "")),
         advisor=str(data["advisor"]),
+        check=data.get("check"),
+        check_timeout=float(
+            data.get("check_timeout", check_mod.CHECK_DEFAULT_TIMEOUT_SECONDS)
+        ),
+        scope_paths=_load_scope_paths(data.get("scope_paths")),
+        pass_env=[str(name) for name in data.get("pass_env", [])],
+        verify_with=data.get("verify_with"),
+        verify_model=data.get("verify_model"),
+        escalate_to=[str(rung) for rung in data.get("escalate_to", [])],
+        mode=data.get("mode"),
     )
+
+
+def _load_scope_paths(raw: Any) -> Optional[list[str]]:
+    """Return the declared allowlist, or ``None`` when no scope was declared.
+
+    Only a JSON list is a declaration; anything else (absent key, ``null``)
+    means enforcement is off — kept distinct from a declared empty list.
+    """
+    if not isinstance(raw, list):
+        return None
+    return [str(pattern) for pattern in raw]
 
 
 def _append_prompt(cmd: list[str], delivery: str, prompt: str) -> None:
@@ -247,19 +483,28 @@ def _chmod_private(path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def build_advisor_env(job: jobs_mod.Job, state_root: Path) -> dict[str, str]:
+def build_advisor_env(
+    job: jobs_mod.Job,
+    state_root: Path,
+    *,
+    pass_env: Optional[list[str]] = None,
+) -> dict[str, str]:
     """Build the environment dict for the advisor subprocess with lineage vars.
 
-    Starts from ``os.environ.copy()`` and overwrites (does not setdefault) the
-    ``CROSSAGENT_PARENT_JOB_ID``, ``CROSSAGENT_TRACE_ID``,
-    ``CROSSAGENT_ORCHESTRATOR_LABEL``, ``CROSSAGENT_NESTING_DEPTH``,
-    and ``CROSSAGENT_STATE_DIR`` variables so a nested ``crossagent start``
-    inside the advisor inherits the correct lineage.
+    Starts from ``os.environ.copy()``, then withholds credential-bearing
+    variables from the delegate (slice S4) — a delegate is partially untrusted
+    and must not receive the caller's ambient secrets. Variables named in
+    *pass_env* are the caller's explicit opt-in exceptions (e.g. the advisor's
+    own API key). Lineage variables are set AFTER the scrub so they are never
+    stripped: it overwrites (does not setdefault) ``CROSSAGENT_PARENT_JOB_ID``,
+    ``CROSSAGENT_TRACE_ID``, ``CROSSAGENT_ORCHESTRATOR_LABEL``,
+    ``CROSSAGENT_NESTING_DEPTH``, and ``CROSSAGENT_STATE_DIR`` so a nested
+    ``crossagent start`` inside the advisor inherits the correct lineage.
 
     This function is deliberately side-effect-free and testable without spawning
     a process.
     """
-    env = os.environ.copy()
+    env = credentials_mod.scrub_env(os.environ, pass_through=pass_env or [])
     env["CROSSAGENT_PARENT_JOB_ID"] = job.job_id
     env["CROSSAGENT_TRACE_ID"] = job.trace_id or ""
     env["CROSSAGENT_ORCHESTRATOR_LABEL"] = job.orchestrator_label or ""

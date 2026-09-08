@@ -12,11 +12,32 @@ import os
 import re
 import sys
 import tempfile
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Literal, Optional
+
+# The gate-result shapes now live in the dependency-free ``types`` module.
+# ``jobs`` uses these three as ``Job`` field annotations, which also re-exports
+# them for callers that still reference ``jobs_mod.CheckResultDict`` (e.g.
+# ``worker``). ``ScopeStatus``/``VerifyVerdict`` are imported straight from
+# ``types`` by ``scope``/``verify``.
+from .types import CheckResultDict, ScopeResultDict, VerifyResultDict
+
+# Where a job's cost figure came from. ``advisor`` is the vendor-declared
+# estimate, ``computed`` is derived from a local price table, and ``unknown``
+# means no cost was measured — never conflate that with a measured ``0.0``.
+CostSource = Literal["advisor", "computed", "unknown"]
+
+
+# The delegation verdict keeps "the delegate finished" separate from "the work
+# was verified" (D5). See :func:`delegation_verdict`.
+DelegationVerdict = Literal["verified", "failed", "unverified", "incomplete"]
+
+# Highest ``schema_version`` this build writes. Older records still load.
+CURRENT_SCHEMA_VERSION = 3
+_SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3})
 
 # Lineage parent ids arrive from CLI flags and environment variables, so they
 # are untrusted. Only the generated ``job_<...>`` shape is accepted; rejecting
@@ -115,7 +136,7 @@ class Job:
     Every JSON response includes *schema_version*, *job_id*, and *status*.
     """
 
-    schema_version: int = 2
+    schema_version: int = CURRENT_SCHEMA_VERSION
     job_id: str = ""
     status: JobState = JobState.PENDING
     advisor: str = ""
@@ -140,6 +161,107 @@ class Job:
     parent_job_id: Optional[str] = None
     orchestrator_label: Optional[str] = None
     nesting_depth: Optional[int] = None
+    # --- Advisor metrics (schema v3) -------------------------------------
+    # Two open-keyed maps (D1): per-advisor token categories and USD costs.
+    # Empty maps + ``cost_source == "unknown"`` mean *unmeasured*, which must
+    # stay distinguishable from a measured zero (D7). Token counts are NOT
+    # additive (D2): each token lives under exactly one ``usage_details`` key.
+    usage_details: dict[str, int] = field(default_factory=dict)
+    cost_details: dict[str, float] = field(default_factory=dict)
+    duration_ms: Optional[int] = None
+    cost_source: CostSource = "unknown"
+    model_reported: Optional[str] = None
+    # --- Independent check-gate (schema v3, slice S3) --------------------
+    # ``None`` means no check ran → *unverified*; a present dict with a
+    # non-zero ``exit_code`` is a failed delegation even when ``status`` is
+    # SUCCEEDED. The delegate's process outcome (``status``) and the work's
+    # verification (this field) are deliberately separate fields so "finished"
+    # can never be read as "verified" (D5).
+    check_result: Optional[CheckResultDict] = None
+    # --- Delegation security posture (schema v3, slice S4) ---------------
+    # ``scope_result`` is the diff-scope assertion outcome. ``None`` means no
+    # allowlist was declared (enforcement off) — distinct from a declared scope
+    # that passed (D7). A declared scope that was violated OR could not be
+    # determined fails the delegation (fail closed); see delegation_verdict.
+    scope_result: Optional[ScopeResultDict] = None
+    # Names — never values — of credential-bearing env vars withheld from the
+    # advisor child. ``None`` means the scrub did not run (a pre-S4 record); an
+    # empty list means it ran and withheld nothing (D7: absent != empty).
+    withheld_env: Optional[list[str]] = None
+    # --- Independent verification pass (schema v3, slice S5) -------------
+    # ``verify_result`` is the outcome of grading the delegate's artifact in a
+    # FRESH peer session (D6). ``None`` means no verification was requested —
+    # distinct from a verification that ran and failed or could not decide (D7).
+    # A ``verdict`` of ``fail`` blocks the green path; ``pass`` can green it;
+    # ``unverified``/``error`` are inconclusive. See :func:`delegation_verdict`.
+    verify_result: Optional[VerifyResultDict] = None
+
+
+def delegation_verdict(job: Job) -> DelegationVerdict:
+    """Return the delegation's verdict, distinguishing *finished* from *verified*.
+
+    D5: the verdict is the deterministic check exit code, never the delegate's
+    self-report and never its mere process exit.
+
+    - ``incomplete`` — the job has not reached a terminal state yet.
+    - ``failed`` — the delegate did not finish cleanly, OR it finished but the
+      independent check exited non-zero. A delegate that exits 0 while its check
+      fails is a *failed delegation*.
+    - ``unverified`` — the delegate finished cleanly but no check was run. This
+      is NOT a pass: a missing gate is never green.
+    - ``verified`` — the delegate finished cleanly and the check exited 0.
+
+    Slices S4 and S5 fold their gates into this same verdict rather than adding
+    new states. Every gate is combined the same way: **any failed gate blocks
+    the green path** (fail closed), at least one *passed* gate with no failures
+    greens the delegation, and a delegation with no decisive gate is
+    ``unverified`` — a missing gate is never a pass.
+
+    Per-gate mapping (a gate that was not requested contributes nothing):
+
+    - **Scope (S4, security gate):** ``violated``/``undetermined`` → fail (a
+      write outside the allowlist, or an inability to tell what changed, is never
+      trustworthy). ``ok`` is neutral — an in-bounds scope does not by itself
+      verify the *work*, so scope alone never greens a delegation.
+    - **Check (S3):** exit ``0`` → pass; any non-zero → fail.
+    - **Verify (S5):** ``pass`` → pass; ``fail`` → fail; ``unverified``/``error``
+      → neutral (inconclusive; graceful degradation per D4 — a verifier that
+      could only produce prose, or could not run, never greens and never
+      hard-fails).
+
+    A failing independent verification therefore blocks green even when the
+    shell check passed — which is the entire point of the fresh-session verifier
+    (D6). When no gate was declared this reduces to the pre-S3 behaviour and its
+    tests are unchanged.
+    """
+    if not is_terminal(job.status):
+        return "incomplete"
+    if job.status != JobState.SUCCEEDED:
+        return "failed"
+
+    any_pass = False
+
+    scope = job.scope_result
+    if scope is not None and scope.get("status") != "ok":
+        return "failed"
+
+    check = job.check_result
+    if check is not None:
+        if check.get("exit_code") == 0:
+            any_pass = True
+        else:
+            return "failed"
+
+    verify = job.verify_result
+    if verify is not None:
+        verdict = verify.get("verdict")
+        if verdict == "pass":
+            any_pass = True
+        elif verdict == "fail":
+            return "failed"
+        # "unverified"/"error" are inconclusive: neither green nor a hard fail.
+
+    return "verified" if any_pass else "unverified"
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +547,9 @@ def runtime_status(job: Job) -> dict[str, Any]:
     started = _parse_iso(job.started_at) if job.started_at else now
     if started.tzinfo is None:
         started = started.replace(tzinfo=timezone.utc)
-    last_activity = _parse_iso(job.last_activity_at) if job.last_activity_at else started
+    last_activity = (
+        _parse_iso(job.last_activity_at) if job.last_activity_at else started
+    )
     if last_activity.tzinfo is None:
         last_activity = last_activity.replace(tzinfo=timezone.utc)
 
@@ -461,6 +585,16 @@ def runtime_status(job: Job) -> dict[str, Any]:
         "parent_job_id": job.parent_job_id,
         "orchestrator_label": job.orchestrator_label,
         "nesting_depth": job.nesting_depth,
+        "usage_details": job.usage_details,
+        "cost_details": job.cost_details,
+        "duration_ms": job.duration_ms,
+        "cost_source": job.cost_source,
+        "model_reported": job.model_reported,
+        "check_result": job.check_result,
+        "scope_result": job.scope_result,
+        "withheld_env": job.withheld_env,
+        "verify_result": job.verify_result,
+        "delegation_verdict": delegation_verdict(job),
     }
 
 
@@ -610,7 +744,7 @@ def load_state(job_dir: Path) -> Job:
         raise InvalidStateError(f"Expected a mapping, got {type(data).__name__}")
 
     ver = data.get("schema_version")
-    if ver not in (1, 2):
+    if ver not in _SUPPORTED_SCHEMA_VERSIONS:
         raise InvalidStateError(f"Unsupported schema_version {ver}")
 
     raw = data.get("status")
@@ -817,7 +951,10 @@ class LineageError(JobError):
 # Audit log
 # ---------------------------------------------------------------------------
 
-def append_event(job_dir: Path, event: str, *, actor: str = "user", **payload: Any) -> None:
+
+def append_event(
+    job_dir: Path, event: str, *, actor: str = "user", **payload: Any
+) -> None:
     """Append one JSON line to <job_dir>/events.jsonl.
 
     Atomic on POSIX for lines under the pipe buffer (our payloads are ~200 bytes).
@@ -829,6 +966,7 @@ def append_event(job_dir: Path, event: str, *, actor: str = "user", **payload: A
     are never audit-relevant.
     """
     import sys
+
     line = json.dumps(
         {
             "ts": datetime.now(timezone.utc).isoformat(),

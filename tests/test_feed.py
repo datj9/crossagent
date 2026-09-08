@@ -256,6 +256,36 @@ class TestNormalizeStreamLineClaudeStream:
         assert ev["meta"]["total_cost_usd"] == 0.015
         assert ev["raw_type"] == "result"
 
+    def test_result_line_surfaces_nested_usage_tokens(self):
+        """Regression: claude nests token counts under ``usage`` (never at the
+        top level), so the result event's token counts must reach meta."""
+        raw = json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "session_id": "sess_abc",
+                "total_cost_usd": 0.0123,
+                "duration_ms": 5000,
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cache_read_input_tokens": 200,
+                },
+            }
+        )
+        ev = normalize_stream_line("claude-stream", raw + "\n")[0]
+        assert ev["meta"]["usage"] == {
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cache_read_input_tokens": 200,
+        }
+        assert ev["meta"]["total_cost_usd"] == 0.0123
+
+    def test_result_line_no_usage_omits_usage_meta(self):
+        raw = json.dumps({"type": "result", "subtype": "success"})
+        ev = normalize_stream_line("claude-stream", raw + "\n")[0]
+        assert "usage" not in ev["meta"]
+
     def test_result_error_with_is_error(self):
         raw = json.dumps(
             {
@@ -368,6 +398,30 @@ class TestNormalizeStreamLineCodexJsonl:
         ev = result[0]
         assert ev["kind"] == "result"
         assert ev["raw_type"] == "codex/turn.completed"
+
+    def test_turn_completed_surfaces_usage_tokens(self):
+        """Regression: codex reports tokens only on ``turn.completed.usage``;
+        the old empty-meta handler dropped every codex token count."""
+        raw = json.dumps(
+            {
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 23075,
+                    "cached_input_tokens": 0,
+                    "output_tokens": 5,
+                    "reasoning_output_tokens": 0,
+                },
+            }
+        )
+        ev = normalize_stream_line("codex-jsonl", raw + "\n")[0]
+        assert ev["kind"] == "result"
+        assert ev["meta"]["usage"]["input_tokens"] == 23075
+        assert ev["meta"]["usage"]["output_tokens"] == 5
+
+    def test_turn_completed_no_usage_omits_usage_meta(self):
+        raw = json.dumps({"type": "turn.completed"})
+        ev = normalize_stream_line("codex-jsonl", raw + "\n")[0]
+        assert "usage" not in ev["meta"]
 
     def test_turn_failed(self):
         raw = json.dumps({"type": "turn.failed", "error": "something went wrong"})

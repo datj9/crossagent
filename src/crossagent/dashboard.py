@@ -24,6 +24,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from . import advisors as advisors_mod
+from . import analytics as analytics_mod
 from . import graph as graph_mod
 from . import jobs as jobs_mod
 from .feed import normalize_stream_line, resolve_event_format
@@ -61,6 +62,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/graph":
             self._send_json(200, self._graph_payload())
             return
+        if path == "/api/analytics":
+            self._send_json(200, self._analytics_payload())
+            return
         match = re.match(r"^/api/jobs/([^/]+)$", path)
         if match:
             self._handle_job_detail(match.group(1))
@@ -92,6 +96,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _graph_payload(self) -> dict[str, Any]:
         jobs = jobs_mod.collect_jobs(self.server.state_root)
         return graph_mod.build_graph(jobs)
+
+    def _analytics_payload(self) -> dict[str, Any]:
+        jobs = jobs_mod.collect_jobs(self.server.state_root)
+        return analytics_mod.build_analytics(jobs)
 
     def _handle_job_detail(self, job_id: str) -> None:
         job = self._load_job(job_id)
@@ -376,96 +384,308 @@ _PAGE_HTML = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>crossagent dashboard</title>
 <style>
-  :root { color-scheme: dark; }
+  /* ---- Design tokens ------------------------------------------------------
+     Semantic palette + type scale. Canvas colors (graph view) are read from
+     these same custom properties at draw time via getComputedStyle, so the
+     graph tracks the active theme. Dark is the default; a light theme is
+     supplied under prefers-color-scheme below. */
+  :root {
+    color-scheme: dark;
+
+    --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --fs-xs: 11px; --fs-sm: 12px; --fs-base: 13px; --fs-md: 14px; --fs-lg: 16px;
+
+    --surface: #0d1117;
+    --surface-raised: #161b22;
+    --surface-inset: #010409;
+    --surface-selected: #1c2431;
+    --border: #21262d;
+    --border-subtle: #161b22;
+    --border-strong: #30363d;
+
+    --text: #e6edf3;
+    --text-muted: #8b949e;
+    --text-faint: #767e87;
+
+    --accent: #58a6ff;
+
+    --run-bg: #1f3a5f; --run-fg: #79c0ff;
+    --ok-bg: #1b3a2a; --ok-fg: #56d364;
+    --bad-bg: #4a1e24; --bad-fg: #ff7b72;
+    --neutral-bg: #30363d; --neutral-fg: #9da7b3;
+    --warn-fg: #d29922;
+
+    /* Consumed by the <canvas> graph renderer (see cssVar() in the script). */
+    --graph-bg: #010409;
+    --graph-edge: #5c646e;
+    --graph-orch-bg: #21262d;
+    --graph-orch-border: #6e7681;
+    --graph-orch-text: #c9d1d9;
+    /* Lineage trace_mismatch cue — a distinct violet, deliberately NOT the red
+       missing_parent uses, so the two inconsistencies are told apart by hue as
+       well as dash. 8.15:1 on --graph-bg, 6.86:1 on --surface-raised (both
+       clear the 3:1 graphical / 4.5:1 text floors). */
+    --graph-mismatch: #bc8cff;
+
+    --radius: 6px;
+    --pill: 999px;
+    --motion-fast: 120ms;
+    --header-h: 0px; /* reserved: measured header height if ever needed */
+  }
+
+  @media (prefers-color-scheme: light) {
+    :root {
+      color-scheme: light;
+      --surface: #ffffff;
+      --surface-raised: #f6f8fa;
+      --surface-inset: #f6f8fa;
+      --surface-selected: #ddf4ff;
+      --border: #d0d7de;
+      --border-subtle: #eaeef2;
+      --border-strong: #afb8c1;
+      --text: #1f2328;
+      --text-muted: #59636e;
+      --text-faint: #656d76;
+      --accent: #0969da;
+      --run-bg: #ddf4ff; --run-fg: #0a5cc4;
+      --ok-bg: #dafbe1; --ok-fg: #1a7f37;
+      --bad-bg: #ffebe9; --bad-fg: #cf222e;
+      --neutral-bg: #eaeef2; --neutral-fg: #59636e;
+      --warn-fg: #7d4e00;
+      --graph-bg: #f6f8fa;
+      --graph-edge: #7d8690;
+      --graph-orch-bg: #eaeef2;
+      --graph-orch-border: #7d8690;
+      --graph-orch-text: #1f2328;
+      /* 4.74:1 on --graph-bg, 5.05:1 on --surface — clears text + graphical. */
+      --graph-mismatch: #8250df;
+    }
+  }
+
   * { box-sizing: border-box; }
-  body { margin: 0; font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
-         background: #0d1117; color: #e6edf3; }
-  header { padding: 14px 20px; border-bottom: 1px solid #21262d;
-           display: flex; align-items: baseline; gap: 12px; }
-  header h1 { font-size: 16px; margin: 0; }
-  header span { color: #7d8590; font-size: 12px; }
-  main { display: grid; grid-template-columns: minmax(420px, 1fr) 6px 1.2fr;
-         gap: 0; height: calc(100vh - 51px); }
-  #jobs-pane { overflow-y: auto; }
-  #pane-splitter { cursor: col-resize; background: #21262d; }
-  #pane-splitter:hover, #pane-splitter.dragging { background: #58a6ff; }
+  html, body { height: 100%; }
+  body { margin: 0; font: var(--fs-md)/1.5 var(--font-ui);
+         background: var(--surface); color: var(--text);
+         height: 100dvh; display: flex; flex-direction: column; }
+  code, kbd { font-family: var(--font-mono); font-size: 0.92em; }
+
+  header { padding: 12px 20px; border-bottom: 1px solid var(--border);
+           display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+           flex: none; }
+  header h1 { font-size: var(--fs-lg); margin: 0; font-weight: 600;
+              font-family: var(--font-mono); letter-spacing: -0.01em; }
+  header .refreshed { color: var(--text-muted); font-size: var(--fs-sm);
+                      font-variant-numeric: tabular-nums; }
+
+  /* The header is `flex: none` and main is `flex: 1`, so the split-pane area
+     fills whatever height is left below the header without a hand-measured
+     constant. 100dvh (not vh) keeps mobile browser chrome from clipping it. */
+  main { display: grid;
+         grid-template-columns: minmax(360px, 1fr) 6px minmax(360px, 1.2fr);
+         gap: 0; flex: 1 1 auto; min-height: 0; }
+  /* Both axes scroll inside the pane so a wide table never widens the page
+     body (no horizontal body overflow on narrow viewports). */
+  #jobs-pane { overflow: auto; min-height: 0; }
+  #pane-splitter { cursor: col-resize; background: var(--border);
+                   transition: background var(--motion-fast); }
+  #pane-splitter:hover, #pane-splitter.dragging { background: var(--accent); }
+
   table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 7px 12px; border-bottom: 1px solid #161b22;
+  th, td { text-align: left; padding: 8px 12px;
+           border-bottom: 1px solid var(--border-subtle);
            white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  th { position: sticky; top: 0; background: #0d1117; color: #7d8590;
-       font-weight: 600; font-size: 11px; text-transform: uppercase; }
+  th { position: sticky; top: 0; z-index: 1; background: var(--surface);
+       color: var(--text-muted); font-weight: 600; font-size: var(--fs-xs);
+       text-transform: uppercase; letter-spacing: 0.04em; }
+  /* Data is monospace (ids, advisors align in a column); the free-text name
+     column uses the UI font, numeric columns use tabular figures. */
+  tbody td { font-family: var(--font-mono); font-size: var(--fs-base); }
+  tbody td.col-num { font-variant-numeric: tabular-nums; color: var(--text-muted); }
+  tbody td.col-name { font-family: var(--font-ui); }
   tbody tr { cursor: pointer; }
-  tbody tr:hover { background: #161b22; }
-  tbody tr.selected { background: #1c2431; }
-  .badge { padding: 1px 8px; border-radius: 10px; font-size: 12px; }
-  .running   { background: #1f3a5f; color: #79c0ff; }
-  .succeeded { background: #1b3a2a; color: #56d364; }
-  .failed, .timed_out { background: #4a1e24; color: #ff7b72; }
-  .cancelled, .abandoned, .pending { background: #30363d; color: #9da7b3; }
-  #detail-pane { overflow-y: auto; padding: 16px 20px; }
-  #detail-pane h2 { font-size: 14px; margin: 0 0 10px; word-break: break-all; }
+  tbody tr:hover { background: var(--surface-raised); }
+  tbody tr.selected { background: var(--surface-selected); }
+  tbody tr:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+  .badge { display: inline-block; padding: 1px 8px; border-radius: var(--pill);
+           font-size: var(--fs-sm); font-weight: 500; white-space: nowrap; }
+  .running   { background: var(--run-bg); color: var(--run-fg); }
+  .succeeded { background: var(--ok-bg); color: var(--ok-fg); }
+  .failed, .timed_out { background: var(--bad-bg); color: var(--bad-fg); }
+  .cancelled, .abandoned, .pending { background: var(--neutral-bg); color: var(--neutral-fg); }
+
+  #detail-pane { overflow-y: auto; padding: 16px 20px; min-height: 0; }
+  #detail-pane h2 { font-size: var(--fs-md); margin: 0 0 10px;
+                    font-family: var(--font-mono); word-break: break-all; }
   dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px;
-       margin: 0 0 14px; font-size: 13px; }
-  dt { color: #7d8590; }
-  dd { margin: 0; word-break: break-all; }
+       margin: 0 0 14px; font-size: var(--fs-base); }
+  dt { color: var(--text-muted); }
+  dd { margin: 0; font-family: var(--font-mono); word-break: break-all; }
   .tabs { display: flex; gap: 8px; margin-bottom: 8px; }
-  .tabs button { background: #21262d; color: #e6edf3; border: 1px solid #30363d;
-                 border-radius: 6px; padding: 3px 12px; cursor: pointer; font: inherit; }
-  .tabs button.active { background: #1c2431; border-color: #58a6ff; }
-  pre { background: #010409; border: 1px solid #21262d; border-radius: 6px;
-        padding: 12px; overflow: auto; max-height: 55vh; white-space: pre-wrap;
-        word-break: break-word; font-size: 12px; }
-  #audit-feed { display: none; background: #010409; border: 1px solid #21262d;
-                border-radius: 6px; padding: 12px; overflow-y: auto;
-                max-height: 55vh; font-size: 12px; }
-  .audit-row { padding: 4px 0; border-bottom: 1px solid #161b22; }
+  .tabs button { background: var(--surface-raised); color: var(--text);
+                 border: 1px solid var(--border-strong); border-radius: var(--radius);
+                 padding: 4px 12px; cursor: pointer; font: inherit;
+                 font-size: var(--fs-sm); }
+  .tabs button:hover { border-color: var(--accent); }
+  .tabs button.active { background: var(--surface-selected); border-color: var(--accent);
+                        color: var(--text); }
+  /* Log/event/audit surfaces carry command output — monospace earns its place. */
+  pre { background: var(--surface-inset); border: 1px solid var(--border);
+        border-radius: var(--radius); padding: 12px; overflow: auto;
+        max-height: 55vh; white-space: pre-wrap; word-break: break-word;
+        font-family: var(--font-mono); font-size: var(--fs-sm); }
+  #audit-feed { display: none; background: var(--surface-inset);
+                border: 1px solid var(--border); border-radius: var(--radius);
+                padding: 12px; overflow-y: auto; max-height: 55vh;
+                font-family: var(--font-mono); font-size: var(--fs-sm); }
+  .audit-row { padding: 4px 0; border-bottom: 1px solid var(--border-subtle); }
   .audit-row:last-child { border-bottom: none; }
-  .audit-ts { color: #7d8590; margin-right: 8px; }
-  .audit-actor { display: inline-block; min-width: 130px; font-size: 11px;
+  .audit-ts { color: var(--text-muted); margin-right: 8px; }
+  .audit-actor { display: inline-block; min-width: 130px; font-size: var(--fs-xs);
                  padding: 1px 6px; border-radius: 3px; margin-right: 8px; }
-  .audit-actor-user { background: #1f3a5f; color: #79c0ff; }
-  .audit-actor-system { background: #30363d; color: #9da7b3; }
-  .audit-transition { color: #e6edf3; }
-  .audit-error { color: #ff7b72; margin-left: 8px; }
-  .empty { color: #7d8590; padding: 24px; }
-  #events-feed { display: none; background: #010409; border: 1px solid #21262d; border-radius: 6px; padding: 12px; overflow-y: auto; max-height: 55vh; font-size: 12px; }
-  .ev-init { color: #7d8590; padding: 2px 0; }
-  .ev-assistant { color: #e6edf3; border-left: 2px solid #58a6ff; padding: 4px 0 4px 10px; margin: 4px 0; white-space: pre-wrap; }
-  .ev-result { color: #56d364; border-left: 2px solid #56d364; padding: 2px 0 2px 10px; margin: 4px 0; font-size: 12px; }
-  .ev-output { color: #9da7b3; padding: 2px 0; font-size: 12px; }
-  .ev-raw { color: #484f58; padding: 2px 0; font-size: 11px; }
-  .ev-raw-label { display: inline-block; color: #7d8590; font-size: 10px; background: #21262d; border-radius: 3px; padding: 0 4px; margin-right: 6px; vertical-align: middle; }
+  .audit-actor-user { background: var(--run-bg); color: var(--run-fg); }
+  .audit-actor-system { background: var(--neutral-bg); color: var(--neutral-fg); }
+  .audit-transition { color: var(--text); }
+  .audit-error { color: var(--bad-fg); margin-left: 8px; }
+  .empty { color: var(--text-muted); padding: 24px; }
+  #events-feed { display: none; background: var(--surface-inset);
+                 border: 1px solid var(--border); border-radius: var(--radius);
+                 padding: 12px; overflow-y: auto; max-height: 55vh;
+                 font-family: var(--font-mono); font-size: var(--fs-sm); }
+  .ev-init { color: var(--text-muted); padding: 2px 0; }
+  .ev-assistant { color: var(--text); border-left: 2px solid var(--accent); padding: 4px 0 4px 10px; margin: 4px 0; white-space: pre-wrap; }
+  .ev-result { color: var(--ok-fg); border-left: 2px solid var(--ok-fg); padding: 2px 0 2px 10px; margin: 4px 0; font-size: var(--fs-sm); }
+  .ev-output { color: var(--neutral-fg); padding: 2px 0; font-size: var(--fs-sm); }
+  .ev-raw { color: var(--text-faint); padding: 2px 0; font-size: var(--fs-xs); }
+  .ev-raw-label { display: inline-block; color: var(--text-muted); font-size: 10px; background: var(--surface-raised); border-radius: 3px; padding: 0 4px; margin-right: 6px; vertical-align: middle; }
   #events-chip { display: none; position: sticky; bottom: 4px; z-index: 10; text-align: center; padding: 4px 0; cursor: pointer; }
-  #events-chip span { display: inline-block; color: #58a6ff; background: #1c2431; border: 1px solid #58a6ff; border-radius: 12px; padding: 4px 14px; font-size: 11px; }
-  .ev-thinking { color: #7d8590; padding: 2px 0; }
-  .ev-thinking summary { cursor: pointer; color: #7d8590; font-size: 11px; }
-  .ev-thinking .ev-body { white-space: pre-wrap; padding: 4px 0 2px 14px; color: #9da7b3; }
-  .ev-rate { color: #d29922; border-left: 2px solid #d29922; padding: 2px 0 2px 10px; margin: 4px 0; }
-  .ev-error { color: #ff7b72; border-left: 2px solid #ff7b72; padding: 2px 0 2px 10px; margin: 4px 0; }
-  .ev-tool { color: #e6edf3; border-left: 2px solid #7d8590; padding: 4px 0 4px 10px; margin: 4px 0; }
-  .ev-tool.ev-tool-done { border-left-color: #56d364; }
-  .ev-tool.ev-tool-failed { border-left-color: #ff7b72; }
-  .ev-tool summary { cursor: pointer; color: #58a6ff; font-size: 12px; }
-  .ev-tool .ev-section-label { color: #7d8590; font-size: 11px; margin-top: 4px; }
-  .ev-tool .ev-body { white-space: pre-wrap; font-size: 11px; color: #9da7b3; margin: 2px 0 2px 14px; }
-  .ev-tool .ev-done-mark { color: #56d364; font-size: 11px; margin-left: 6px; }
-  .ev-tool .ev-fail-mark { color: #ff7b72; font-size: 11px; margin-left: 6px; }
-  .view-toggle { margin-left: auto; display: flex; gap: 0; }
-  .view-toggle button { background: #21262d; color: #e6edf3; border: 1px solid #30363d; padding: 4px 14px; cursor: pointer; font: inherit; font-size: 12px; }
-  .view-toggle button:first-child { border-radius: 6px 0 0 6px; }
-  .view-toggle button:last-child { border-radius: 0 6px 6px 0; }
-  .view-toggle button.active { background: #1c2431; border-color: #58a6ff; }
-  #graph-container { display: none; overflow: hidden; width: 100%; height: 100%; background: #010409; position: relative; }
+  #events-chip span { display: inline-block; color: var(--accent); background: var(--surface-selected); border: 1px solid var(--accent); border-radius: var(--pill); padding: 4px 14px; font-size: var(--fs-xs); }
+  .ev-thinking { color: var(--text-muted); padding: 2px 0; }
+  .ev-thinking summary { cursor: pointer; color: var(--text-muted); font-size: var(--fs-xs); }
+  .ev-thinking .ev-body { white-space: pre-wrap; padding: 4px 0 2px 14px; color: var(--neutral-fg); }
+  .ev-rate { color: var(--warn-fg); border-left: 2px solid var(--warn-fg); padding: 2px 0 2px 10px; margin: 4px 0; }
+  .ev-error { color: var(--bad-fg); border-left: 2px solid var(--bad-fg); padding: 2px 0 2px 10px; margin: 4px 0; }
+  .ev-tool { color: var(--text); border-left: 2px solid var(--text-muted); padding: 4px 0 4px 10px; margin: 4px 0; }
+  .ev-tool.ev-tool-done { border-left-color: var(--ok-fg); }
+  .ev-tool.ev-tool-failed { border-left-color: var(--bad-fg); }
+  .ev-tool summary { cursor: pointer; color: var(--accent); font-size: var(--fs-sm); }
+  .ev-tool .ev-section-label { color: var(--text-muted); font-size: var(--fs-xs); margin-top: 4px; }
+  .ev-tool .ev-body { white-space: pre-wrap; font-size: var(--fs-xs); color: var(--neutral-fg); margin: 2px 0 2px 14px; }
+  .ev-tool .ev-done-mark { color: var(--ok-fg); font-size: var(--fs-xs); margin-left: 6px; }
+  .ev-tool .ev-fail-mark { color: var(--bad-fg); font-size: var(--fs-xs); margin-left: 6px; }
+  .view-toggle { margin-inline-start: auto; display: flex; gap: 0; }
+  .view-toggle button { background: var(--surface-raised); color: var(--text); border: 1px solid var(--border-strong); padding: 5px 14px; cursor: pointer; font: inherit; font-size: var(--fs-sm); }
+  .view-toggle button:first-child { border-radius: var(--radius) 0 0 var(--radius); }
+  .view-toggle button:last-child { border-radius: 0 var(--radius) var(--radius) 0; border-inline-start: none; }
+  .view-toggle button.active { background: var(--surface-selected); border-color: var(--accent); color: var(--text); }
+  #graph-container { display: none; overflow: hidden; width: 100%; height: 100%; background: var(--graph-bg); position: relative; }
   #list-view { height: 100%; }
+  #fit-btn { position: absolute; top: 8px; right: 8px; z-index: 5;
+             background: var(--surface-raised); color: var(--text);
+             border: 1px solid var(--border-strong); border-radius: var(--radius);
+             padding: 5px 12px; cursor: pointer; font: var(--fs-sm) var(--font-ui); }
+  #fit-btn:hover { border-color: var(--accent); }
+  #no-nest-hint { display: none; position: absolute; top: 8px; left: 50%;
+                  transform: translateX(-50%); color: var(--text-muted);
+                  font-size: var(--fs-sm); pointer-events: none; text-align: center;
+                  white-space: nowrap; }
+
+  /* ---- Analytics view ----------------------------------------------------
+     A full-width surface (spans all grid columns) shown in place of the
+     split-pane list/graph. Every table lives inside its own .table-scroll so a
+     wide rollup scrolls sideways within the card instead of widening the page
+     body at 390px. Secondary text is --text-muted on --surface (>=6:1 both
+     themes); "not measured" is deliberately text, not a blank or a zero. */
+  #analytics-view { display: none; grid-column: 1 / -1; overflow: auto;
+                    min-height: 0; padding: 16px 20px 40px; }
+  .an-section { margin: 0 0 24px; max-width: 1100px; }
+  .an-section h2 { font-size: var(--fs-lg); margin: 0 0 6px;
+                   font-family: var(--font-mono); }
+  .an-section h3 { font-size: var(--fs-md); margin: 0 0 10px;
+                   color: var(--text); font-weight: 600; }
+  .an-caveat { color: var(--text-muted); font-size: var(--fs-base);
+               margin: 0; max-width: 70ch; }
+  .an-caveat code { color: var(--text); }
+  .table-scroll { overflow-x: auto; border: 1px solid var(--border);
+                  border-radius: var(--radius); }
+  .an-table { width: 100%; border-collapse: collapse; background: var(--surface);
+              font-size: var(--fs-base); }
+  .an-table th { position: static; text-align: left; padding: 8px 12px;
+                 background: var(--surface); color: var(--text-muted);
+                 font-weight: 600; font-size: var(--fs-xs); text-transform: uppercase;
+                 letter-spacing: 0.04em; white-space: nowrap;
+                 border-bottom: 1px solid var(--border); }
+  .an-table td { padding: 8px 12px; border-bottom: 1px solid var(--border-subtle);
+                 white-space: nowrap; vertical-align: top; }
+  .an-table tr:last-child td { border-bottom: none; }
+  .an-table .an-key { font-family: var(--font-mono); color: var(--text);
+                      font-weight: 600; }
+  .an-table .metric-main { font-variant-numeric: tabular-nums; color: var(--text); }
+  .an-table .metric-sub { font-size: var(--fs-xs); color: var(--text-muted);
+                          font-variant-numeric: tabular-nums; margin-top: 1px; }
+  .an-table .num { font-variant-numeric: tabular-nums; color: var(--text); }
+  /* Unmeasured is a first-class state, never a 0 or a blank — muted italic so
+     it reads as "no data", visually distinct from a real measured number. */
+  .unmeasured { color: var(--text-muted); font-style: italic; font-size: var(--fs-sm); }
+  .cost-src { display: inline-block; margin-inline-start: 4px; font-size: 10px;
+              color: var(--text-muted); text-transform: uppercase;
+              letter-spacing: 0.03em; }
+  .verdict { font-weight: 600; }
+  .verdict-verified { color: var(--ok-fg); }
+  .verdict-failed { color: var(--bad-fg); }
+  .verdict-unverified { color: var(--warn-fg); }
+  .verdict-incomplete { color: var(--neutral-fg); }
+  .an-filters { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+  .an-filters input, .an-filters select {
+    background: var(--surface-raised); color: var(--text);
+    border: 1px solid var(--border-strong); border-radius: var(--radius);
+    padding: 6px 10px; font: var(--fs-base) var(--font-ui); }
+  .an-filters input { flex: 1 1 220px; min-width: 0; font-family: var(--font-mono); }
+  .an-filters input:focus-visible, .an-filters select:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 1px; border-color: var(--accent); }
+  .link-btn { background: none; border: none; padding: 0; margin: 0;
+              color: var(--accent); font: var(--fs-base) var(--font-mono);
+              cursor: pointer; text-align: left; }
+  .link-btn:hover { text-decoration: underline; }
+  .link-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px;
+                            border-radius: 2px; }
+  .an-empty { color: var(--text-muted); padding: 16px 4px; font-size: var(--fs-base); }
+
+  /* Stack the two panes below a narrow breakpoint so nothing overflows
+     horizontally on phones. The `!important` overrides the inline
+     grid-template-columns the drag splitter may have written on desktop. */
+  @media (max-width: 860px) {
+    main { grid-template-columns: 1fr !important;
+           grid-template-rows: auto auto; height: auto; }
+    #pane-splitter { display: none; }
+    #jobs-pane { max-height: 60vh; border-bottom: 1px solid var(--border); }
+    #detail-pane { max-height: none; }
+  }
+
+  /* Touch input: grow rows and controls to the 44px target floor without
+     hurting desktop (mouse/trackpad) density. */
+  @media (hover: none) and (pointer: coarse) {
+    th, td { padding: 12px; }
+    .tabs button, .view-toggle button, #fit-btn { padding: 11px 16px; }
+    .an-filters input, .an-filters select { min-height: 44px; }
+    .link-btn { min-height: 44px; }
+    #pane-splitter { display: none; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important; }
+  }
 </style>
 </head>
 <body>
 <header>
   <h1>crossagent dashboard</h1>
-  <span id="refreshed"></span>
+  <span id="refreshed" class="refreshed"></span>
   <div class="view-toggle">
     <button id="view-list" class="active">List</button>
     <button id="view-graph">Graph</button>
+    <button id="view-analytics">Analytics</button>
   </div>
 </header>
 <main>
@@ -475,19 +695,86 @@ _PAGE_HTML = """<!doctype html>
         <thead>
           <tr><th>Job</th><th>Status</th><th>Advisor</th><th>Elapsed</th><th>Idle</th><th>Name</th></tr>
         </thead>
-        <tbody id="jobs-body"></tbody>
+        <tbody id="jobs-body" role="listbox" aria-label="Jobs" tabindex="-1"></tbody>
       </table>
       <div id="jobs-empty" class="empty" hidden>No jobs yet. Start one with <code>crossagent start …</code></div>
     </div>
     <div id="graph-container">
       <canvas id="graph-canvas"></canvas>
-      <button id="fit-btn" style="position:absolute;top:8px;right:8px;z-index:5;background:#21262d;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:4px 12px;cursor:pointer;font:12px ui-monospace,monospace;">Fit</button>
-      <div id="no-nest-hint" style="display:none;position:absolute;top:8px;left:50%;transform:translateX(-50%);color:#7d8590;font-size:12px;pointer-events:none;text-align:center;white-space:nowrap;">No nested orchestration yet — jobs shown standalone.</div>
+      <button id="fit-btn">Fit</button>
+      <div id="no-nest-hint">No nested orchestration yet — jobs shown standalone.</div>
     </div>
   </div>
   <div id="pane-splitter" title="Drag to resize"></div>
   <div id="detail-pane">
     <div class="empty">Select a job to see its detail and live logs.</div>
+  </div>
+  <div id="analytics-view">
+    <section class="an-section">
+      <h2>Delegation analytics</h2>
+      <p class="an-caveat">
+        Rollups are computed only from persisted job records. Averages exclude jobs
+        with no measurement — <strong>&ldquo;not measured&rdquo; is never counted as
+        zero</strong>. Telemetry coverage differs by advisor: only <code>claude</code>
+        reports cost (a vendor estimate, not billing truth); <code>codex</code> and
+        <code>commandcode</code> report tokens; <code>opencode</code> and
+        <code>gemini</code> report nothing measurable here.
+      </p>
+    </section>
+    <section class="an-section">
+      <h3>Check-pass rate by model</h3>
+      <div class="table-scroll">
+        <table class="an-table">
+          <thead><tr>
+            <th>Model</th><th>Jobs</th><th>Pass rate</th><th>Cost</th>
+            <th>Tokens</th><th>Duration</th><th>Escalation</th>
+          </tr></thead>
+          <tbody id="an-model-body"></tbody>
+        </table>
+      </div>
+      <p id="an-model-empty" class="an-empty" hidden>No jobs yet.</p>
+    </section>
+    <section class="an-section">
+      <h3>By advisor</h3>
+      <div class="table-scroll">
+        <table class="an-table">
+          <thead><tr>
+            <th>Advisor</th><th>Jobs</th><th>Pass rate</th><th>Cost</th>
+            <th>Tokens</th><th>Duration</th><th>Escalation</th>
+          </tr></thead>
+          <tbody id="an-advisor-body"></tbody>
+        </table>
+      </div>
+      <p id="an-advisor-empty" class="an-empty" hidden>No jobs yet.</p>
+    </section>
+    <section class="an-section">
+      <h3>History</h3>
+      <div class="an-filters">
+        <input id="an-search" type="text" autocomplete="off" spellcheck="false"
+               aria-label="Search delegations by job id, name, advisor, or model"
+               placeholder="Search job, name, advisor, model…">
+        <select id="an-filter-advisor" aria-label="Filter history by advisor">
+          <option value="">All advisors</option>
+        </select>
+        <select id="an-filter-verdict" aria-label="Filter history by verdict">
+          <option value="">All verdicts</option>
+          <option value="verified">verified</option>
+          <option value="failed">failed</option>
+          <option value="unverified">unverified</option>
+          <option value="incomplete">incomplete</option>
+        </select>
+      </div>
+      <div class="table-scroll">
+        <table class="an-table">
+          <thead><tr>
+            <th>Job</th><th>Advisor</th><th>Model</th><th>Status</th><th>Verdict</th>
+            <th>Cost</th><th>Tokens</th><th>Duration</th><th>Started</th>
+          </tr></thead>
+          <tbody id="an-history-body"></tbody>
+        </table>
+      </div>
+      <p id="an-history-empty" class="an-empty" hidden>No delegations match.</p>
+    </section>
   </div>
 </main>
 <script>
@@ -501,6 +788,38 @@ let hasRunningJobs = false;
 const reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 let rafId = null;
 let hasRunningNodes = false;
+
+// The graph is a <canvas>: its colors live in JS, not CSS, so they cannot
+// inherit the theme automatically. We read the same design tokens the
+// stylesheet uses via getComputedStyle and cache them, refreshing on theme
+// change so light/dark both stay correct.
+let graphColors = null;
+function refreshGraphColors() {
+  const styles = getComputedStyle(document.documentElement);
+  const token = (name) => styles.getPropertyValue(name).trim();
+  graphColors = {
+    text: token("--text"),
+    textMuted: token("--text-muted"),
+    edge: token("--graph-edge"),
+    accent: token("--accent"),
+    bad: token("--bad-fg"),
+    mismatch: token("--graph-mismatch"),
+    runBg: token("--run-bg"), runFg: token("--run-fg"),
+    okBg: token("--ok-bg"), okFg: token("--ok-fg"),
+    badBg: token("--bad-bg"),
+    neutralBg: token("--neutral-bg"), neutralFg: token("--neutral-fg"),
+    orchBg: token("--graph-orch-bg"),
+    orchBorder: token("--graph-orch-border"),
+    orchText: token("--graph-orch-text"),
+  };
+  return graphColors;
+}
+if (window.matchMedia) {
+  window.matchMedia("(prefers-color-scheme: light)").addEventListener("change", function () {
+    refreshGraphColors();
+    if (currentView === "graph") paintGraph();
+  });
+}
 
 const knownStatuses = new Set(["pending", "running", "succeeded", "failed",
                                "timed_out", "cancelled", "abandoned"]);
@@ -658,6 +977,55 @@ function updateChip() {
   }
 }
 
+// Select a job from either the list row or a graph node, keeping the row's
+// aria-selected state and the roving-tabindex focus target in sync.
+function selectJob(jobId) {
+  selectedJobId = jobId;
+  for (const [rowId, existingRow] of jobRows) {
+    const isSelected = rowId === selectedJobId;
+    existingRow.classList.toggle("selected", isSelected);
+    existingRow.setAttribute("aria-selected", isSelected ? "true" : "false");
+  }
+  updateRovingTabindex();
+  refreshDetail();
+}
+
+// Roving tabindex: exactly one row is in the Tab order (the selected one, or
+// the first row if nothing is selected). Arrow keys move focus among rows.
+function updateRovingTabindex() {
+  const body = document.getElementById("jobs-body");
+  const rows = body.querySelectorAll("tr");
+  let focusIndex = 0;
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i].getAttribute("aria-selected") === "true") { focusIndex = i; break; }
+  }
+  for (let i = 0; i < rows.length; i++) {
+    rows[i].tabIndex = i === focusIndex ? 0 : -1;
+  }
+}
+
+(function initJobKeyboard() {
+  const body = document.getElementById("jobs-body");
+  body.addEventListener("keydown", function (ev) {
+    const row = ev.target.closest("tr");
+    if (!row) return;
+    const rows = Array.prototype.slice.call(body.querySelectorAll("tr"));
+    const index = rows.indexOf(row);
+    let target = null;
+    if (ev.key === "ArrowDown") target = rows[index + 1];
+    else if (ev.key === "ArrowUp") target = rows[index - 1];
+    else if (ev.key === "Home") target = rows[0];
+    else if (ev.key === "End") target = rows[rows.length - 1];
+    else if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); row.click(); return; }
+    else return;
+    if (!target) return;
+    ev.preventDefault();
+    for (let i = 0; i < rows.length; i++) rows[i].tabIndex = -1;
+    target.tabIndex = 0;
+    target.focus();
+  });
+})();
+
 async function refreshJobs() {
   const response = await fetch("/api/jobs");
   const payload = await response.json();
@@ -672,20 +1040,22 @@ async function refreshJobs() {
 
     if (!row) {
       row = document.createElement("tr");
+      row.setAttribute("role", "option");
+      row.setAttribute("aria-selected", "false");
+      row.tabIndex = -1;
       row.innerHTML =
-        "<td></td><td></td><td></td><td></td><td></td><td></td>";
-      row.onclick = () => {
-        selectedJobId = job.job_id;
-        for (const [rowId, existingRow] of jobRows) {
-          existingRow.classList.toggle("selected", rowId === selectedJobId);
-        }
-        refreshDetail();
-      };
+        "<td></td><td></td><td></td>" +
+        '<td class="col-num"></td><td class="col-num"></td>' +
+        '<td class="col-name"></td>';
+      const rowJobId = job.job_id;
+      row.onclick = () => { selectJob(rowJobId); };
       jobRows.set(job.job_id, row);
       body.appendChild(row);
     }
 
-    row.classList.toggle("selected", job.job_id === selectedJobId);
+    const isSelected = job.job_id === selectedJobId;
+    row.classList.toggle("selected", isSelected);
+    row.setAttribute("aria-selected", isSelected ? "true" : "false");
 
     const cells = row.children;
     setCellText(cells[0], job.job_id);
@@ -715,6 +1085,8 @@ async function refreshJobs() {
     }
     orderIndex++;
   }
+
+  updateRovingTabindex();
 
   hasRunningJobs = false;
   for (const job of payload.jobs) {
@@ -895,10 +1267,14 @@ async function poll() {
   try {
     if (currentView === "graph") {
       await refreshGraph();
+    } else if (currentView === "analytics") {
+      await refreshAnalytics();
     } else {
       await refreshJobs();
     }
-    if (selectedJobId) {
+    // The analytics view has no detail pane, so skip the detail fetch there
+    // rather than mutate hidden DOM against the last-selected job.
+    if (selectedJobId && currentView !== "analytics") {
       await refreshDetail();
     }
   } catch (_e) {
@@ -914,11 +1290,23 @@ async function poll() {
 
 let currentView = "list";
 
+// Show/hide the split-pane surface (list/graph + detail) as a unit; the
+// analytics view replaces it entirely rather than sitting inside a pane.
+function setSplitPaneVisible(visible) {
+  var display = visible ? "" : "none";
+  document.getElementById("jobs-pane").style.display = display;
+  document.getElementById("pane-splitter").style.display = display;
+  document.getElementById("detail-pane").style.display = display;
+}
+
 document.getElementById("view-list").onclick = function () {
   currentView = "list";
   if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
   document.getElementById("view-list").classList.add("active");
   document.getElementById("view-graph").classList.remove("active");
+  document.getElementById("view-analytics").classList.remove("active");
+  document.getElementById("analytics-view").style.display = "none";
+  setSplitPaneVisible(true);
   document.getElementById("list-view").style.display = "";
   document.getElementById("graph-container").style.display = "none";
 };
@@ -927,6 +1315,9 @@ document.getElementById("view-graph").onclick = function () {
   currentView = "graph";
   document.getElementById("view-graph").classList.add("active");
   document.getElementById("view-list").classList.remove("active");
+  document.getElementById("view-analytics").classList.remove("active");
+  document.getElementById("analytics-view").style.display = "none";
+  setSplitPaneVisible(true);
   document.getElementById("list-view").style.display = "none";
   document.getElementById("graph-container").style.display = "block";
   if (graphFirstShown) {
@@ -936,6 +1327,17 @@ document.getElementById("view-graph").onclick = function () {
     paintGraph();
   }
   maybeStartAnimation();
+};
+
+document.getElementById("view-analytics").onclick = function () {
+  currentView = "analytics";
+  if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+  document.getElementById("view-analytics").classList.add("active");
+  document.getElementById("view-list").classList.remove("active");
+  document.getElementById("view-graph").classList.remove("active");
+  setSplitPaneVisible(false);
+  document.getElementById("analytics-view").style.display = "block";
+  refreshAnalytics();
 };
 
 let graphData = null;
@@ -1078,6 +1480,7 @@ function paintGraph() {
   var canvas = document.getElementById("graph-canvas");
   var ctx = canvas.getContext("2d");
   var dpr = window.devicePixelRatio || 1;
+  var C = graphColors || refreshGraphColors();
 
   var container = canvas.parentElement;
   var cssW = container.clientWidth;
@@ -1092,12 +1495,12 @@ function paintGraph() {
   hasRunningNodes = false;
 
   var hint = document.getElementById("no-nest-hint");
-  if (hint) hint.style.display = (graphData && graphData.meaningful_edge_count === 0) ? "" : "none";
+  if (hint) hint.style.display = (graphData && graphData.meaningful_edge_count === 0) ? "block" : "none";
 
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
   if (!graphData || !graphData.nodes || graphData.nodes.length === 0) {
-    ctx.fillStyle = "#7d8590";
+    ctx.fillStyle = C.textMuted;
     ctx.font = "16px ui-monospace, SFMono-Regular, Menlo, monospace";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
@@ -1107,7 +1510,7 @@ function paintGraph() {
 
   if (graphRects.length === 0) {
     ctx.clearRect(0, 0, cssW, cssH);
-    ctx.fillStyle = "#7d8590";
+    ctx.fillStyle = C.textMuted;
     ctx.font = "14px ui-monospace, SFMono-Regular, Menlo, monospace";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
@@ -1124,10 +1527,15 @@ function paintGraph() {
   for (var i = 0; i < graphRects.length; i++) rectById[graphRects[i].id] = graphRects[i];
 
   var orphanIds = new Set();
+  var mismatchIds = new Set();
   if (graphData && graphData.diagnostics) {
     for (var di = 0; di < graphData.diagnostics.length; di++) {
       var d = graphData.diagnostics[di];
       if (d.type === "missing_parent") orphanIds.add(d.job_id);
+      // trace_mismatch: the parent exists but lives in a different trace, so the
+      // child is re-rooted to its own orchestrator. Without a cue it draws as a
+      // normal edge and the operator can't see lineage is inconsistent.
+      else if (d.type === "trace_mismatch") mismatchIds.add(d.job_id);
     }
   }
 
@@ -1141,8 +1549,19 @@ function paintGraph() {
     var x2 = tgtR.x, y2 = tgtR.y + tgtR.h / 2;
     var cp = Math.min(Math.abs(x2 - x1) * 0.4, 60);
     var orphanEdge = orphanIds.has(e["to"]);
-    ctx.strokeStyle = orphanEdge ? "#ff7b72" : "#30363d";
-    ctx.setLineDash(orphanEdge ? [4, 3] : []);
+    var mismatchEdge = mismatchIds.has(e["to"]);
+    // Mismatch wins the styling and uses a tighter dot pattern than the orphan's
+    // dash, so hue AND rhythm distinguish the two (colour-blind safe).
+    if (mismatchEdge) {
+      ctx.strokeStyle = C.mismatch;
+      ctx.setLineDash([2, 3]);
+    } else if (orphanEdge) {
+      ctx.strokeStyle = C.bad;
+      ctx.setLineDash([4, 3]);
+    } else {
+      ctx.strokeStyle = C.edge;
+      ctx.setLineDash([]);
+    }
     ctx.beginPath();
     ctx.moveTo(x1, y1);
     ctx.bezierCurveTo(x1 + cp, y1, x2 - cp, y2, x2, y2);
@@ -1158,10 +1577,10 @@ function paintGraph() {
     var status = n.status || "pending";
     var borderColor, bgColor;
     switch (status) {
-      case "running": borderColor = "#79c0ff"; bgColor = "#1f3a5f"; break;
-      case "succeeded": borderColor = "#56d364"; bgColor = "#1b3a2a"; break;
-      case "failed": case "timed_out": borderColor = "#ff7b72"; bgColor = "#4a1e24"; break;
-      default: borderColor = "#9da7b3"; bgColor = "#30363d";
+      case "running": borderColor = C.runFg; bgColor = C.runBg; break;
+      case "succeeded": borderColor = C.okFg; bgColor = C.okBg; break;
+      case "failed": case "timed_out": borderColor = C.bad; bgColor = C.badBg; break;
+      default: borderColor = C.neutralFg; bgColor = C.neutralBg;
     }
 
     ctx.fillStyle = bgColor;
@@ -1172,7 +1591,7 @@ function paintGraph() {
     ctx.stroke();
 
     if (n.id === selectedJobId) {
-      ctx.strokeStyle = "#00ffff";
+      ctx.strokeStyle = C.accent;
       ctx.lineWidth = 2;
       ctxRoundRect(ctx, r.x - 1, r.y - 1, r.w + 2, r.h + 2, 10);
       ctx.stroke();
@@ -1180,9 +1599,21 @@ function paintGraph() {
 
     if (orphanIds.has(n.id)) {
       ctx.setLineDash([4, 3]);
-      ctx.strokeStyle = "#ff7b72";
+      ctx.strokeStyle = C.bad;
       ctx.lineWidth = 1.5;
       ctxRoundRect(ctx, r.x, r.y, r.w, r.h, 8);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    // Violet dotted ring for a trace-mismatched node. Because the hue differs
+    // from every status border (and from the red orphan ring), it stays legible
+    // even on a red failed node where a same-coloured ring would vanish.
+    if (mismatchIds.has(n.id)) {
+      ctx.setLineDash([2, 3]);
+      ctx.strokeStyle = C.mismatch;
+      ctx.lineWidth = 2;
+      ctxRoundRect(ctx, r.x - 1, r.y - 1, r.w + 2, r.h + 2, 10);
       ctx.stroke();
       ctx.setLineDash([]);
     }
@@ -1190,7 +1621,7 @@ function paintGraph() {
     if (n.status === "running") {
       hasRunningNodes = true;
       if (reduceMotion) {
-        ctx.strokeStyle = "#58a6ff";
+        ctx.strokeStyle = C.accent;
         ctx.lineWidth = 2;
         ctxRoundRect(ctx, r.x - 1, r.y - 1, r.w + 2, r.h + 2, 10);
         ctx.stroke();
@@ -1198,7 +1629,7 @@ function paintGraph() {
         var pulse = 0.35 + 0.35 * (0.5 + 0.5 * Math.sin(performance.now() / 500));
         ctx.save();
         ctx.globalAlpha = pulse;
-        ctx.strokeStyle = "#58a6ff";
+        ctx.strokeStyle = C.accent;
         ctx.lineWidth = 3;
         ctxRoundRect(ctx, r.x - 1.5, r.y - 1.5, r.w + 3, r.h + 3, 10);
         ctx.stroke();
@@ -1206,7 +1637,7 @@ function paintGraph() {
       }
     }
 
-    ctx.fillStyle = "#e6edf3";
+    ctx.fillStyle = C.text;
     ctx.font = "bold 11px ui-monospace, SFMono-Regular, Menlo, monospace";
     ctx.textAlign = "left";
     ctx.textBaseline = "middle";
@@ -1218,7 +1649,10 @@ function paintGraph() {
     ctx.textAlign = "right";
     ctx.fillText(clipText(ctx, status.replace(/_/g, " "), r.w * 0.4 - 4), r.x + r.w - 7, r.y + 14);
 
-    ctx.fillStyle = "#7d8590";
+    // --text (not --text-muted): muted gray on the colored node fills falls
+    // below 4.5:1 in dark (e.g. 3.73:1 on the running fill). Weight (regular
+    // vs the id's bold) and position keep the name visually secondary.
+    ctx.fillStyle = C.text;
     ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, monospace";
     ctx.textAlign = "left";
     ctx.fillText(clipText(ctx, n.name || "", r.w - 14), r.x + 7, r.y + 34);
@@ -1230,14 +1664,14 @@ function paintGraph() {
     var r = rectById[n.id];
     if (!r) continue;
 
-    ctx.fillStyle = "#2a1f5e";
-    ctx.strokeStyle = "#6e40c9";
+    ctx.fillStyle = C.orchBg;
+    ctx.strokeStyle = C.orchBorder;
     ctx.lineWidth = 1.5;
     ctxRoundRect(ctx, r.x, r.y, r.w, r.h, 8);
     ctx.fill();
     ctx.stroke();
 
-    ctx.fillStyle = "#d2a8ff";
+    ctx.fillStyle = C.orchText;
     ctx.font = "13px ui-monospace, SFMono-Regular, Menlo, monospace";
     ctx.textAlign = "left";
     ctx.textBaseline = "middle";
@@ -1309,9 +1743,8 @@ async function refreshGraph() {
       var r = graphRects[i];
       if (worldX >= r.x && worldX < r.x + r.w && worldY >= r.y && worldY < r.y + r.h) {
         if (r.kind === "job") {
-          selectedJobId = r.id;
+          selectJob(r.id);
           paintGraph();
-          refreshDetail();
         }
         return;
       }
@@ -1417,8 +1850,10 @@ window.addEventListener("resize", function () {
 (function initPaneSplitter() {
   const splitter = document.getElementById("pane-splitter");
   const mainEl = document.querySelector("main");
+  const wideEnough = () => window.matchMedia("(min-width: 861px)").matches;
   let dragging = false;
   splitter.addEventListener("mousedown", function (e) {
+    if (!wideEnough()) return;
     dragging = true;
     splitter.classList.add("dragging");
     document.body.style.userSelect = "none";
@@ -1441,6 +1876,287 @@ window.addEventListener("resize", function () {
     document.body.style.userSelect = "";
     document.body.style.cursor = "";
     if (currentView === "graph") paintGraph();
+  });
+})();
+
+// ---------------------------------------------------------------------------
+// Analytics view
+// ---------------------------------------------------------------------------
+
+let analyticsJobs = [];
+let analyticsSearch = "";
+let analyticsAdvisor = "";
+let analyticsVerdict = "";
+
+function fmtPct(rate) {
+  return Math.round(rate * 100) + "%";
+}
+
+function fmtCost(value) {
+  // Small vendor-estimate figures need more precision than 2dp; larger ones
+  // read better rounded. Either way it is an estimate, labelled at the source.
+  return "$" + (value >= 1 ? value.toFixed(2) : value.toFixed(4));
+}
+
+function fmtTokens(count) {
+  return Number(count).toLocaleString();
+}
+
+function fmtDurationMs(ms) {
+  if (ms < 1000) return Math.round(ms) + "ms";
+  return fmtSeconds(ms / 1000);
+}
+
+// A job's token total, mirroring analytics._token_totals in Python: only the
+// primary input/output buckets are summed; cache/reasoning keys are subsets and
+// are skipped so they never double-count. Returns null when nothing was
+// measured (empty map) so the cell can render "not measured", never 0.
+function jobTokenTotal(usage) {
+  if (!usage) return null;
+  const keys = Object.keys(usage);
+  if (keys.length === 0) return null;
+  let total = 0;
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i];
+    const lowered = key.toLowerCase();
+    if (lowered.indexOf("cache") >= 0 || lowered.indexOf("reasoning") >= 0) continue;
+    if (lowered.indexOf("input") >= 0 || lowered.indexOf("output") >= 0) {
+      total += usage[key] || 0;
+    }
+  }
+  return total;
+}
+
+function jobCost(job) {
+  if (job.cost_source === "unknown" || !job.cost_details) return null;
+  const details = job.cost_details;
+  if (Object.keys(details).length === 0) return null;
+  if (Object.prototype.hasOwnProperty.call(details, "total")) return details.total;
+  let sum = 0;
+  for (const key in details) sum += details[key];
+  return sum;
+}
+
+// A td whose text is set via textContent — never innerHTML — so disk-sourced
+// advisor names and model ids can never inject markup.
+function textCell(text, className) {
+  const td = document.createElement("td");
+  if (className) td.className = className;
+  td.textContent = text == null ? "" : String(text);
+  return td;
+}
+
+function unmeasuredCell() {
+  const td = document.createElement("td");
+  const span = document.createElement("span");
+  span.className = "unmeasured";
+  span.textContent = "not measured";
+  td.appendChild(span);
+  return td;
+}
+
+function metricCell(mainText, subText) {
+  const td = document.createElement("td");
+  const main = document.createElement("div");
+  main.className = "metric-main";
+  main.textContent = mainText;
+  td.appendChild(main);
+  if (subText) {
+    const sub = document.createElement("div");
+    sub.className = "metric-sub";
+    sub.textContent = subText;
+    td.appendChild(sub);
+  }
+  return td;
+}
+
+function verdictSpan(verdict) {
+  const span = document.createElement("span");
+  span.className = "verdict verdict-" + verdict;
+  span.textContent = verdict;
+  return span;
+}
+
+function passRateCell(check) {
+  if (check.pass_rate == null) return unmeasuredCell();
+  return metricCell(fmtPct(check.pass_rate), check.passed + "/" + check.measured + " checked");
+}
+
+function costRollupCell(cost) {
+  if (cost.total == null) return unmeasuredCell();
+  const sub = "avg " + fmtCost(cost.mean) + (cost.source ? " · " + cost.source : "");
+  return metricCell(fmtCost(cost.total), sub);
+}
+
+function tokensRollupCell(tokens) {
+  if (tokens.total == null) return unmeasuredCell();
+  return metricCell(fmtTokens(tokens.total), fmtTokens(tokens.input) + " in / " + fmtTokens(tokens.output) + " out");
+}
+
+function durationRollupCell(duration) {
+  if (duration.mean_ms == null) return unmeasuredCell();
+  return metricCell(fmtDurationMs(duration.mean_ms), "avg of " + duration.measured_count);
+}
+
+function escalationCell(escalation) {
+  if (escalation.rate == null) return unmeasuredCell();
+  return metricCell(fmtPct(escalation.rate), escalation.escalated + "/" + escalation.failed + " failed");
+}
+
+function renderRollup(tbody, rollups, isModel) {
+  while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
+  for (let i = 0; i < rollups.length; i++) {
+    const rollup = rollups[i];
+    const tr = document.createElement("tr");
+    const label = rollup.key == null
+      ? (isModel ? "(model not reported)" : "(no advisor)")
+      : rollup.key;
+    tr.appendChild(textCell(label, "an-key"));
+    tr.appendChild(textCell(rollup.job_count, "num"));
+    tr.appendChild(passRateCell(rollup.check));
+    tr.appendChild(costRollupCell(rollup.cost));
+    tr.appendChild(tokensRollupCell(rollup.tokens));
+    tr.appendChild(durationRollupCell(rollup.duration));
+    tr.appendChild(escalationCell(rollup.escalation));
+    tbody.appendChild(tr);
+  }
+}
+
+function updateAdvisorFilter(jobs) {
+  const select = document.getElementById("an-filter-advisor");
+  const advisors = [];
+  const seen = {};
+  for (let i = 0; i < jobs.length; i++) {
+    const advisor = jobs[i].advisor;
+    if (advisor && !seen[advisor]) { seen[advisor] = true; advisors.push(advisor); }
+  }
+  advisors.sort();
+  // Rebuild only when the option set changed, so the current selection sticks.
+  const wanted = "|" + advisors.join("|");
+  if (select.getAttribute("data-advisors") === wanted) return;
+  select.setAttribute("data-advisors", wanted);
+  const current = select.value;
+  while (select.options.length > 1) select.remove(1);
+  for (let i = 0; i < advisors.length; i++) {
+    const option = document.createElement("option");
+    option.value = advisors[i];
+    option.textContent = advisors[i];
+    select.appendChild(option);
+  }
+  select.value = current;
+  if (select.value !== current) { select.value = ""; analyticsAdvisor = ""; }
+}
+
+function historyMatches(job) {
+  if (analyticsAdvisor && job.advisor !== analyticsAdvisor) return false;
+  if (analyticsVerdict && job.delegation_verdict !== analyticsVerdict) return false;
+  if (analyticsSearch) {
+    const haystack = [job.job_id, job.name, job.advisor, job.model_reported].join(" ").toLowerCase();
+    if (haystack.indexOf(analyticsSearch.toLowerCase()) < 0) return false;
+  }
+  return true;
+}
+
+function historyRow(job) {
+  const tr = document.createElement("tr");
+
+  const jobTd = document.createElement("td");
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "link-btn";
+  btn.textContent = job.job_id.length > 14 ? "…" + job.job_id.slice(-13) : job.job_id;
+  btn.title = job.job_id;
+  const targetId = job.job_id;
+  btn.onclick = function () {
+    document.getElementById("view-list").click();
+    selectJob(targetId);
+  };
+  jobTd.appendChild(btn);
+  tr.appendChild(jobTd);
+
+  tr.appendChild(textCell(job.advisor));
+  const modelTd = textCell(job.model_reported || "(not reported)");
+  if (!job.model_reported) modelTd.className = "metric-sub";
+  tr.appendChild(modelTd);
+
+  const statusTd = document.createElement("td");
+  statusTd.innerHTML = badge(job.status);
+  tr.appendChild(statusTd);
+
+  const verdictTd = document.createElement("td");
+  verdictTd.appendChild(verdictSpan(job.delegation_verdict));
+  tr.appendChild(verdictTd);
+
+  const cost = jobCost(job);
+  tr.appendChild(cost == null ? unmeasuredCell() : textCell(fmtCost(cost), "num"));
+
+  const tokens = jobTokenTotal(job.usage_details);
+  tr.appendChild(tokens == null ? unmeasuredCell() : textCell(fmtTokens(tokens), "num"));
+
+  tr.appendChild(
+    job.duration_ms == null ? unmeasuredCell() : textCell(fmtDurationMs(job.duration_ms), "num")
+  );
+
+  const started = job.started_at ? new Date(job.started_at).toLocaleString() : "-";
+  tr.appendChild(textCell(started, "metric-sub"));
+  return tr;
+}
+
+function renderHistory() {
+  const tbody = document.getElementById("an-history-body");
+  while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
+  let shown = 0;
+  for (let i = 0; i < analyticsJobs.length; i++) {
+    const job = analyticsJobs[i];
+    if (!historyMatches(job)) continue;
+    tbody.appendChild(historyRow(job));
+    shown++;
+  }
+  document.getElementById("an-history-empty").hidden = shown > 0;
+}
+
+async function refreshAnalytics() {
+  const [analyticsResponse, jobsResponse] = await Promise.all([
+    fetch("/api/analytics"),
+    fetch("/api/jobs"),
+  ]);
+  const analytics = await analyticsResponse.json();
+  const jobsPayload = await jobsResponse.json();
+  analyticsJobs = jobsPayload.jobs || [];
+
+  // Keep the adaptive poll honest even though refreshJobs did not run.
+  hasRunningJobs = false;
+  for (let i = 0; i < analyticsJobs.length; i++) {
+    if (analyticsJobs[i].status === "running" || analyticsJobs[i].status === "pending") {
+      hasRunningJobs = true;
+      break;
+    }
+  }
+
+  renderRollup(document.getElementById("an-model-body"), analytics.by_model, true);
+  document.getElementById("an-model-empty").hidden = analytics.by_model.length > 0;
+  renderRollup(document.getElementById("an-advisor-body"), analytics.by_advisor, false);
+  document.getElementById("an-advisor-empty").hidden = analytics.by_advisor.length > 0;
+
+  updateAdvisorFilter(analyticsJobs);
+  renderHistory();
+
+  document.getElementById("refreshed").textContent =
+    "refreshed " + new Date().toLocaleTimeString();
+}
+
+(function initAnalyticsFilters() {
+  document.getElementById("an-search").addEventListener("input", function () {
+    analyticsSearch = this.value;
+    renderHistory();
+  });
+  document.getElementById("an-filter-advisor").addEventListener("change", function () {
+    analyticsAdvisor = this.value;
+    renderHistory();
+  });
+  document.getElementById("an-filter-verdict").addEventListener("change", function () {
+    analyticsVerdict = this.value;
+    renderHistory();
   });
 })();
 

@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -141,7 +143,7 @@ def test_start_returns_job_id_and_worker_continues(
     captured = capsys.readouterr()
     assert code == 0, captured.err
     response = json.loads(captured.out)
-    assert response["schema_version"] == 2
+    assert response["schema_version"] == 3
     assert response["job_id"].startswith("job_")
     assert response["status"] in ("pending", "running")
     assert response["advisor"] == "codex"
@@ -899,3 +901,245 @@ def test_start_depth_cap_exits_nonzero(state_dir, monkeypatch, capsys):
         assert "exceeded" in captured.err
     finally:
         jobs_mod.MAX_NESTING_DEPTH = 8  # restore
+
+
+# =========================================================================
+# Slice S3 — delegate mode with check-gate (CLI end to end)
+# =========================================================================
+
+
+def _check_cmd(exit_code: int) -> str:
+    return f'{sys.executable} -c "import sys; sys.exit({exit_code})"'
+
+
+def test_start_writes_check_into_command_json(state_dir, fake_codex_in_path, capsys):
+    code = main(
+        [
+            "start",
+            "--agent",
+            "codex",
+            "--prompt",
+            "hello",
+            "--check",
+            _check_cmd(0),
+            "--check-timeout",
+            "42",
+            "--json",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    job_id = json.loads(captured.out)["job_id"]
+    _wait_for_terminal(job_id)
+
+    command_path = (
+        jobs_mod.job_dir_path(jobs_mod.default_state_root(), job_id) / "command.json"
+    )
+    info = json.loads(command_path.read_text(encoding="utf-8"))
+    assert info["check"] == _check_cmd(0)
+    assert info["check_timeout"] == 42.0
+
+
+def test_start_without_check_records_none(state_dir, fake_codex_in_path, capsys):
+    code = main(["start", "--agent", "codex", "--prompt", "hi", "--json"])
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    job_id = json.loads(captured.out)["job_id"]
+    job = _wait_for_terminal(job_id)
+    assert job.check_result is None
+    assert jobs_mod.delegation_verdict(job) == "unverified"
+
+
+def test_start_writes_scope_paths_and_pass_env_into_command_json(
+    state_dir, fake_codex_in_path, capsys
+):
+    code = main(
+        [
+            "start",
+            "--agent",
+            "codex",
+            "--prompt",
+            "hi",
+            "--allow-path",
+            "src",
+            "--allow-path",
+            "tests",
+            "--pass-env",
+            "ANTHROPIC_API_KEY",
+            "--json",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    job_id = json.loads(captured.out)["job_id"]
+    _wait_for_terminal(job_id)
+
+    command_path = (
+        jobs_mod.job_dir_path(jobs_mod.default_state_root(), job_id) / "command.json"
+    )
+    info = json.loads(command_path.read_text(encoding="utf-8"))
+    assert info["scope_paths"] == ["src", "tests"]
+    assert info["pass_env"] == ["ANTHROPIC_API_KEY"]
+
+
+def test_start_without_allow_path_records_none_scope(
+    state_dir, fake_codex_in_path, capsys
+):
+    """No --allow-path -> scope_paths null (enforcement off), distinct from []."""
+    code = main(["start", "--agent", "codex", "--prompt", "hi", "--json"])
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    job_id = json.loads(captured.out)["job_id"]
+    _wait_for_terminal(job_id)
+
+    command_path = (
+        jobs_mod.job_dir_path(jobs_mod.default_state_root(), job_id) / "command.json"
+    )
+    info = json.loads(command_path.read_text(encoding="utf-8"))
+    assert info["scope_paths"] is None
+    assert info["pass_env"] == []
+
+
+def test_start_write_outside_git_repo_exits_2_and_creates_no_job(
+    state_dir, fake_codex_in_path, tmp_path, capsys
+):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    code = main(
+        ["start", "--agent", "codex", "--write", "--prompt", "hi", "--cwd", str(plain), "--json"]
+    )
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "--write requires a git repository" in captured.err
+    assert captured.out == ""
+    assert not state_dir.exists() or not any(state_dir.iterdir())
+
+
+def test_start_write_with_allow_path_outside_git_repo_still_exits_2(
+    state_dir, fake_codex_in_path, tmp_path, capsys
+):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    code = main(
+        ["start", "--agent", "codex", "--write", "--allow-path", "src",
+         "--prompt", "hi", "--cwd", str(plain), "--json"]
+    )
+    assert code == 2
+    assert "--write requires a git repository" in capsys.readouterr().err
+
+
+def test_start_write_inside_git_repo_succeeds(state_dir, fake_codex_in_path, tmp_path, capsys):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    code = main(
+        ["start", "--agent", "codex", "--write", "--prompt", "hi", "--cwd", str(repo), "--json"]
+    )
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    assert "unbounded filesystem access" in captured.err
+    job_id = json.loads(captured.out)["job_id"]
+    job = _wait_for_terminal(job_id)
+    assert job.status == jobs_mod.JobState.SUCCEEDED
+    command_path = (
+        jobs_mod.job_dir_path(jobs_mod.default_state_root(), job_id) / "command.json"
+    )
+    info = json.loads(command_path.read_text(encoding="utf-8"))
+    assert info["mode"] == "write"
+    assert info["cwd"] == str(repo)
+
+
+def test_require_complete_fails_on_failed_check(state_dir, fake_codex_in_path, capsys):
+    """A delegate that exits 0 but whose check fails must NOT pass the
+    --require-complete gate (D5)."""
+    main(
+        [
+            "start",
+            "--agent",
+            "codex",
+            "--prompt",
+            "hi",
+            "--check",
+            _check_cmd(1),
+            "--json",
+        ]
+    )
+    job_id = json.loads(capsys.readouterr().out)["job_id"]
+    job = _wait_for_terminal(job_id)
+    assert job.status == jobs_mod.JobState.SUCCEEDED
+    assert job.check_result is not None and job.check_result["exit_code"] == 1
+
+    rc = main(["wait", job_id, "--require-complete", "--timeout", "5"])
+    assert rc == 1
+
+
+def test_require_complete_passes_on_verified_check(
+    state_dir, fake_codex_in_path, capsys
+):
+    main(
+        [
+            "start",
+            "--agent",
+            "codex",
+            "--prompt",
+            "hi",
+            "--check",
+            _check_cmd(0),
+            "--json",
+        ]
+    )
+    job_id = json.loads(capsys.readouterr().out)["job_id"]
+    _wait_for_terminal(job_id)
+    rc = main(["wait", job_id, "--require-complete", "--timeout", "5"])
+    assert rc == 0
+
+
+def test_result_reports_failed_verdict_and_nonzero_exit(
+    state_dir, fake_codex_in_path, capsys
+):
+    """`result` still prints the delegate's answer but signals the failed
+    verification on stderr and via a non-zero exit code."""
+    main(
+        [
+            "start",
+            "--agent",
+            "codex",
+            "--prompt",
+            "hi",
+            "--check",
+            _check_cmd(1),
+            "--json",
+        ]
+    )
+    job_id = json.loads(capsys.readouterr().out)["job_id"]
+    _wait_for_terminal(job_id)
+
+    rc = main(["result", job_id])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "FAILED verification" in captured.err
+
+
+def test_list_json_includes_verdict_and_check_result(
+    state_dir, fake_codex_in_path, capsys
+):
+    main(
+        [
+            "start",
+            "--agent",
+            "codex",
+            "--prompt",
+            "hi",
+            "--check",
+            _check_cmd(1),
+            "--json",
+        ]
+    )
+    job_id = json.loads(capsys.readouterr().out)["job_id"]
+    _wait_for_terminal(job_id)
+
+    main(["list", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    entry = next(job for job in payload["jobs"] if job["job_id"] == job_id)
+    assert entry["delegation_verdict"] == "failed"
+    assert entry["check_result"]["exit_code"] == 1
