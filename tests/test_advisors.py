@@ -51,6 +51,56 @@ def test_user_config_overrides_builtin(tmp_path):
     assert registry["myllm"].prompt_delivery == "flag:-q"
 
 
+def test_codex_defaults_to_gpt6_astra_and_others_have_no_default():
+    assert advisors.resolve("codex").default_model == "gpt-6-astra"
+    for name in ("claude", "opencode", "commandcode", "gemini"):
+        assert advisors.resolve(name).default_model is None
+
+
+@pytest.mark.parametrize("alias", ["gpt6", "GPT6", "astra", "Astra", " gpt6 "])
+def test_resolve_model_expands_codex_aliases_case_insensitively(alias):
+    assert advisors.resolve_model(alias, "codex") == "gpt-6-astra"
+
+
+def test_codex_aliases_do_not_leak_to_other_advisors():
+    # The Claude CLI resolves its own shorthands; we must not rewrite them.
+    assert advisors.resolve_model("gpt6", "claude") == "gpt6"
+    assert advisors.resolve_model("astra", "gemini") == "astra"
+    assert advisors.resolve_model("fable", "claude") == "fable"
+
+
+@pytest.mark.parametrize("value", [None, 0, 1.5, [], {}, object()])
+def test_resolve_model_returns_none_for_non_strings(value):
+    assert advisors.resolve_model(value, "codex") is None
+
+
+@pytest.mark.parametrize("value", ["", "   ", "\t\n"])
+def test_resolve_model_returns_none_for_blank_strings(value):
+    assert advisors.resolve_model(value, "codex") is None
+
+
+def test_resolve_model_passes_unknown_models_through_stripped():
+    assert advisors.resolve_model("  gpt-5.6-sol  ", "codex") == "gpt-5.6-sol"
+    assert advisors.resolve_model("opus", "claude") == "opus"
+
+
+def test_user_config_can_clear_codex_default_model(tmp_path):
+    cfg = tmp_path / "advisors.json"
+    cfg.write_text(json.dumps({"advisors": {"codex": {"default_model": None}}}))
+    registry = advisors.available(cfg)
+    assert registry["codex"].default_model is None
+    # Other built-in fields survive the layering.
+    assert registry["codex"].executable == "codex"
+
+
+def test_user_config_can_override_default_model(tmp_path):
+    cfg = tmp_path / "advisors.json"
+    cfg.write_text(
+        json.dumps({"advisors": {"codex": {"default_model": "gpt-5.6-sol"}}})
+    )
+    assert advisors.available(cfg)["codex"].default_model == "gpt-5.6-sol"
+
+
 def test_malformed_user_config_is_ignored(tmp_path):
     cfg = tmp_path / "advisors.json"
     cfg.write_text("{ not json")

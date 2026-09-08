@@ -55,6 +55,46 @@ def _redacted_command(cmd: list[str]) -> str:
     return shlex.join([*cmd[:-1], "<prompt>"])
 
 
+# Literal `--model default` (any case) means "emit no model flag at all" — the
+# escape hatch back to whatever the advisor CLI's own config already picks.
+_MODEL_SENTINEL_DEFAULT = "default"
+
+
+def _is_resume(
+    advisor: Advisor, args: argparse.Namespace, registry: dict[str, Any]
+) -> bool:
+    """True when this invocation will continue an existing thread (mirrors build_command)."""
+    if not advisor.supports_sessions:
+        return False
+    if args.resume and advisor.resume_flag:
+        return True
+    key = reg.session_key(advisor.name, args.name)
+    stored_id = reg.stored_session_id(registry, key)
+    return bool(
+        stored_id
+        and not args.new_session
+        and (advisor.resume_command or advisor.resume_flag)
+    )
+
+
+def effective_model(
+    advisor: Advisor, args: argparse.Namespace, *, is_resume: bool
+) -> str:
+    """The model id actually used (and persisted): explicit --model, else advisor default.
+
+    An advisor's ``default_model`` is only injected on a FRESH invocation — forcing
+    a model onto a resumed thread would switch models mid-conversation.
+    """
+    requested = getattr(args, "model", "") or ""
+    if (
+        isinstance(requested, str)
+        and requested.strip().lower() == _MODEL_SENTINEL_DEFAULT
+    ):
+        return ""
+    raw = requested or ("" if is_resume else advisor.default_model or "")
+    return advisors_mod.resolve_model(raw, advisor.name) or ""
+
+
 def build_command(
     advisor: Advisor,
     args: argparse.Namespace,
@@ -64,8 +104,11 @@ def build_command(
 ) -> tuple[list[str], str]:
     cmd = [advisor.executable, *advisor.base_args, *advisor.invoke_args]
 
-    if args.model and advisor.model_flag:
-        cmd.extend([advisor.model_flag, args.model])
+    chosen_model = effective_model(
+        advisor, args, is_resume=_is_resume(advisor, args, registry)
+    )
+    if chosen_model and advisor.model_flag:
+        cmd.extend([advisor.model_flag, chosen_model])
 
     if advisor.supports_stream:
         cmd.extend(args.stream and advisor.stream_args or advisor.json_args)
@@ -160,7 +203,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--model",
         default="",
-        help="Advisor model or alias (advisor-specific). Empty = advisor default.",
+        help=(
+            "Advisor model or per-advisor alias (codex: gpt6/astra -> gpt-6-astra). "
+            "Empty falls back to the advisor's default_model, then to the CLI's own "
+            "default. Use 'default' to send no --model flag at all."
+        ),
     )
     parser.add_argument(
         "--safe-mode",
@@ -209,6 +256,8 @@ def _print_advisors() -> int:
     for name, adv in sorted(advisors_mod.available().items()):
         tag = " (experimental)" if adv.experimental else ""
         print(f"{name:14} -> {adv.executable}{tag}")
+        if adv.default_model:
+            print(f"{'':14}    default model: {adv.default_model}")
         if adv.notes:
             print(f"{'':14}    {adv.notes}")
     return 0
@@ -296,7 +345,9 @@ def _dispatch(
             name=args.name,
             cwd=args.cwd or os.getcwd(),
             advisor=advisor.name,
-            model=args.model,
+            model=effective_model(
+                advisor, args, is_resume=_is_resume(advisor, args, registry)
+            ),
         )
         print(
             f"[crossagent] saved session name={key} id={parsed.session_id}",
@@ -462,7 +513,15 @@ def _cmd_start(args: argparse.Namespace) -> int:
 
     job_dir = jobs_mod.create_job_dir(state_root, job_id)
     _write_job_prompt(job_dir, args._prompt)
-    _write_command_info(job_dir, advisor, args, cmd, key, registry_path)
+    _write_command_info(
+        job_dir,
+        advisor,
+        args,
+        cmd,
+        key,
+        registry_path,
+        is_resume=_is_resume(advisor, args, registry),
+    )
 
     now = datetime.now(timezone.utc).isoformat()
     job = jobs_mod.Job(
@@ -755,6 +814,8 @@ def _write_command_info(
     cmd: list[str],
     key: str,
     registry_path: Path,
+    *,
+    is_resume: bool = False,
 ) -> None:
     info = {
         "command": cmd,
@@ -764,7 +825,7 @@ def _write_command_info(
         "registry_path": str(registry_path),
         "key": key,
         "name": args.name,
-        "model": args.model,
+        "model": effective_model(advisor, args, is_resume=is_resume),
         "advisor": advisor.name,
     }
     jobs_mod.atomic_json_write(info, job_dir / "command.json")
