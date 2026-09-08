@@ -531,8 +531,9 @@ def _add_mode_args(parser: argparse.ArgumentParser) -> None:
         const="write",
         help=(
             "Delegation: put the executor in write mode (edit files / run "
-            "commands unattended). Expands per advisor (commandcode auto-accept, "
-            "opencode --auto, claude bypassPermissions, codex default). Grants "
+            "commands unattended). Expands per advisor (commandcode --yolo, "
+            "opencode --auto, claude bypassPermissions, codex --sandbox "
+            "workspace-write). Grants "
             "unbounded filesystem access unless bounded with --allow-path (start "
             "path only; the foreground path has no --allow-path)."
         ),
